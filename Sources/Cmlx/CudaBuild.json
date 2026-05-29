@@ -1,0 +1,35 @@
+{
+    "headerSearchPaths": [
+        "mlx",
+        "mlx-c",
+        "json/single_include/nlohmann",
+        "fmt/include"
+    ],
+    "exclude": [
+        "framework",
+        "include-framework",
+        "metal-cpp",
+        "mlx/mlx/backend/metal/kernels",
+        "mlx/mlx/backend/metal/jit",
+        "mlx/mlx/backend/no_cpu",
+        "mlx-conditional",
+        "mlx-c/examples",
+        "json",
+        "fmt/test",
+        "fmt/doc",
+        "fmt/support",
+        "mlx/benchmarks",
+        "mlx/cmake",
+        "mlx/docs",
+        "mlx/examples",
+        "mlx/python",
+        "mlx/tests",
+        "mlx/mlx/backend/metal/kernels",
+        "mlx/mlx/backend/cuda/quantized/qmm",
+        "mlx/mlx/backend/cuda/quantized/fp_quantize.cu",
+        "mlx/mlx/backend/cuda/quantized/qqmm_utils.cu",
+        "mlx/mlx/backend/cuda/gemms/grouped_gemm_unaligned.cu"
+    ],
+    "cppLanguageStandard": "c++20",
+    "verbose": false
+}
