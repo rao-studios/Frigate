@@ -12,8 +12,9 @@ All fork sources are vendored directly — no external URLs for patched librarie
 |---|---|---|
 | `FrigateEmbedder` | `mlx-community/snowflake-arctic-embed-m-v1.5` | Returns `[[Float]]` |
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
+| `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
 
-Models are downloaded from HuggingFace Hub on first use and cached at `~/.cache/huggingface/`.
+HuggingFace models are downloaded on first use and cached at `~/.cache/huggingface/`. `FrigateBoost` loads a model exported with `booster.save_model("model.json")` — no `libxgboost` required at runtime.
 
 ---
 
@@ -69,10 +70,10 @@ The script is idempotent — safe to re-run if any step failed.
 
 ```bash
 # Embedding model (~450 MB)
-huggingface-cli download mlx-community/snowflake-arctic-embed-m-v1.5
+hf download mlx-community/snowflake-arctic-embed-m-v1.5
 
 # LLM (~400 MB)
-huggingface-cli download mlx-community/Qwen3-0.6B-4bit
+hf download mlx-community/Qwen3-0.6B-4bit
 ```
 
 HuggingFace Hub caches models at `~/.cache/huggingface/hub/`. Downloads happen automatically at first use if you skip this step.
@@ -89,6 +90,13 @@ Then import and use:
 
 ```swift
 import Frigate
+
+// XGBoost — load model, predict P(class=1) for a batch of feature vectors
+let boost = try FrigateBoost(modelURL: URL(fileURLWithPath: "model.json"))
+let probs: [Float] = await boost.predict(features: [
+    [0.12, 0.003, 0.47, 0.06, 0.31, 0.84, 0.002, 0.001, 0.51, 0.29],
+])
+print(probs) // e.g. [0.731]
 
 // Embeddings
 let embedder = FrigateEmbedder()
@@ -155,6 +163,19 @@ public actor FrigateLLM {
 
 Both actors deduplicate concurrent model loads — calling `embed` or `generate` from multiple tasks concurrently is safe.
 
+### FrigateBoost
+
+```swift
+public actor FrigateBoost {
+    /// Load an XGBoost model exported with `booster.save_model("model.json")`.
+    public init(modelURL: URL) throws
+    /// Predict P(class=1) for a batch of feature vectors.
+    public func predict(features: [[Float]]) async -> [Float]
+}
+```
+
+`FrigateBoost` parses the XGBoost v2 JSON format in pure Swift and walks the tree ensemble directly — no `libxgboost` binary required. The `binary:logistic` objective is supported; leaf values are summed across all trees and sigmoid is applied to produce final probabilities.
+
 ---
 
 ## Vendored sources
@@ -169,7 +190,8 @@ All fork sources are copied directly into `Sources/`. No git submodules, no exte
 | `Sources/Hub/` … `Sources/Models/` | `riteshpakala/swift-transformers` |
 | `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `riteshpakala/mlx-swift-lm` |
 | `Sources/mlx_embeddings/` | `riteshpakala/mlx.embeddings` |
-| `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM` |
+| `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |
+| `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |
 
 ---
 

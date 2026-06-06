@@ -25,7 +25,7 @@ public func gaussianBlur(
     let kernel = makeGaussianKernel(size: kernelSize, sigma: sigma)
         .reshaped([1, kernelSize, kernelSize, 1])
     let batched = input.reshaped([1, H, W, 1])
-    let out = MLX.conv2d(batched, kernel, padding: kernelSize / 2, stream: stream)
+    let out = MLX.conv2d(batched, kernel, padding: IntOrPair(kernelSize / 2), stream: stream)
     MLX.eval(out)
     return out.reshaped([H, W])
 }

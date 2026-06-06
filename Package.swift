@@ -304,6 +304,9 @@ let package = Package(
         // Main Frigate API
         .library(name: "Frigate", targets: ["Frigate"]),
 
+        // Linux-compatible Accelerate ops backed by MLX
+        .library(name: "MLXAccelerate", targets: ["MLXAccelerate"]),
+
         // Re-exported MLX stack
         .library(name: "MLX", targets: ["MLX"]),
         .library(name: "MLXRandom", targets: ["MLXRandom"]),
@@ -496,12 +499,22 @@ let package = Package(
             ]
         ),
 
+        // ── MLXAccelerate — Linux-compatible Accelerate ops via MLX ─────────
+        .target(
+            name: "MLXAccelerate",
+            dependencies: ["MLX"],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+
         // ── Frigate public API ────────────────────────────────────────────────
         .target(
             name: "Frigate",
             dependencies: [
                 "MLX", "MLXNN", "Tokenizers",
                 "MLXLMCommon", "MLXLLM", "mlx_embeddings",
+                "MLXAccelerate",
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")

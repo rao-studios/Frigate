@@ -13,3 +13,4 @@
 @_exported import MLX
 @_exported import MLXNN
 @_exported import MLXLMCommon
+@_exported import MLXAccelerate
