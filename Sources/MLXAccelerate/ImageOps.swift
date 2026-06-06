@@ -26,7 +26,6 @@ public func gaussianBlur(
         .reshaped([1, kernelSize, kernelSize, 1])
     let batched = input.reshaped([1, H, W, 1])
     let out = MLX.conv2d(batched, kernel, padding: IntOrPair(kernelSize / 2), stream: stream)
-    MLX.eval(out)
     return out.reshaped([H, W])
 }
 
@@ -47,7 +46,6 @@ public func sobelGradients(
     let ky = MLXArray([-1, -2, -1, 0, 0, 0, 1, 2, 1] as [Float], [1, 3, 3, 1])
     let dx = MLX.conv2d(batched, kx, padding: 1, stream: stream).reshaped([H, W])
     let dy = MLX.conv2d(batched, ky, padding: 1, stream: stream).reshaped([H, W])
-    MLX.eval(dx, dy)
     return (dx, dy)
 }
 
@@ -68,8 +66,9 @@ public func filter2D(
     let k = kernel.reshaped([1, kH, kW, 1])
     let batched = input.reshaped([1, H, W, 1])
     let out = MLX.conv2d(batched, k, padding: IntOrPair((kH / 2, kW / 2)), stream: stream)
-    MLX.eval(out)
-    return out.reshaped([H, W])
+    // Even-sized kernels (e.g. 2×2) produce output size = input + 1 per padded dim.
+    // Slice back to [H, W] so callers always get the expected shape.
+    return out[0..<1, 0..<H, 0..<W, 0..<1].reshaped([H, W])
 }
 
 // MARK: - Perspective Warp
@@ -99,16 +98,10 @@ public func perspectiveWarp(
     let mInv = invertMatrix3x3(m)
     let mInvArr = MLXArray(mInv, [3, 3])  // (3, 3)
 
-    // Build destination coordinate grid of shape (outH*outW, 3) in homogeneous form [x, y, 1].
-    let ys = MLXArray(Array(0..<outH).map { Float($0) }, [outH])
-    let xs = MLXArray(Array(0..<outW).map { Float($0) }, [outW])
-    let gridY = broadcast(ys.expandedDimensions(axis: 1), to: [outH, outW])   // (outH, outW)
-    let gridX = broadcast(xs.expandedDimensions(axis: 0), to: [outH, outW])   // (outH, outW)
-    let onesG  = MLXArray.ones([outH * outW], type: Float.self)
-    let xFlat  = gridX.reshaped([-1])  // (N,)
-    let yFlat  = gridY.reshaped([-1])  // (N,)
-    // Stack into (N, 3) — columns: [x, y, 1]
-    let coords = MLX.stacked([xFlat, yFlat, onesG], axis: 1)  // (N, 3)
+    // Destination coordinate grid (N, 3) in homogeneous form [x, y, 1].
+    // Use a cache keyed by output size — warpNoise calls this 32 times with
+    // the same tile dimensions so rebuilding from scratch every call is wasteful.
+    let coords = coordGrid(outH: outH, outW: outW)  // (N, 3)
 
     // Apply M_inv: source_coords = coords @ mInv^T  →  (N, 3)
     let transformed = MLX.matmul(coords, mInvArr.transposed())
@@ -158,8 +151,27 @@ public func perspectiveWarp(
                + p10.asType(.float32) * (one - dx) * dy
                + p11.asType(.float32) * dx * dy
 
-    MLX.eval(result)
     return result.reshaped([outH, outW, C])
+}
+
+// MARK: - Coord grid cache
+
+/// Returns a reusable `(outH*outW, 3)` homogeneous coordinate grid for bilinear warp.
+/// Results are cached by (outH, outW) so repeated calls with the same tile size
+/// (e.g. 32×32 across all N_TRIALS) skip the array construction entirely.
+private nonisolated(unsafe) var _coordGridCache: [Int: MLXArray] = [:]
+private func coordGrid(outH: Int, outW: Int) -> MLXArray {
+    let key = outH &* 65536 &+ outW
+    if let cached = _coordGridCache[key] { return cached }
+    let ys = MLXArray(Array(0..<outH).map { Float($0) }, [outH])
+    let xs = MLXArray(Array(0..<outW).map { Float($0) }, [outW])
+    let gridY = broadcast(ys.expandedDimensions(axis: 1), to: [outH, outW])
+    let gridX = broadcast(xs.expandedDimensions(axis: 0), to: [outH, outW])
+    let onesG = MLXArray.ones([outH * outW], type: Float.self)
+    let grid  = MLX.stacked([gridX.reshaped([-1]), gridY.reshaped([-1]), onesG], axis: 1)
+    MLX.eval(grid)   // materialise once; safe here since it's constant data
+    _coordGridCache[key] = grid
+    return grid
 }
 
 // MARK: - Homography
