@@ -159,10 +159,13 @@ public func perspectiveWarp(
 /// Returns a reusable `(outH*outW, 3)` homogeneous coordinate grid for bilinear warp.
 /// Results are cached by (outH, outW) so repeated calls with the same tile size
 /// (e.g. 32×32 across all N_TRIALS) skip the array construction entirely.
+/// Lock-protected for concurrent access from parallel patch tasks.
 private nonisolated(unsafe) var _coordGridCache: [Int: MLXArray] = [:]
+private let _coordGridLock = NSLock()
 private func coordGrid(outH: Int, outW: Int) -> MLXArray {
     let key = outH &* 65536 &+ outW
-    if let cached = _coordGridCache[key] { return cached }
+    _coordGridLock.lock()
+    if let cached = _coordGridCache[key] { _coordGridLock.unlock(); return cached }
     let ys = MLXArray(Array(0..<outH).map { Float($0) }, [outH])
     let xs = MLXArray(Array(0..<outW).map { Float($0) }, [outW])
     let gridY = broadcast(ys.expandedDimensions(axis: 1), to: [outH, outW])
@@ -171,6 +174,7 @@ private func coordGrid(outH: Int, outW: Int) -> MLXArray {
     let grid  = MLX.stacked([gridX.reshaped([-1]), gridY.reshaped([-1]), onesG], axis: 1)
     MLX.eval(grid)   // materialise once; safe here since it's constant data
     _coordGridCache[key] = grid
+    _coordGridLock.unlock()
     return grid
 }
 

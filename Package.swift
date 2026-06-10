@@ -524,7 +524,7 @@ let package = Package(
         // ── Tests ─────────────────────────────────────────────────────────────
         .testTarget(
             name: "FrigateTests",
-            dependencies: ["Frigate"]
+            dependencies: ["Frigate", "MLXAccelerate"]
         ),
     ],
 
