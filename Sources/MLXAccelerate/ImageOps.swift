@@ -240,7 +240,8 @@ private func makeGaussianKernel(size: Int, sigma: Float) -> MLXArray {
 }
 
 /// Gaussian elimination on an (n×n) system, returns nil if singular.
-private func gaussianElimination(_ A: [[Double]], _ b: [Double]) -> [Double]? {
+/// Internal: also used by getPerspectiveTransformD in BatchedImageOps.swift.
+func gaussianElimination(_ A: [[Double]], _ b: [Double]) -> [Double]? {
     let n = b.count
     var aug = A.enumerated().map { (i, row) in row + [b[i]] }
     for col in 0..<n {
