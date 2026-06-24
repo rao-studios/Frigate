@@ -1,3 +1,4 @@
+#if !os(iOS) && !os(tvOS) && !os(watchOS) && !os(visionOS)
 import Foundation
 
 func searchForCommand(_ name: String) -> URL? {
@@ -23,3 +24,5 @@ extension Process {
         }
     }
 }
+
+#endif

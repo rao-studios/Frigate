@@ -1,3 +1,4 @@
+#if !os(iOS) && !os(tvOS) && !os(watchOS) && !os(visionOS)
 import ArgumentParser
 import Foundation
 
@@ -65,3 +66,5 @@ extension Encuda {
         }
     }
 }
+
+#endif
