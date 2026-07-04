@@ -327,6 +327,9 @@ let package = Package(
         .library(name: "MLXLMCommon", targets: ["MLXLMCommon"]),
         .library(name: "MLXEmbedders", targets: ["MLXEmbedders"]),
         .library(name: "mlx_embeddings", targets: ["mlx_embeddings"]),
+
+        // FLUX.2 Klein text-to-image pipeline (MLX)
+        .library(name: "FluxKit", targets: ["FluxKit"]),
     ],
 
     dependencies: [
@@ -346,6 +349,25 @@ let package = Package(
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ]
+        ),
+
+        // ── FLUX.2 Klein text-to-image (MLX port of mflux's flux2) ───────────
+        .target(
+            name: "FluxKit",
+            dependencies: [
+                "MLX", "MLXNN", "MLXFast", "MLXRandom",
+                "Tokenizers", "Hub",
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // macOS verification harness: downloads the model, generates, writes a PNG.
+        .executableTarget(
+            name: "flux2-cli",
+            dependencies: [
+                "FluxKit",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .plugin(
             name: "CudaBuild",
