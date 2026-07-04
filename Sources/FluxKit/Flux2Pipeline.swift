@@ -15,6 +15,7 @@ import Foundation
 import Hub
 import MLX
 import MLXRandom
+import ObscurKit
 import Tokenizers
 
 public final class Flux2Pipeline {
@@ -36,15 +37,28 @@ public final class Flux2Pipeline {
     }
 
     /// Synchronous; run on a background executor. `onPhase` fires on the calling thread.
+    /// `adapter` installs a Signet bank branch for this generation (see ObscurKit);
+    /// its recorder — when set — accrues per-entry attribution across steps/layers.
     public func generate(prompt: String,
                          width: Int = 1024,
                          height: Int = 1024,
                          steps: Int = 4,
                          seed: UInt64 = UInt64.random(in: 0..<UInt64.max),
+                         adapter: ObscurInjectionContext? = nil,
                          onPhase: ((Phase) -> Void)? = nil,
                          isCancelled: (() -> Bool)? = nil) throws -> CGImage {
         func checkCancelled() throws {
             if isCancelled?() == true { throw FluxKitError.cancelled }
+        }
+
+        // Keep MLX's recycled-buffer cache small for the duration of the run: freed
+        // component weights must return to the OS, not sit in the cache (Jetsam counts
+        // cached buffers against the app on iOS).
+        let previousCacheLimit = Memory.cacheLimit
+        Memory.cacheLimit = 128 * 1024 * 1024
+        defer {
+            Memory.cacheLimit = previousCacheLimit
+            Memory.clearCache()
         }
 
         // ── 1. Prompt → context embeddings (Qwen3 taps), then free the encoder ──
@@ -86,9 +100,11 @@ public final class Flux2Pipeline {
             let transformer = try Flux2Transformer(componentDir: modelDir.appendingPathComponent("transformer"))
             try checkCancelled()
             for i in 0..<steps {
+                adapter?.recorder?.currentStep = i
                 let noise = transformer(hidden: latents, encoder: promptEmbeds,
                                         timestep: scheduler.timesteps[i],
-                                        imgIDs: imgIDs, txtIDs: txtIDs)
+                                        imgIDs: imgIDs, txtIDs: txtIDs,
+                                        adapter: adapter)
                 latents = scheduler.step(noise: noise, latents: latents, index: i)
                 eval(latents)
                 onPhase?(.denoising(step: i + 1, total: steps))

@@ -330,6 +330,8 @@ let package = Package(
 
         // FLUX.2 Klein text-to-image pipeline (MLX)
         .library(name: "FluxKit", targets: ["FluxKit"]),
+        // Obscur per-corpus KV-bank adapter (Signets) over FLUX.2 Klein
+        .library(name: "ObscurKit", targets: ["ObscurKit"]),
     ],
 
     dependencies: [
@@ -351,12 +353,20 @@ let package = Package(
             ]
         ),
 
+        // ── Obscur Signet adapter: per-corpus KV banks + attribution ─────────
+        .target(
+            name: "ObscurKit",
+            dependencies: [
+                "MLX", "MLXNN", "MLXFast", "MLXRandom",
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         // ── FLUX.2 Klein text-to-image (MLX port of mflux's flux2) ───────────
         .target(
             name: "FluxKit",
             dependencies: [
                 "MLX", "MLXNN", "MLXFast", "MLXRandom",
-                "Tokenizers", "Hub",
+                "Tokenizers", "Hub", "ObscurKit",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

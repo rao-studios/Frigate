@@ -13,6 +13,7 @@ import Foundation
 import MLX
 import MLXFast
 import MLXNN
+import ObscurKit
 
 public final class Flux2Transformer {
     public struct Config {
@@ -67,7 +68,9 @@ public final class Flux2Transformer {
         /// Returns (encoderHidden, hidden).
         func callAsFunction(hidden: MLXArray, encoder: MLXArray,
                             modImg: [MLXArray], modTxt: [MLXArray],
-                            ropeCos: MLXArray, ropeSin: MLXArray) -> (MLXArray, MLXArray) {
+                            ropeCos: MLXArray, ropeSin: MLXArray,
+                            adapter: ObscurInjectionContext? = nil,
+                            layerRef: ObscurLayerRef? = nil) -> (MLXArray, MLXArray) {
             // modImg/modTxt: 6 arrays each — [shiftMSA, scaleMSA, gateMSA, shiftMLP, scaleMLP, gateMLP]
             let normed = layerNorm(hidden, eps: config.eps)
             let modded = (1 + modImg[1]) * normed + modImg[0]
@@ -75,7 +78,8 @@ public final class Flux2Transformer {
             let ctxModded = (1 + modTxt[1]) * ctxNormed + modTxt[0]
 
             let (attnOut, ctxAttnOut) = jointAttention(img: modded, txt: ctxModded,
-                                                       ropeCos: ropeCos, ropeSin: ropeSin)
+                                                       ropeCos: ropeCos, ropeSin: ropeSin,
+                                                       adapter: adapter, layerRef: layerRef)
 
             var h = hidden + modImg[2] * attnOut
             var c = encoder + modTxt[2] * ctxAttnOut
@@ -90,7 +94,9 @@ public final class Flux2Transformer {
         }
 
         private func jointAttention(img: MLXArray, txt: MLXArray,
-                                    ropeCos: MLXArray, ropeSin: MLXArray) -> (MLXArray, MLXArray) {
+                                    ropeCos: MLXArray, ropeSin: MLXArray,
+                                    adapter: ObscurInjectionContext? = nil,
+                                    layerRef: ObscurLayerRef? = nil) -> (MLXArray, MLXArray) {
             let b = img.dim(0)
             let heads = config.numHeads
             let hd = config.headDim
@@ -102,6 +108,10 @@ public final class Flux2Transformer {
             var q = normQ(heads4(attnToQ(img)))
             var k = normK(heads4(attnToK(img)))
             let v = heads4(attnToV(img))
+
+            // Signet branch reuses the base image-stream queries, pre-RoPE (bank tokens
+            // carry no spatial position).
+            let imgQueryPreRope = q
 
             let eq = normAddedQ(heads4(addQ(txt)))
             let ek = normAddedK(heads4(addK(txt)))
@@ -121,7 +131,15 @@ public final class Flux2Transformer {
 
             let txtLen = txt.dim(1)
             let ctxOut = toAddOut(out[0..., ..<txtLen, 0...])
-            let imgOut = attnToOut(out[0..., txtLen..., 0...])
+            var imgOut = attnToOut(out[0..., txtLen..., 0...])
+
+            // Additive decoupled cross-attention over the composed Signet bank; joins
+            // the base attention output (so it shares the block's modulation gate).
+            // Zero gate ⇒ nil ⇒ bit-exact base behavior.
+            if let adapter, let layerRef,
+               let branch = adapter.apply(query: imgQueryPreRope, layer: layerRef) {
+                imgOut = imgOut + branch
+            }
             return (imgOut, ctxOut)
         }
     }
@@ -144,7 +162,10 @@ public final class Flux2Transformer {
         }
 
         func callAsFunction(_ hidden: MLXArray, mod: [MLXArray],
-                            ropeCos: MLXArray, ropeSin: MLXArray) -> MLXArray {
+                            ropeCos: MLXArray, ropeSin: MLXArray,
+                            textTokenCount: Int = 0,
+                            adapter: ObscurInjectionContext? = nil,
+                            layerRef: ObscurLayerRef? = nil) -> MLXArray {
             // mod: [shift, scale, gate]
             let b = hidden.dim(0)
             let s = hidden.dim(1)
@@ -164,6 +185,9 @@ public final class Flux2Transformer {
 
             q = normQ(q)
             k = normK(k)
+            // Pre-RoPE image-token queries for the Signet branch (image tokens trail
+            // the text tokens in the fused sequence).
+            let imgQueryPreRope = q[0..., 0..., textTokenCount..., 0...]
             (q, k) = applyRopeInterleaved(q: q, k: k, cos: ropeCos, sin: ropeSin)
 
             let scale = 1.0 / Float(hd).squareRoot()
@@ -171,7 +195,15 @@ public final class Flux2Transformer {
                                                          scale: scale, mask: nil)
             attn = attn.transposed(0, 2, 1, 3).reshaped(b, s, inner)
 
-            let out = toOut(concatenated([attn, swiGLU(mlp)], axis: -1))
+            var out = toOut(concatenated([attn, swiGLU(mlp)], axis: -1))
+
+            // Signet branch adds to the block output's image rows (shares mod gate).
+            if let adapter, let layerRef,
+               let branch = adapter.apply(query: imgQueryPreRope, layer: layerRef) {
+                let txtRows = out[0..., ..<textTokenCount, 0...]
+                let imgRows = out[0..., textTokenCount..., 0...] + branch
+                out = concatenated([txtRows, imgRows], axis: 1)
+            }
             return hidden + mod[2] * out
         }
     }
@@ -215,8 +247,11 @@ public final class Flux2Transformer {
 
     /// hidden: (B, imgSeq, 128) packed latents · encoder: (B, txtSeq, 7680) ·
     /// timestep in [0, 1000] · ids: (S, 4). Returns the velocity prediction (B, imgSeq, 128).
+    /// `adapter` (optional) installs the Signet decoupled cross-attention branch at its
+    /// hooked layers; zero gates keep the pass bit-exact with the base model.
     public func callAsFunction(hidden: MLXArray, encoder: MLXArray, timestep: Float,
-                               imgIDs: MLXArray, txtIDs: MLXArray) -> MLXArray {
+                               imgIDs: MLXArray, txtIDs: MLXArray,
+                               adapter: ObscurInjectionContext? = nil) -> MLXArray {
         let dtype = Flux2Pipeline.activationDType
 
         // Timestep embedding (sinusoidal 256 → MLP 3072), flip_sin_to_cos.
@@ -241,14 +276,18 @@ public final class Flux2Transformer {
         let cos = concatenated([txtCos, imgCos], axis: 0)
         let sin = concatenated([txtSin, imgSin], axis: 0)
 
-        for block in doubleBlocks {
+        for (index, block) in doubleBlocks.enumerated() {
             (c, h) = block(hidden: h, encoder: c, modImg: modImg, modTxt: modTxt,
-                           ropeCos: cos, ropeSin: sin)
+                           ropeCos: cos, ropeSin: sin,
+                           adapter: adapter, layerRef: .doubleStream(index: index))
         }
 
+        let textTokenCount = c.dim(1)
         var joint = concatenated([c, h], axis: 1)
-        for block in singleBlocks {
-            joint = block(joint, mod: modSingle, ropeCos: cos, ropeSin: sin)
+        for (index, block) in singleBlocks.enumerated() {
+            joint = block(joint, mod: modSingle, ropeCos: cos, ropeSin: sin,
+                          textTokenCount: textTokenCount,
+                          adapter: adapter, layerRef: .singleStream(index: index))
         }
 
         var out = joint[0..., c.dim(1)..., 0...]
