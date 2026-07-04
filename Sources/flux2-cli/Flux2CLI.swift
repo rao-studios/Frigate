@@ -118,6 +118,14 @@ struct Flux2CLI: AsyncParsableCommand {
                                                   projection: projection)
         print("composed bank: \(composed.tokenCount) tokens over \(composed.spans.count) entries")
 
+        func writePNG(_ image: CGImage, suffix: String) {
+            let url = URL(fileURLWithPath: out.replacingOccurrences(of: ".png", with: "-\(suffix).png"))
+            guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(dest, image, nil)
+            CGImageDestinationFinalize(dest)
+            print("  wrote \(url.path)")
+        }
+
         func pixels(influence: Float, recorder: ObscurAttributionRecorder?) throws -> [UInt8] {
             var adapter: ObscurInjectionContext?
             let gates = ObscurGates.grouped(structure: influence, texture: influence,
@@ -125,6 +133,7 @@ struct Flux2CLI: AsyncParsableCommand {
             adapter = ObscurInjectionContext(composed: composed, gates: gates, recorder: recorder)
             let image = try pipeline.generate(prompt: prompt, width: 256, height: 256,
                                               steps: steps, seed: seed, adapter: adapter)
+            writePNG(image, suffix: String(format: "inf%03d", Int(influence * 100)))
             guard let data = image.dataProvider?.data as Data? else { return [] }
             return [UInt8](data)
         }
@@ -132,6 +141,7 @@ struct Flux2CLI: AsyncParsableCommand {
         print("• baseline (no adapter)…")
         let baseImage = try pipeline.generate(prompt: prompt, width: 256, height: 256,
                                               steps: steps, seed: seed)
+        writePNG(baseImage, suffix: "base")
         let base = [UInt8]((baseImage.dataProvider?.data as Data?) ?? Data())
 
         print("• zero-gate install…")
@@ -141,7 +151,7 @@ struct Flux2CLI: AsyncParsableCommand {
 
         print("• influence sweep…")
         var previousDelta = 0.0
-        for influence: Float in [0.25, 0.75] {
+        for influence: Float in [0.25, 0.75, 1.0] {
             let recorder = ObscurAttributionRecorder(spans: composed.spans)
             let px = try pixels(influence: influence, recorder: recorder)
             let delta = zip(px, base).reduce(0.0) { $0 + abs(Double($1.0) - Double($1.1)) }

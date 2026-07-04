@@ -242,9 +242,13 @@ public final class ObscurInjectionContext {
 
     /// The decoupled cross-attention branch at one hooked site.
     /// query: (B, H, S, D) pre-RoPE, RMS-normed image-stream queries from the base
-    /// block. Returns the gated branch output (B, S, H*D) to add to the base attention
-    /// output, or nil when this layer is unhooked/gated off.
-    public func apply(query: MLXArray, layer: ObscurLayerRef) -> MLXArray? {
+    /// block. `baseOutput`: the block's own attention output for the same image tokens,
+    /// (B, S, H*D) — the branch is RMS-matched to it per token, which makes the gate
+    /// dimensionless: gate 1.0 injects at most a base-attention-sized signal, never an
+    /// unbounded one (an uncalibrated projection at raw scale flattens the whole
+    /// generation into a constant-color latent). Returns the gated branch output to add
+    /// to `baseOutput`, or nil when this layer is unhooked/gated off.
+    public func apply(query: MLXArray, baseOutput: MLXArray, layer: ObscurLayerRef) -> MLXArray? {
         guard let (k, v) = composed.kv[layer] else { return nil }
         let gate = gate(layer)
         guard gate != 0 else { return nil }
@@ -276,9 +280,16 @@ public final class ObscurInjectionContext {
             recorder.record(layer: layer, entryMasses: entryMasses)
         }
 
-        let out = matmul(attn, vHeads)                                     // (B, H, S, D)
+        var out = matmul(attn, vHeads)                                     // (B, H, S, D)
             .transposed(0, 2, 1, 3)
             .reshaped(b, s, headCount * headDim)
+
+        // Per-token RMS match against the base attention output.
+        let base32 = baseOutput.asType(.float32)
+        let baseRMS = sqrt(base32.square().mean(axis: -1, keepDims: true))
+        let branchRMS = sqrt(out.square().mean(axis: -1, keepDims: true))
+        out = out * (baseRMS / (branchRMS + 1e-6))
+
         return (out * gate).asType(outDtype)
     }
 }

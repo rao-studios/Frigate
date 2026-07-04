@@ -134,10 +134,11 @@ public final class Flux2Transformer {
             var imgOut = attnToOut(out[0..., txtLen..., 0...])
 
             // Additive decoupled cross-attention over the composed Signet bank; joins
-            // the base attention output (so it shares the block's modulation gate).
-            // Zero gate ⇒ nil ⇒ bit-exact base behavior.
+            // the base attention output (so it shares the block's modulation gate) and
+            // is RMS-matched to it. Zero gate ⇒ nil ⇒ bit-exact base behavior.
             if let adapter, let layerRef,
-               let branch = adapter.apply(query: imgQueryPreRope, layer: layerRef) {
+               let branch = adapter.apply(query: imgQueryPreRope, baseOutput: imgOut,
+                                          layer: layerRef) {
                 imgOut = imgOut + branch
             }
             return (imgOut, ctxOut)
@@ -197,12 +198,15 @@ public final class Flux2Transformer {
 
             var out = toOut(concatenated([attn, swiGLU(mlp)], axis: -1))
 
-            // Signet branch adds to the block output's image rows (shares mod gate).
-            if let adapter, let layerRef,
-               let branch = adapter.apply(query: imgQueryPreRope, layer: layerRef) {
-                let txtRows = out[0..., ..<textTokenCount, 0...]
-                let imgRows = out[0..., textTokenCount..., 0...] + branch
-                out = concatenated([txtRows, imgRows], axis: 1)
+            // Signet branch adds to the block output's image rows (shares mod gate),
+            // RMS-matched to those rows.
+            if let adapter, let layerRef {
+                let imgRows = out[0..., textTokenCount..., 0...]
+                if let branch = adapter.apply(query: imgQueryPreRope, baseOutput: imgRows,
+                                              layer: layerRef) {
+                    let txtRows = out[0..., ..<textTokenCount, 0...]
+                    out = concatenated([txtRows, imgRows + branch], axis: 1)
+                }
             }
             return hidden + mod[2] * out
         }
