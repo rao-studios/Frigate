@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Frigate}",
+            "name": "Debug flux2-cli",
+            "target": "flux2-cli",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug flux2-cli"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Frigate}",
+            "name": "Release flux2-cli",
+            "target": "flux2-cli",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release flux2-cli"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Frigate}",
+            "name": "Debug encuda",
+            "target": "encuda",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug encuda"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Frigate}",
+            "name": "Release encuda",
+            "target": "encuda",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release encuda"
+        }
+    ]
+}
