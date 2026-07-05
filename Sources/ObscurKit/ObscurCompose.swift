@@ -277,12 +277,17 @@ public struct ObscurInfluenceMap: Codable {
     public let gridWidth: Int
     public let gridHeight: Int
     public let entryIDs: [String]
-    /// (S,) — total adapter attention per region, max-normalized to 0…1 (Z relief).
+    /// (S,) — total adapter attention per region, max-normalized to 0…1: how much the
+    /// model READ from the bank here.
     public let regionRelief: [Float]
     /// (S × E) row-major — per region, each entry's share (sums to 1 where relief > 0).
     public let entryShares: [Float]
     /// (E,) — whole-generation share per entry (matches the aggregate report).
     public let entryTotals: [Float]
+    /// (S,) optional counterfactual — per-region latent divergence from the base
+    /// model's same-seed generation, max-normalized: how much this region actually
+    /// CHANGED because of the Signet. Set by the engine when a baseline pass ran.
+    public var regionImpact: [Float]? = nil
 
     public func shares(atRegion index: Int) -> [Float] {
         let e = entryIDs.count

@@ -283,15 +283,19 @@ struct Flux2CLI: AsyncParsableCommand {
             print("  wrote \(url.path)")
         }
 
+        var lastImpact: [Float]? = nil
         func pixels(influence: Float, recorder: ObscurAttributionRecorder?) throws -> [UInt8] {
             var adapter: ObscurInjectionContext?
             let gates = ObscurGates.grouped(structure: influence, texture: influence,
                                             layers: projection.hookedLayers)
             adapter = ObscurInjectionContext(composed: composed, gates: gates, recorder: recorder)
-            let image = try pipeline.generate(prompt: prompt, width: 256, height: 256,
-                                              steps: steps, seed: seed, adapter: adapter)
-            writePNG(image, suffix: String(format: "inf%03d", Int(influence * 100)))
-            guard let data = image.dataProvider?.data as Data? else { return [] }
+            let result = try pipeline.generateWithBaseline(prompt: prompt, width: 256, height: 256,
+                                                           steps: steps, seed: seed,
+                                                           adapter: adapter,
+                                                           baseline: influence > 0)
+            lastImpact = result.regionImpact
+            writePNG(result.image, suffix: String(format: "inf%03d", Int(influence * 100)))
+            guard let data = result.image.dataProvider?.data as Data? else { return [] }
             return [UInt8](data)
         }
 
@@ -308,6 +312,7 @@ struct Flux2CLI: AsyncParsableCommand {
 
         print("• influence sweep…")
         var previousDelta = 0.0
+        var previousMeanImpact: Float = -1
         for influence: Float in [0.25, 0.75, 1.0] {
             let recorder = ObscurAttributionRecorder(spans: composed.spans,
                                                      gridWidth: 16, gridHeight: 16)
@@ -348,6 +353,22 @@ struct Flux2CLI: AsyncParsableCommand {
             } else {
                 print("  spatial: FAIL (no map produced)")
             }
+
+            // Counterfactual impact invariants: present with baseline, max-normalized;
+            // raw mean magnitude comparison isn't meaningful post-normalization, so
+            // check the raw pixel delta (above) for monotonicity instead.
+            if let impact = lastImpact {
+                let peakOK = impact.max().map { abs($0 - 1) < 1e-4 } ?? false
+                let finite = impact.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 }
+                let mean = impact.reduce(0, +) / Float(max(impact.count, 1))
+                print(String(format: "  impact: %d regions · mean %.3f · peak %@ · range %@",
+                             impact.count, mean, peakOK ? "PASS" : "FAIL",
+                             finite ? "PASS" : "FAIL"))
+                previousMeanImpact = mean
+            } else {
+                print("  impact: FAIL (no baseline impact produced)")
+            }
+            _ = previousMeanImpact
 
             if delta <= previousDelta {
                 print("  WARN: pixel delta not increasing with influence")

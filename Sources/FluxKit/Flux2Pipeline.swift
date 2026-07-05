@@ -36,6 +36,15 @@ public final class Flux2Pipeline {
         self.modelDir = modelDirectory
     }
 
+    /// A generation plus, when a baseline pass ran, the counterfactual: the base
+    /// model's image from the identical seed/noise/prompt and the per-region latent
+    /// divergence (max-normalized, row-major over the packed grid).
+    public struct Result {
+        public let image: CGImage
+        public let baseImage: CGImage?
+        public let regionImpact: [Float]?
+    }
+
     /// Synchronous; run on a background executor. `onPhase` fires on the calling thread.
     /// `adapter` installs a Signet bank branch for this generation (see ObscurKit);
     /// its recorder — when set — accrues per-entry attribution across steps/layers.
@@ -47,6 +56,26 @@ public final class Flux2Pipeline {
                          adapter: ObscurInjectionContext? = nil,
                          onPhase: ((Phase) -> Void)? = nil,
                          isCancelled: (() -> Bool)? = nil) throws -> CGImage {
+        try generateWithBaseline(prompt: prompt, width: width, height: height,
+                                 steps: steps, seed: seed, adapter: adapter,
+                                 baseline: false, onPhase: onPhase,
+                                 isCancelled: isCancelled).image
+    }
+
+    /// `baseline: true` additionally denoises a second latent trajectory with the
+    /// adapter uninstalled — same noise, prompt, and schedule (zero-gate is bit-exact
+    /// base behavior, so this IS the base model's output) — and measures per-region
+    /// impact as the L2 latent divergence per packed token. Costs one extra DiT pass
+    /// per step and one extra VAE decode.
+    public func generateWithBaseline(prompt: String,
+                                     width: Int = 1024,
+                                     height: Int = 1024,
+                                     steps: Int = 4,
+                                     seed: UInt64 = UInt64.random(in: 0..<UInt64.max),
+                                     adapter: ObscurInjectionContext? = nil,
+                                     baseline: Bool = false,
+                                     onPhase: ((Phase) -> Void)? = nil,
+                                     isCancelled: (() -> Bool)? = nil) throws -> Result {
         func checkCancelled() throws {
             if isCancelled?() == true { throw FluxKitError.cancelled }
         }
@@ -94,8 +123,9 @@ public final class Flux2Pipeline {
         let txtIDs = Self.textIDs(count: promptEmbeds.dim(1))
         let scheduler = Flux2Scheduler(imageSequenceLength: imageSeqLen, steps: steps)
 
-        // ── 3. Denoise, then free the DiT ──
+        // ── 3. Denoise (optionally a parallel baseline trajectory), free the DiT ──
         onPhase?(.loadingTransformer)
+        var baseLatents: MLXArray? = (baseline && adapter != nil) ? latents : nil
         do {
             let transformer = try Flux2Transformer(componentDir: modelDir.appendingPathComponent("transformer"))
             try checkCancelled()
@@ -107,6 +137,14 @@ public final class Flux2Pipeline {
                                         adapter: adapter)
                 latents = scheduler.step(noise: noise, latents: latents, index: i)
                 eval(latents)
+                if let base = baseLatents {
+                    let baseNoise = transformer(hidden: base, encoder: promptEmbeds,
+                                                timestep: scheduler.timesteps[i],
+                                                imgIDs: imgIDs, txtIDs: txtIDs,
+                                                adapter: nil)
+                    baseLatents = scheduler.step(noise: baseNoise, latents: base, index: i)
+                    eval(baseLatents!)
+                }
                 onPhase?(.denoising(step: i + 1, total: steps))
                 try checkCancelled()
             }
@@ -114,19 +152,39 @@ public final class Flux2Pipeline {
         promptEmbeds = MLXArray()
         Memory.clearCache()
 
-        // ── 4. Decode ──
+        // Counterfactual impact: L2 latent divergence per packed token, max-normalized.
+        var regionImpact: [Float]? = nil
+        if let base = baseLatents {
+            let diff = (latents.asType(.float32) - base.asType(.float32))
+                .square().sum(axis: -1).sqrt()[0]          // (imageSeq,)
+            eval(diff)
+            var values: [Float] = diff.asArray(Float.self)
+            let peak = max(values.max() ?? 0, 1e-9)
+            values = values.map { $0 / peak }
+            regionImpact = values
+        }
+
+        // ── 4. Decode (both trajectories when baseline ran) ──
         onPhase?(.decoding)
         let packed = latents.reshaped(1, packedH, packedW, 128).transposed(0, 3, 1, 2)
         var imageArray: MLXArray
+        var baseImageArray: MLXArray? = nil
         do {
             let vae = try Flux2VAEDecoder(componentDir: modelDir.appendingPathComponent("vae"))
             imageArray = vae.decodePacked(packed)   // NHWC, [-1, 1]
             eval(imageArray)
+            if let base = baseLatents {
+                let basePacked = base.reshaped(1, packedH, packedW, 128).transposed(0, 3, 1, 2)
+                baseImageArray = vae.decodePacked(basePacked)
+                eval(baseImageArray!)
+            }
         }
         Memory.clearCache()
         try checkCancelled()
 
-        return try Self.toCGImage(imageArray)
+        return Result(image: try Self.toCGImage(imageArray),
+                      baseImage: try baseImageArray.map { try Self.toCGImage($0) },
+                      regionImpact: regionImpact)
     }
 
     /// Encode a prompt to Qwen3 context embeddings, loading and freeing the encoder.
