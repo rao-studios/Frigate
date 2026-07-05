@@ -182,6 +182,110 @@ public final class Flux2VAEDecoder {
     }
 }
 
+// MARK: - Encoder (real image → BN-normalized packed training latents)
+
+/// FLUX.2 VAE encode path, used by the P1 training campaign to turn real dataset
+/// images into the packed, BN-normalized latent space the DiT denoises in (the same
+/// space generation samples its noise in). Deterministic: takes the posterior mean
+/// (diffusers "argmax" sampling); scaling=1, shift=0 for FLUX.2.
+public final class Flux2VAEEncoder {
+    let bnMean: MLXArray
+    let bnStd: MLXArray
+    let quantW: MLXArray, quantB: MLXArray
+    let convInW: MLXArray, convInB: MLXArray
+    let downBlocks: [[Flux2VAEDecoder.Resnet]]
+    let downsampleConvs: [(MLXArray, MLXArray)?]
+    let midResnet1: Flux2VAEDecoder.Resnet
+    let midAttention: Flux2VAEDecoder.MidAttention
+    let midResnet2: Flux2VAEDecoder.Resnet
+    let normOutW: MLXArray, normOutB: MLXArray
+    let convOutW: MLXArray, convOutB: MLXArray
+
+    public init(componentDir: URL) throws {
+        let store = try TensorStore(componentDir: componentDir)
+        bnMean = try store.take("bn.running_mean").asType(.float32)
+        bnStd = MLX.sqrt(try store.take("bn.running_var").asType(.float32) + Flux2VAEDecoder.bnEps)
+        let qc = try store.conv2d("quant_conv")
+        quantW = qc.weight
+        quantB = qc.bias
+        let ci = try store.conv2d("encoder.conv_in")
+        convInW = ci.weight
+        convInB = ci.bias
+
+        var blocks: [[Flux2VAEDecoder.Resnet]] = []
+        var downs: [(MLXArray, MLXArray)?] = []
+        let numBlocks = Flux2VAEDecoder.blockOut.count
+        for i in 0..<numBlocks {
+            var resnets: [Flux2VAEDecoder.Resnet] = []
+            for j in 0..<2 {   // layers_per_block = 2 on the encoder side
+                resnets.append(try Flux2VAEDecoder.Resnet(store: store,
+                                                          prefix: "encoder.down_blocks.\(i).resnets.\(j)"))
+            }
+            blocks.append(resnets)
+            if i < numBlocks - 1 {
+                downs.append(try store.conv2d("encoder.down_blocks.\(i).downsamplers.0.conv"))
+            } else {
+                downs.append(nil)
+            }
+        }
+        downBlocks = blocks
+        downsampleConvs = downs
+
+        midResnet1 = try Flux2VAEDecoder.Resnet(store: store, prefix: "encoder.mid_block.resnets.0")
+        midAttention = try Flux2VAEDecoder.MidAttention(store: store, prefix: "encoder.mid_block.attentions.0")
+        midResnet2 = try Flux2VAEDecoder.Resnet(store: store, prefix: "encoder.mid_block.resnets.1")
+        normOutW = try store.take("encoder.conv_norm_out.weight")
+        normOutB = try store.take("encoder.conv_norm_out.bias")
+        let co = try store.conv2d("encoder.conv_out")
+        convOutW = co.weight
+        convOutB = co.bias
+        store.drain()
+    }
+
+    /// image: (B, H, W, 3) NHWC in [-1, 1], H/W multiples of 16.
+    /// Returns BN-normalized packed latents (B, (H/16)*(W/16), 128) — x0 for training.
+    public func encodePackedNormalized(_ image: MLXArray) -> MLXArray {
+        var h = image.asType(Flux2Pipeline.activationDType)
+        h = conv2dSame(h, weight: convInW, bias: convInB)
+
+        for (i, resnets) in downBlocks.enumerated() {
+            for resnet in resnets {
+                h = resnet(h)
+            }
+            if let (w, bias) = downsampleConvs[i] {
+                // Asymmetric pad (bottom/right by 1) then stride-2 conv, pad 0 — matches
+                // mflux's Flux2Downsample2D.
+                h = MLX.padded(h, widths: [.init((0, 0)), .init((0, 1)), .init((0, 1)), .init((0, 0))])
+                h = MLX.conv2d(h, w, stride: [2, 2], padding: [0, 0]) + bias
+            }
+            eval(h)
+        }
+
+        h = midResnet1(h)
+        h = midAttention(h)
+        h = midResnet2(h)
+
+        h = groupNorm(h, weight: normOutW, bias: normOutB)
+        h = silu(h)
+        h = conv2dSame(h, weight: convOutW, bias: convOutB)     // (B, H/8, W/8, 64)
+        h = conv2d1x1(h, weight: quantW, bias: quantB)
+
+        // Posterior mean = first 32 channels (channels-last).
+        let mean = h[0..., 0..., 0..., ..<Flux2VAEDecoder.latentChannels].asType(.float32)
+
+        // NHWC → NCHW, patchify 32→128 (2×2), BN normalize, pack (B, seq, 128).
+        var latents = mean.transposed(0, 3, 1, 2)
+        let (b, c, lh, lw) = (latents.dim(0), latents.dim(1), latents.dim(2), latents.dim(3))
+        latents = latents.reshaped(b, c, lh / 2, 2, lw / 2, 2)
+            .transposed(0, 1, 3, 5, 2, 4)
+            .reshaped(b, c * 4, lh / 2, lw / 2)
+        latents = (latents - bnMean.reshaped(1, -1, 1, 1)) / bnStd.reshaped(1, -1, 1, 1)
+        return latents.reshaped(b, c * 4, (lh / 2) * (lw / 2))
+            .transposed(0, 2, 1)
+            .asType(Flux2Pipeline.activationDType)
+    }
+}
+
 // MARK: - Conv/GroupNorm helpers (NHWC, PyTorch-compatible numerics)
 
 func conv2dSame(_ x: MLXArray, weight: MLXArray, bias: MLXArray) -> MLXArray {

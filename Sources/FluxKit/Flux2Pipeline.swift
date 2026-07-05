@@ -129,6 +129,17 @@ public final class Flux2Pipeline {
         return try Self.toCGImage(imageArray)
     }
 
+    /// Encode a prompt to Qwen3 context embeddings, loading and freeing the encoder.
+    /// Exposed for the projection trainer (which caches one empty-prompt embedding).
+    public func promptEmbeddings(for prompt: String) throws -> MLXArray {
+        let (inputIDs, attentionMask) = try tokenize(prompt: prompt)
+        let encoder = try Qwen3TextEncoder(componentDir: modelDir.appendingPathComponent("text_encoder"))
+        let embeds = encoder.promptEmbeddings(inputIDs: inputIDs, attentionMask: attentionMask)
+        eval(embeds)
+        Memory.clearCache()
+        return embeds
+    }
+
     // MARK: - Prompt tokenization
 
     /// Qwen3 chat template for one user message, generation prompt, thinking disabled —

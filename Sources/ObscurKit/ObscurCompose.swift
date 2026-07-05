@@ -68,6 +68,26 @@ public struct ObscurComposedKV {
     public let tokenCount: Int
 
     public var isEmpty: Bool { tokenCount == 0 }
+
+    public init(kv: [ObscurLayerRef: (k: MLXArray, v: MLXArray)],
+                logitBias: MLXArray, spans: [Span], tokenCount: Int) {
+        self.kv = kv
+        self.logitBias = logitBias
+        self.spans = spans
+        self.tokenCount = tokenCount
+    }
+
+    /// A single-entry bank of `tokenCount` tokens (bias 0) — the training-time bank
+    /// (projection output for one image), differentiable: `kv` is left un-eval'd.
+    public static func singleEntry(kv: [ObscurLayerRef: (k: MLXArray, v: MLXArray)],
+                                   tokenCount: Int,
+                                   corpusID: ObscurCorpusID = "train",
+                                   entryID: ObscurEntryID = "entry") -> ObscurComposedKV {
+        ObscurComposedKV(kv: kv,
+                         logitBias: MLXArray.zeros([tokenCount], type: Float.self),
+                         spans: [Span(corpusID: corpusID, entryID: entryID, range: 0..<tokenCount)],
+                         tokenCount: tokenCount)
+    }
 }
 
 public enum ObscurComposer {
@@ -284,11 +304,13 @@ public final class ObscurInjectionContext {
             .transposed(0, 2, 1, 3)
             .reshaped(b, s, headCount * headDim)
 
-        // Per-token RMS match against the base attention output.
+        // Per-token RMS match against the base attention output. Eps inside the sqrt:
+        // a (near-)zero branch otherwise has an infinite sqrt gradient at 0, which NaNs
+        // training when backprop runs through this scale.
         let base32 = baseOutput.asType(.float32)
-        let baseRMS = sqrt(base32.square().mean(axis: -1, keepDims: true))
-        let branchRMS = sqrt(out.square().mean(axis: -1, keepDims: true))
-        out = out * (baseRMS / (branchRMS + 1e-6))
+        let baseRMS = sqrt(base32.square().mean(axis: -1, keepDims: true) + 1e-12)
+        let branchRMS = sqrt(out.square().mean(axis: -1, keepDims: true) + 1e-12)
+        out = out * (baseRMS / branchRMS)
 
         return (out * gate).asType(outDtype)
     }

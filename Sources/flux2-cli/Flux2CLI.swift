@@ -28,7 +28,7 @@ struct Flux2CLI: AsyncParsableCommand {
     )
 
     @Option(name: .long, help: "Prompt text.")
-    var prompt: String
+    var prompt: String = ""
 
     @Option(name: .long, help: "Output PNG path.")
     var out: String = "/tmp/flux2.png"
@@ -51,6 +51,58 @@ struct Flux2CLI: AsyncParsableCommand {
     @Flag(name: .long, help: "Run the Signet adapter gate test: zero-gate bit-exactness, attribution sum, influence sweep.")
     var testAdapter = false
 
+    @Flag(name: .long, help: "Bootstrap P1: pretrain the Signet projection and save obscur.projection.v1.safetensors.")
+    var trainProjection = false
+
+    @Option(name: .long, help: "P1 training steps.")
+    var trainSteps: Int = 400
+
+    @Option(name: .long, help: "DINOv2 weights (dinov2_small.safetensors).")
+    var dinoWeights: String = "/Users/ritesh/Documents/projects/seer/Ra/applications/CLR/Sources/CLRCore/Resources/dinov2_small.safetensors"
+
+    @Flag(name: .long, help: "Production P1: train the projection on a real-image dataset (atlas layout).")
+    var trainCampaign = false
+
+    @Option(name: .long, help: "Campaign dataset root (e.g. /Volumes/T9/datasets/atlas).")
+    var dataset: String = "/Volumes/T9/datasets/atlas"
+
+    @Option(name: .long, help: "Preprocessed cache dir (default <dataset>/.obscur-p1-cache).")
+    var cacheDir: String?
+
+    @Option(name: .long, help: "Campaign dir for checkpoints/logs/previews.")
+    var campaignDir: String = NSString(string: "~/Documents/obscur-p1-campaign").expandingTildeInPath
+
+    @Option(name: .long, help: "Campaign: max dataset images.")
+    var maxImages: Int = 8000
+
+    @Option(name: .long, help: "Campaign: optimizer steps.")
+    var campaignSteps: Int = 20000
+
+    @Flag(name: .long, help: "Campaign: resume from the checkpoint in --campaign-dir.")
+    var resume = false
+
+    @Option(name: .long, help: "P3: reference image to ingest as a 1-image Signet for the trained-vs-random comparison.")
+    var testProjection: String?
+
+    @Option(name: .long, help: "P3: trained projection artifact to compare against random.")
+    var projection: String?
+
+    /// Diverse subjects × styles for the bootstrap P1 self-supervised dataset.
+    static let trainingPrompts: [String] = {
+        let subjects = ["a mountain lake", "a city street at night", "a bowl of fruit",
+                        "a portrait of a woman", "a red sports car", "a forest path",
+                        "a cup of coffee", "a sailboat on the sea", "a field of sunflowers",
+                        "an old stone bridge", "a snowy village", "a desert at dusk"]
+        let styles = ["photorealistic", "oil painting", "watercolor", "pencil sketch",
+                      "anime style", "cyberpunk neon", "impressionist", "low-poly 3D render"]
+        var prompts: [String] = []
+        for (i, s) in subjects.enumerated() {
+            prompts.append("\(s), \(styles[i % styles.count])")
+            prompts.append("\(s), \(styles[(i + 3) % styles.count])")
+        }
+        return prompts
+    }()
+
     func run() async throws {
         let repoID = "mlx-community/flux2-klein-4b-4bit"
         let dir: URL
@@ -69,6 +121,42 @@ struct Flux2CLI: AsyncParsableCommand {
         }
 
         let pipeline = Flux2Pipeline(modelDirectory: dir)
+
+        if trainCampaign {
+            let datasetURL = URL(fileURLWithPath: dataset)
+            let campaignURL = URL(fileURLWithPath: campaignDir)
+            let cacheURL = cacheDir.map { URL(fileURLWithPath: $0) }
+                ?? datasetURL.appendingPathComponent(".obscur-p1-cache")
+            let outputURL = out.hasSuffix(".safetensors")
+                ? URL(fileURLWithPath: out)
+                : campaignURL.appendingPathComponent("obscur.projection.v1.safetensors")
+            let campaign = ObscurCampaign(
+                config: .init(modelDir: dir,
+                              dinoWeightsURL: URL(fileURLWithPath: dinoWeights),
+                              datasetRoot: datasetURL,
+                              cacheDir: cacheURL,
+                              campaignDir: campaignURL,
+                              outputURL: outputURL,
+                              maxImages: maxImages,
+                              steps: campaignSteps)) { print($0); fflush(stdout) }
+            _ = try campaign.train(resume: resume)
+            return
+        }
+
+        if trainProjection {
+            let trainer = ObscurProjectionTrainer(modelDirectory: dir,
+                                                  dinoWeightsURL: URL(fileURLWithPath: dinoWeights))
+            let start = Date()
+            _ = try trainer.train(prompts: Self.trainingPrompts, steps: trainSteps,
+                                  outputURL: URL(fileURLWithPath: out)) { print($0) }
+            print(String(format: "✓ P1 training done in %.0fs", Date().timeIntervalSince(start)))
+            return
+        }
+
+        if let refPath = testProjection {
+            try runProjectionTest(pipeline: pipeline, refPath: refPath)
+            return
+        }
 
         if testAdapter {
             try runAdapterGateTest(pipeline: pipeline)
@@ -95,6 +183,50 @@ struct Flux2CLI: AsyncParsableCommand {
         CGImageDestinationAddImage(dest, image, nil)
         CGImageDestinationFinalize(dest)
         print("✓ wrote \(out) (\(image.width)×\(image.height)) in \(String(format: "%.1f", elapsed))s")
+    }
+
+    // MARK: - P3 projection validation (trained vs random, visual style transfer)
+
+    /// Ingest a reference image as a 1-entry Signet, then generate the SAME neutral
+    /// prompt/seed three ways — base (no adapter), random projection, trained projection —
+    /// so the trained projection's style-transfer can be compared against noise.
+    func runProjectionTest(pipeline: Flux2Pipeline, refPath: String) throws {
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: refPath) as CFURL, nil),
+              let refImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            throw ValidationError("cannot read reference image \(refPath)")
+        }
+        let dino = ObscurDinov2()
+        try dino.loadWeights(url: URL(fileURLWithPath: dinoWeights))
+        let refTokens = dino.patchTokens(ObscurDinoPreprocess.input(refImage))[0].asType(.float16)
+        MLX.eval(refTokens)
+
+        func bank(_ proj: ObscurProjection) -> ObscurInjectionContext {
+            let kv = proj.project(refTokens)
+            let composed = ObscurComposedKV.singleEntry(kv: kv, tokenCount: ObscurProjection.pooledTokens)
+            let gates = ObscurGates.grouped(structure: 0.8, texture: 0.8, layers: proj.hookedLayers)
+            return ObscurInjectionContext(composed: composed, gates: gates, recorder: nil)
+        }
+
+        func gen(_ adapter: ObscurInjectionContext?, _ suffix: String) throws {
+            let image = try pipeline.generate(prompt: prompt.isEmpty ? "a photograph" : prompt,
+                                              width: 256, height: 256, steps: steps, seed: seed,
+                                              adapter: adapter)
+            let url = URL(fileURLWithPath: out.replacingOccurrences(of: ".png", with: "-\(suffix).png"))
+            if let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, image, nil)
+                CGImageDestinationFinalize(dest)
+                print("  wrote \(url.lastPathComponent)")
+            }
+        }
+
+        print("• baseline (no Signet)…");     try gen(nil, "base")
+        print("• random projection…");        try gen(bank(ObscurProjection(seed: 999)), "random")
+        if let projPath = projection {
+            print("• trained projection…")
+            let trained = try ObscurProjection.load(from: URL(fileURLWithPath: projPath))
+            try gen(bank(trained), "trained")
+        }
+        print("✓ projection test complete")
     }
 
     // MARK: - Signet adapter gate test (spec build-order gate 4)

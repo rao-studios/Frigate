@@ -114,6 +114,56 @@ public final class ObscurProjection {
         return out
     }
 
+    // MARK: - Training support (differentiable functional forward)
+
+    /// Flat name→array view of the trainable parameters, for `valueAndGrad`.
+    public func trainableParameters() -> [String: MLXArray] {
+        var params: [String: MLXArray] = [
+            "pool.queries": poolQueries.asType(.float32),
+            "trunk.in": trunkIn.asType(.float32),
+            "trunk.out": trunkOut.asType(.float32),
+        ]
+        for (layer, head) in heads {
+            params["head.\(layer.key).k"] = head.k.asType(.float32)
+            params["head.\(layer.key).v"] = head.v.asType(.float32)
+        }
+        return params
+    }
+
+    /// Load updated (trained) values back in, casting to the fp16 storage dtype.
+    public func setTrainableParameters(_ params: [String: MLXArray]) {
+        if let p = params["pool.queries"] { poolQueries = p.asType(.float16) }
+        if let p = params["trunk.in"] { trunkIn = p.asType(.float16) }
+        if let p = params["trunk.out"] { trunkOut = p.asType(.float16) }
+        for layer in hookedLayers {
+            if let k = params["head.\(layer.key).k"], let v = params["head.\(layer.key).v"] {
+                heads[layer] = (k.asType(.float16), v.asType(.float16))
+            }
+        }
+    }
+
+    /// Differentiable projection forward from an explicit fp32 params dict — used by the
+    /// trainer so gradients reach `params`. Mirrors `project(_:)` exactly.
+    public static func projectFunctional(_ tokens: MLXArray, params: [String: MLXArray],
+                                         hookedLayers: [ObscurLayerRef])
+        -> [ObscurLayerRef: (k: MLXArray, v: MLXArray)] {
+        let t = tokens.asType(.float32)
+        let q = params["pool.queries"]!
+        let scale = 1.0 / Float(dinoDim).squareRoot()
+        let logits = matmul(q, t.transposed(1, 0)) * scale
+        let attn = softmax(logits, axis: -1)
+        var x = matmul(attn, t)                                      // (32, 384)
+        let h = gelu(matmul(x, params["trunk.in"]!.transposed(1, 0)))
+        x = x + matmul(h, params["trunk.out"]!.transposed(1, 0))
+        var out: [ObscurLayerRef: (MLXArray, MLXArray)] = [:]
+        for layer in hookedLayers {
+            let k = matmul(x, params["head.\(layer.key).k"]!.transposed(1, 0))
+            let v = matmul(x, params["head.\(layer.key).v"]!.transposed(1, 0))
+            out[layer] = (k, v)
+        }
+        return out
+    }
+
     // MARK: - Persistence (versioned safetensors)
 
     public func save(to url: URL) throws {
