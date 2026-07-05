@@ -103,7 +103,32 @@ struct Flux2CLI: AsyncParsableCommand {
         return prompts
     }()
 
+    /// MLX resolves its Metal kernels from `<binary dir>/mlx.metallib` first. Frigate
+    /// ships no metallib (CLR's resource bundle carries it), so `swift build` output
+    /// lacks one and any clean wipes a hand-copied file. Self-heal at launch: copy from
+    /// `FLUX2_METALLIB` (env) or CLR's known resource path when missing.
+    static func ensureMetallib() {
+        let binaryDir = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath().deletingLastPathComponent()
+        let target = binaryDir.appendingPathComponent("mlx.metallib")
+        guard !FileManager.default.fileExists(atPath: target.path) else { return }
+
+        let candidates = [
+            ProcessInfo.processInfo.environment["FLUX2_METALLIB"],
+            "/Users/ritesh/Documents/projects/seer/Ra/applications/CLR/Sources/CLRCore/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        ].compactMap { $0 }
+
+        for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
+            if (try? FileManager.default.copyItem(at: URL(fileURLWithPath: candidate), to: target)) != nil {
+                print("• restored mlx.metallib → \(target.path)")
+                return
+            }
+        }
+        print("⚠️ mlx.metallib not found next to the binary and no source available — set FLUX2_METALLIB to a metallib path if MLX fails to start.")
+    }
+
     func run() async throws {
+        Self.ensureMetallib()
         let repoID = "mlx-community/flux2-klein-4b-4bit"
         let dir: URL
         if let modelDir {
@@ -284,7 +309,8 @@ struct Flux2CLI: AsyncParsableCommand {
         print("• influence sweep…")
         var previousDelta = 0.0
         for influence: Float in [0.25, 0.75, 1.0] {
-            let recorder = ObscurAttributionRecorder(spans: composed.spans)
+            let recorder = ObscurAttributionRecorder(spans: composed.spans,
+                                                     gridWidth: 16, gridHeight: 16)
             let px = try pixels(influence: influence, recorder: recorder)
             let delta = zip(px, base).reduce(0.0) { $0 + abs(Double($1.0) - Double($1.1)) }
                 / Double(max(base.count, 1))
@@ -299,6 +325,30 @@ struct Flux2CLI: AsyncParsableCommand {
             for (id, share) in report.entries.sorted(by: { $0.key < $1.key }) {
                 print(String(format: "    %@ share %.4f", id, share.attentionShare))
             }
+
+            // Spatial map invariants: per-region shares sum to 1 (where relief > 0), and
+            // the per-entry totals derived from the spatial map match the aggregate report.
+            if let map = recorder.influenceMap() {
+                let e = map.entryIDs.count
+                var worstRegionSum: Float = 1
+                for i in 0..<(map.gridWidth * map.gridHeight) where map.regionRelief[i] > 0 {
+                    let sum = map.shares(atRegion: i).reduce(0, +)
+                    if abs(sum - 1) > abs(worstRegionSum - 1) { worstRegionSum = sum }
+                }
+                var worstEntryDelta: Float = 0
+                for (j, id) in map.entryIDs.enumerated() {
+                    let aggregate = report.entries[id]?.attentionShare ?? 0
+                    worstEntryDelta = max(worstEntryDelta, abs(map.entryTotals[j] - aggregate))
+                }
+                let reliefOK = map.regionRelief.max().map { abs($0 - 1) < 1e-4 } ?? false
+                print(String(format: "  spatial: worst region sum %.5f %@ · spatial↔aggregate Δ %.5f %@ · relief max %@",
+                             worstRegionSum, abs(worstRegionSum - 1) < 1e-3 ? "PASS" : "FAIL",
+                             worstEntryDelta, worstEntryDelta < 1e-3 ? "PASS" : "FAIL",
+                             reliefOK ? "PASS" : "FAIL"))
+            } else {
+                print("  spatial: FAIL (no map produced)")
+            }
+
             if delta <= previousDelta {
                 print("  WARN: pixel delta not increasing with influence")
             }

@@ -89,6 +89,8 @@ public final class ObscurBank {
     public private(set) var order: [ObscurEntryID]
     /// Per-corpus attention logit bias (composition mixing weight, log-space).
     public var logitBias: Float
+    /// Semantic motifs (k-means over entry dinoMeans) — set at forge time.
+    public var motifs: [ObscurMotif] = []
     /// In-memory K/V memo per entry (invalidated on entry change / projection change).
     var kvMemo: [ObscurEntryID: [ObscurLayerRef: (k: MLXArray, v: MLXArray)]] = [:]
 
@@ -137,11 +139,14 @@ public enum ObscurStore {
         var corpusID: ObscurCorpusID
         var logitBias: Float
         var entries: [EntryMeta]
+        // Absent in pre-motif banks — they recluster on next forge.
+        var motifs: [ObscurMotif]? = nil
     }
 
     public static func save(_ bank: ObscurBank, to dir: URL) throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var manifest = Manifest(corpusID: bank.corpusID, logitBias: bank.logitBias, entries: [])
+        var manifest = Manifest(corpusID: bank.corpusID, logitBias: bank.logitBias,
+                                entries: [], motifs: bank.motifs.isEmpty ? nil : bank.motifs)
         var tensors: [String: MLXArray] = [:]
         for id in bank.order {
             guard let entry = bank.entries[id] else { continue }
@@ -167,6 +172,7 @@ public enum ObscurStore {
         let manifest = try JSONDecoder().decode(Manifest.self, from: data)
         let tensors = try loadArrays(url: dir.appendingPathComponent("bank.safetensors"))
         let bank = ObscurBank(corpusID: manifest.corpusID, logitBias: manifest.logitBias)
+        bank.motifs = manifest.motifs ?? []
         for meta in manifest.entries {
             guard let dino = tensors["\(meta.id).dino"] else {
                 throw ObscurKitError.corruptStore("missing tokens for entry \(meta.id)")

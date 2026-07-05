@@ -357,7 +357,7 @@ let package = Package(
         .target(
             name: "ObscurKit",
             dependencies: [
-                "MLX", "MLXNN", "MLXFast", "MLXRandom",
+                "MLX", "MLXNN", "MLXFast", "MLXRandom", "MLXAccelerate",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -163,20 +163,74 @@ public enum ObscurComposer {
 // MARK: - Attribution
 
 /// Accumulates gate-weighted attention mass per entry, per layer, per denoising step.
-/// A faithful record of what the model read — a causal-input record, not an influence
-/// certificate.
+/// With grid dimensions set, also accumulates the SPATIAL map: attention mass per image
+/// region (query token) per entry — the data behind the Influence Cloud. A faithful
+/// record of what the model read — a causal-input record, not an influence certificate.
 public final class ObscurAttributionRecorder {
     // step → layerKey → entry masses (aligned with spans order)
     private var masses: [Int: [String: [Float]]] = [:]
     private let spans: [ObscurComposedKV.Span]
     public var currentStep: Int = 0
 
-    public init(spans: [ObscurComposedKV.Span]) {
+    /// Image-token grid (packedW × packedH). Zero ⇒ spatial recording disabled.
+    public let gridWidth: Int
+    public let gridHeight: Int
+    /// (S × E) row-major accumulator, gate-weighted, summed over layers and steps.
+    private var spatialAccum: [Float]
+
+    var wantsSpatial: Bool { gridWidth > 0 && gridHeight > 0 }
+
+    public init(spans: [ObscurComposedKV.Span], gridWidth: Int = 0, gridHeight: Int = 0) {
         self.spans = spans
+        self.gridWidth = gridWidth
+        self.gridHeight = gridHeight
+        self.spatialAccum = [Float](repeating: 0,
+                                    count: max(gridWidth * gridHeight * spans.count, 0))
     }
 
     func record(layer: ObscurLayerRef, entryMasses: [Float]) {
         masses[currentStep, default: [:]][layer.key] = entryMasses
+    }
+
+    /// masses: (S × E) row-major for this layer/step, already gate-weighted.
+    func recordSpatial(_ values: [Float]) {
+        guard values.count == spatialAccum.count else { return }
+        for i in 0..<values.count {
+            spatialAccum[i] += values[i]
+        }
+    }
+
+    /// The per-region influence map accumulated across the generation, or nil when
+    /// spatial recording was disabled.
+    public func influenceMap() -> ObscurInfluenceMap? {
+        guard wantsSpatial, !spans.isEmpty else { return nil }
+        let s = gridWidth * gridHeight
+        let e = spans.count
+        var relief = [Float](repeating: 0, count: s)
+        var shares = [Float](repeating: 0, count: s * e)
+        var entryTotals = [Float](repeating: 0, count: e)
+        for i in 0..<s {
+            var total: Float = 0
+            for j in 0..<e {
+                let value = spatialAccum[i * e + j]
+                total += value
+                entryTotals[j] += value
+            }
+            relief[i] = total
+            if total > 0 {
+                for j in 0..<e {
+                    shares[i * e + j] = spatialAccum[i * e + j] / total
+                }
+            }
+        }
+        let grandTotal = max(entryTotals.reduce(0, +), 1e-12)
+        let maxRelief = max(relief.max() ?? 0, 1e-12)
+        return ObscurInfluenceMap(gridWidth: gridWidth,
+                                  gridHeight: gridHeight,
+                                  entryIDs: spans.map(\.entryID),
+                                  regionRelief: relief.map { $0 / maxRelief },
+                                  entryShares: shares,
+                                  entryTotals: entryTotals.map { $0 / grandTotal })
     }
 
     public func report(generationID: UUID, modelVersion: String,
@@ -213,6 +267,26 @@ public final class ObscurAttributionRecorder {
                                        projectionVersion: projectionVersion,
                                        corpora: corpora,
                                        entries: entries)
+    }
+}
+
+/// Spatial influence map for one generation: for every image region (packed token),
+/// how much the adapter branch read from each bank entry. Region order is row-major
+/// over the packed grid; each region maps to a 16×16-pixel patch of the output.
+public struct ObscurInfluenceMap: Codable {
+    public let gridWidth: Int
+    public let gridHeight: Int
+    public let entryIDs: [String]
+    /// (S,) — total adapter attention per region, max-normalized to 0…1 (Z relief).
+    public let regionRelief: [Float]
+    /// (S × E) row-major — per region, each entry's share (sums to 1 where relief > 0).
+    public let entryShares: [Float]
+    /// (E,) — whole-generation share per entry (matches the aggregate report).
+    public let entryTotals: [Float]
+
+    public func shares(atRegion index: Int) -> [Float] {
+        let e = entryIDs.count
+        return Array(entryShares[(index * e)..<((index + 1) * e)])
     }
 }
 
@@ -298,6 +372,17 @@ public final class ObscurInjectionContext {
                 tokenMass[span.range].reduce(0, +) * gate
             }
             recorder.record(layer: layer, entryMasses: entryMasses)
+
+            // Spatial map: mass per image region per entry (S × E), gate-weighted.
+            if recorder.wantsSpatial, recorder.gridWidth * recorder.gridHeight == s {
+                let spatial = attn.sum(axes: [0, 1])                       // (S, N)
+                let columns = composed.spans.map { span in
+                    spatial[0..., span.range.lowerBound..<span.range.upperBound].sum(axis: -1)
+                }
+                let regionByEntry = stacked(columns, axis: -1)             // (S, E)
+                eval(regionByEntry)
+                recorder.recordSpatial(regionByEntry.asArray(Float.self).map { $0 * gate })
+            }
         }
 
         var out = matmul(attn, vHeads)                                     // (B, H, S, D)
