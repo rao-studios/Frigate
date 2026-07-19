@@ -54,8 +54,12 @@ private struct XGBModel: Decodable {
 
     struct LearnerModelParam: Decodable {
         let baseScore: String   // stored as e.g. "[5E-1]" or "0.5" in XGBoost 2.x
+        let numFeature: String? // e.g. "40" — feature-vector width the booster expects
 
-        enum CodingKeys: String, CodingKey { case baseScore = "base_score" }
+        enum CodingKeys: String, CodingKey {
+            case baseScore = "base_score"
+            case numFeature = "num_feature"
+        }
 
         var baseScoreFloat: Float {
             // XGBoost 2.x wraps the value in brackets: "[5E-1]"
@@ -103,9 +107,15 @@ public struct XGBoostTreeModel: Sendable {
     private let trees: [XGTree]
     private let baseScoreLogit: Float  // logit(base_score); 0 for base_score=0.5
 
+    /// Feature-vector width the booster was trained with (`learner_model_param.num_feature`),
+    /// or 0 if the model json omits it. Lets callers gate expensive feature extraction on
+    /// what the loaded model actually consumes.
+    public let numFeatures: Int
+
     public init(url: URL) throws {
         let data = try Data(contentsOf: url)
         let decoded = try JSONDecoder().decode(XGBModel.self, from: data)
+        numFeatures = Int(decoded.learner.learnerModelParam.numFeature ?? "") ?? 0
 
         let bs = decoded.learner.learnerModelParam.baseScoreFloat
         // base_score is a probability; convert to log-odds (logit) to add to margin.

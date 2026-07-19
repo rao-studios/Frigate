@@ -189,14 +189,18 @@ public func buildBicubicWarpTapsHost(
 ) -> WarpTapTableHost {
     let T = dstToSrc.count
     let count = T * height * width
-    var idx = [[Int32]](repeating: [Int32](repeating: 0, count: count), count: 16)
-    var wts = [[Float]](repeating: [Float](repeating: 0, count: count), count: 16)
+    // Flat [16 · count] buffers filled row-parallel (each (t, y) writes a disjoint
+    // range), then split into the 16 per-tap arrays. Full-image tables (CLR v2.6
+    // directional probes, 512²) made the sequential build the pipeline bottleneck.
+    let iBuf = UnsafeMutablePointer<Int32>.allocate(capacity: 16 * count)
+    let wBuf = UnsafeMutablePointer<Float>.allocate(capacity: 16 * count)
+    defer { iBuf.deallocate(); wBuf.deallocate() }
 
-    for t in 0..<T {
+    DispatchQueue.concurrentPerform(iterations: T * height) { r in
+        let t = r / height, y = r % height
         let m = dstToSrc[t]
         let base = sourceIsTrialStacked ? Int32(t * height * width) : Int32(0)
-        for y in 0..<height {
-            for x in 0..<width {
+        for x in 0..<width {
                 let xd = Double(x), yd = Double(y)
                 let den = m[6] * xd + m[7] * yd + m[8]
                 let sxNum = m[0] * xd + m[1] * yd + m[2]
@@ -225,12 +229,17 @@ public func buildBicubicWarpTapsHost(
                     for i in 0..<4 {
                         let srcX = reflect101Index(ix - 1 + i, width)
                         let k = j * 4 + i
-                        idx[k][p] = base + Int32(srcY * width + srcX)
-                        wts[k][p] = Float(wy[j] * wx[i])
+                        iBuf[k * count + p] = base + Int32(srcY * width + srcX)
+                        wBuf[k * count + p] = Float(wy[j] * wx[i])
                     }
                 }
-            }
         }
+    }
+    var idx = [[Int32]](); idx.reserveCapacity(16)
+    var wts = [[Float]](); wts.reserveCapacity(16)
+    for k in 0..<16 {
+        idx.append(Array(UnsafeBufferPointer(start: iBuf + k * count, count: count)))
+        wts.append(Array(UnsafeBufferPointer(start: wBuf + k * count, count: count)))
     }
     return WarpTapTableHost(indices: idx, weights: wts)
 }
