@@ -317,9 +317,9 @@ let package = Package(
         .library(name: "MLXFast", targets: ["MLXFast"]),
 
         // Transformers stack
-        .library(name: "Hub", targets: ["Hub"]),
-        .library(name: "Tokenizers", targets: ["Tokenizers"]),
-        .library(name: "Transformers", targets: ["Tokenizers", "Generation", "Models"]),
+        .library(name: "FrigateHub", targets: ["Hub"]),
+        .library(name: "FrigateTokenizers", targets: ["Tokenizers"]),
+        .library(name: "FrigateTransformers", targets: ["Tokenizers", "Generation", "Models"]),
 
         // LLM / embedding models
         .library(name: "MLXLLM", targets: ["MLXLLM"]),
