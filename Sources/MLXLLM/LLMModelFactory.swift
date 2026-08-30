@@ -7,7 +7,7 @@ import MLXLMCommon
 import Tokenizers
 
 /// Creates a function that decodes configuration data and instantiates a model with the proper configuration
-private func create<C: Codable, M>(
+private func create<C: Decodable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
 ) -> (Data) throws -> M {
     { data in
@@ -33,6 +33,10 @@ public enum LLMTypeRegistry {
         "gemma3": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
         "gemma3_text": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
         "gemma3n": create(Gemma3nTextConfiguration.self, Gemma3nTextModel.init),
+        "gemma4": create(Gemma4Configuration.self, Gemma4Model.init),
+        "gemma4_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
+        "gemma4_unified": create(Gemma4Configuration.self, Gemma4Model.init),
+        "gemma4_unified_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
         "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
         "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
         "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
@@ -185,6 +189,14 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "What is the difference between a fruit and a vegetable?",
         // https://ai.google.dev/gemma/docs/core/prompt-structure
         extraEOSTokens: ["<end_of_turn>"]
+    )
+
+    /// Hub id only — weights are downloaded on first load, never vendored.
+    static public let gemma4_12b_coder_4bit = ModelConfiguration(
+        id: "mlx-community/gemma-4-12b-coder-fable5-composer2.5-4bit",
+        defaultPrompt: "Write a Swift function that reverses a string.",
+        extraEOSTokens: ["<end_of_turn>"],
+        toolCallFormat: .gemma
     )
 
     static public let qwen205b4bit = ModelConfiguration(
@@ -369,6 +381,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma3n_E2B_it_lm_bf16,
             gemma3n_E4B_it_lm_4bit,
             gemma3n_E2B_it_lm_4bit,
+            gemma4_12b_coder_4bit,
             granite3_3_2b_4bit,
             granite_4_0_h_tiny_4bit_dwq,
             llama3_1_8B_4bit,

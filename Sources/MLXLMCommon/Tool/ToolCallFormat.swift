@@ -102,7 +102,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .lfm2
         case "glm4", "glm4_moe", "glm4_moe_lite":
             return .glm4
-        case "gemma":
+        case "gemma", "gemma2", "gemma3", "gemma3_text", "gemma3n",
+            "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text":
             return .gemma
         default:
             return nil
