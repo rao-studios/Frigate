@@ -211,6 +211,49 @@ let noCudaCmlxExcludes = [
     ]
 #endif
 
+// ── FrigateVision — VisionAX, re-exported ────────────────────────────────────
+// WHAT: Frigate hosts every ML surface its consumers take; pixel perception is one of
+//       them. VisionAX (Canny regions → ONNX role classifier → page map) keeps its own
+//       repo, bench, harvester and training; this is the door consumers walk through.
+// PIN:  macOS ONLY, AND ONLY ON A macOS HOST. VisionAX arrives with two xcframework
+//       binary targets (OpenCV, ONNX Runtime) that Linux cannot resolve, so the
+//       dependency, the target AND the product live in one `#if !os(Linux)` block —
+//       a product naming an absent target fails manifest validation, and a Linux box
+//       (Totem's CUDA build) must never learn that VisionAX exists. The guard is
+//       evaluated on the host, the same way the CUDA branches above are.
+//       MLX-FREE BY CONSTRUCTION. The wrapper depends on the VisionAX product and
+//       nothing else, so a consumer that takes FrigateVision alone links no MLX.
+//       NEVER FOLDED INTO THE `Frigate` UMBRELLA. VisionAX replicates the AX type names
+//       (AXNodeSnapshot, AXScreenElement, AXNodeCategory) that Mary's machine layer
+//       declares; `import Frigate` must not carry them, or every consumer of the
+//       umbrella inherits an ambiguity at the use site. FrigateExports.swift stays clean;
+//       ManifestPlatformTests pins it.
+//       THE FLOOR IS macOS 15 BECAUSE OF THIS. A macOS-14 library cannot depend on a
+//       macOS-15 product; every consumer (Mary, Bonnie, Fleet, Totem, Zehn) already sits
+//       at 15 or above.
+var visionDependencies: [Package.Dependency] = []
+var visionTargets: [Target] = []
+var visionProducts: [Product] = []
+var visionTestDependencies: [Target.Dependency] = []
+#if !os(Linux)
+    visionDependencies = [
+        .package(path: "../VisionAX")
+    ]
+    visionTargets = [
+        .target(
+            name: "FrigateVision",
+            dependencies: [
+                .product(name: "VisionAX", package: "VisionAX")
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        )
+    ]
+    visionProducts = [
+        .library(name: "FrigateVision", targets: ["FrigateVision"])
+    ]
+    visionTestDependencies = ["FrigateVision"]
+#endif
+
 // MLXVLM uses AVFoundation, CoreImage, CoreGraphics — macOS/iOS only.
 // On Linux exclude the model files and media processing; keep VLMModel.swift (protocol).
 #if os(Linux)
@@ -294,7 +337,10 @@ let package = Package(
     name: "Frigate",
 
     platforms: [
-        .macOS("14.0"),
+        // 15, not 14: FrigateVision depends on VisionAX, whose floor is 15, and a target
+        // cannot require less than the product it depends on. Every consumer is at or
+        // above 15 already.
+        .macOS("15.0"),
         .iOS(.v17),
         .tvOS(.v17),
         .visionOS(.v1),
@@ -332,14 +378,14 @@ let package = Package(
         .library(name: "FluxKit", targets: ["FluxKit"]),
         // Obscur per-corpus KV-bank adapter (Signets) over FLUX.2 Klein
         .library(name: "ObscurKit", targets: ["ObscurKit"]),
-    ],
+    ] + visionProducts,
 
     dependencies: [
         .package(url: "https://github.com/apple/swift-numerics", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
-    ],
+    ] + visionDependencies,
 
     targets: [
         // ── C++ core ──────────────────────────────────────────────────────────
@@ -557,8 +603,9 @@ let package = Package(
         .testTarget(
             name: "FrigateTests",
             dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon"]
+                + visionTestDependencies
         ),
-    ],
+    ] + visionTargets,
 
     cxxLanguageStandard: .gnucxx20
 )

@@ -13,10 +13,59 @@ All fork sources are vendored directly — no external URLs for patched librarie
 | `FrigateEmbedder` | `mlx-community/snowflake-arctic-embed-m-v1.5` | Returns `[[Float]]` |
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
 | `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
+| `FrigateVision` | bundled ONNX region classifier | Pixel perception, re-exported from [VisionAX](../VisionAX) — **macOS only** |
 
 HuggingFace models are downloaded on first use and cached at `~/.cache/huggingface/`. `FrigateBoost` loads a model exported with `booster.save_model("model.json")` — no `libxgboost` required at runtime.
 
 ---
+
+## FrigateVision — pixel perception
+
+`import FrigateVision` gives you VisionAX whole: the OpenCV region detector, Apple's text
+recognition, the ONNX role classifier and the page map.
+
+```swift
+import FrigateVision
+
+let engine = try VisionEngine()
+let scene = try engine.perceive(
+    image: capture,
+    projection: ScreenProjection(origin: pageOrigin, pixelsPerPoint: 2),
+    classifier: try? RegionClassifier.bundled(),
+    lanes: [.regions, .text])
+let map = scene.pageMap()          // rows, what each affords, where its name came from
+```
+
+It is a **re-export**, not a copy — VisionAX keeps its own repository, bench, harvester and
+training pipeline, and this package is the door consumers walk through.
+
+Three things worth knowing:
+
+- **macOS only.** VisionAX brings OpenCV and ONNX Runtime as xcframeworks, which Linux
+  cannot resolve, so the dependency, the target and the product all live inside
+  `#if !os(Linux)` in `Package.swift`. A Linux build of Frigate never learns they exist,
+  and `../VisionAX` need not be checked out on a Linux box. `ManifestPlatformTests` fails
+  on macOS the moment something escapes that guard, so the Linux box is never the first to
+  find out.
+- **It is not in the `Frigate` umbrella.** `import Frigate` does not carry it, deliberately:
+  VisionAX declares `AXNodeSnapshot`, `AXScreenElement` and `AXNodeCategory` under the same
+  names an accessibility layer already uses, and every consumer of the umbrella would
+  inherit that ambiguity at the use site.
+- **It costs no MLX.** The wrapper depends on the VisionAX product alone, so taking
+  `FrigateVision` links none of the inference stack.
+
+Two consequences of the path dependency, both benign:
+
+- On macOS, every consumer's `Package.resolved` gains an `opencv-spm` pin and their next
+  resolve fetches the OpenCV and ONNX Runtime artifacts, whether or not they link
+  `FrigateVision`.
+- Frigate's own `Package.resolved` differs by host (macOS has `opencv-spm`; Linux does not).
+  A plain `swift build` on Linux drops the extra pin with a warning and rewrites the file —
+  which is why the Linux scripts do not pass `--force-resolved-versions`.
+
+Because Frigate now carries a path dependency, **a consumer must take Frigate by path too**
+(`.package(path: "../Frigate")`): SwiftPM refuses a package required by URL that itself
+depends on a local package.
 
 ## Requirements
 
@@ -25,7 +74,7 @@ HuggingFace models are downloaded on first use and cached at `~/.cache/huggingfa
 | Swift | 6.3+ |
 | Ubuntu | 24.04 Noble (Linux) |
 | CUDA | 12.x — GPU sm_86+ recommended (e.g. RTX 3090) |
-| macOS | 14+ — Metal, no CUDA needed |
+| macOS | 15+ — Metal, no CUDA needed |
 
 ---
 
