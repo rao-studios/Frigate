@@ -3,8 +3,9 @@ import Foundation
 /// Built-in filters for Jinja template rendering.
 ///
 /// Filters transform values in template expressions using the pipe syntax (`|`).
-/// All filter functions follow the same signature pattern, accepting an array of values
-/// (with the filtered value as the first element), optional keyword arguments, and an environment.
+/// Each filter accepts an array of values (with the filtered value first),
+/// optional keyword arguments,
+/// and an environment.
 public enum Filters {
     // MARK: - Basic String Filters
 
@@ -14,10 +15,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            throw JinjaError.runtime("upper filter requires string")
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -25,7 +22,7 @@ public enum Filters {
             defaults: [:]
         )
 
-        return .string(str.uppercased())
+        return .string(softString(args.first).uppercased())
     }
 
     /// Converts a string to lowercase.
@@ -34,10 +31,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            throw JinjaError.runtime("lower filter requires string")
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -45,7 +38,7 @@ public enum Filters {
             defaults: [:]
         )
 
-        return .string(str.lowercased())
+        return .string(softString(args.first).lowercased())
     }
 
     /// Returns the length of a string, array, or object.
@@ -92,9 +85,7 @@ public enum Filters {
             defaults: ["separator": .string(""), "attribute": .null]
         )
 
-        guard case let .string(separator) = arguments["separator"] else {
-            throw JinjaError.runtime("join filter requires string separator")
-        }
+        let separator = softString(arguments["separator"])
 
         let strings: [String]
         if let attribute = arguments["attribute"], attribute != .null {
@@ -223,7 +214,7 @@ public enum Filters {
             if dict.isEmpty { return .undefined }
             let randomIndex = dict.keys.indices.randomElement()!
             let randomKey = dict.keys[randomIndex]
-            return .string(randomKey)
+            return Value(randomKey)
         default:
             return .undefined
         }
@@ -666,7 +657,7 @@ public enum Filters {
         }
         let reverse = arguments["reverse"]!.isTruthy
 
-        let sortedPairs: [(key: String, value: Value)]
+        let sortedPairs: [(key: ObjectKey, value: Value)]
         if by == "value" {
             sortedPairs = dict.sorted { a, b in
                 let comparison =
@@ -677,16 +668,13 @@ public enum Filters {
             }
         } else {
             sortedPairs = dict.sorted { a, b in
-                let comparison =
-                    caseSensitive
-                    ? a.key.compare(b.key)
-                    : a.key.localizedCaseInsensitiveCompare(b.key)
+                let comparison = a.key.compare(b.key, options: caseSensitive ? [] : [.caseInsensitive])
                 return reverse ? comparison == .orderedDescending : comparison == .orderedAscending
             }
         }
 
         let resultArray = sortedPairs.map { key, value in
-            Value.array([.string(key), value])
+            Value.array([Value(key), value])
         }
         return .array(resultArray)
     }
@@ -765,10 +753,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard args.count > 1, case let .string(formatString) = args[0] else {
-            return args.first ?? .string("")
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -776,7 +760,12 @@ public enum Filters {
             defaults: [:]
         )
 
+        let formatString = softString(args.first)
         let formatArgs = Array(args.dropFirst())
+        guard !formatArgs.isEmpty else {
+            return .string(formatString)
+        }
+
         var result = ""
         var formatIdx = formatString.startIndex
         var argIdx = 0
@@ -983,9 +972,12 @@ public enum Filters {
         var needsSpace = false
         for (key, value) in dict {
             if value == .null || value == .undefined { continue }
+            let keyString = key.stringValue
             // Validate key doesn't contain invalid characters
-            if key.contains(" ") || key.contains("/") || key.contains(">") || key.contains("=") {
-                throw JinjaError.runtime("Invalid character in XML attribute key: '\(key)'")
+            if keyString.contains(" ") || keyString.contains("/") || keyString.contains(">")
+                || keyString.contains("=")
+            {
+                throw JinjaError.runtime("Invalid character in XML attribute key: '\(keyString)'")
             }
             let escapedValue = value.description
                 .replacingOccurrences(of: "&", with: "&amp;")
@@ -993,7 +985,7 @@ public enum Filters {
                 .replacingOccurrences(of: ">", with: "&gt;")
                 .replacingOccurrences(of: "\"", with: "&quot;")
             if needsSpace { result += " " }
-            result += "\(key)=\"\(escapedValue)\""
+            result += "\(keyString)=\"\(escapedValue)\""
             needsSpace = true
         }
         if autospace && !result.isEmpty {
@@ -1028,16 +1020,14 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return .string("")
-        }
-
         let arguments = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
             parameters: ["chars"],
             defaults: ["chars": .null]
         )
+
+        let str = softString(args.first)
 
         let characterSet: CharacterSet
         if case let .string(chars) = arguments["chars"], !chars.isEmpty {
@@ -1065,13 +1055,18 @@ public enum Filters {
         return try forceescape(args, kwargs: kwargs, env: env)
     }
 
-    /// Converts value to JSON string.
+    /// Converts value to a JSON string.
+    ///
+    /// The output follows the environment's typed JSON policies
+    /// (see ``Environment/policies``).
+    /// By default that is Python's `json.dumps` with `ensure_ascii=False`,
+    /// which is what transformers uses to render chat templates.
     ///
     /// - Parameters:
-    ///   - indent: If greater than 0, enables pretty-printed output using
-    ///             Foundation's default indentation (optional).
-    ///   - ensure_ascii: If true (default), escape non-ASCII characters as `\uXXXX`.
-    ///                   If false, output Unicode characters directly.
+    ///   - indent: Number of spaces to indent nested values by.
+    ///             Overrides the policy's indentation.
+    ///   - ensure_ascii: Whether to escape non-ASCII characters as `\uXXXX`.
+    ///                   Overrides the policy's non-ASCII escaping.
     @Sendable public static func tojson(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -1083,50 +1078,24 @@ public enum Filters {
             args: Array(args.dropFirst()),
             kwargs: kwargs,
             parameters: ["indent", "ensure_ascii"],
-            defaults: ["indent": .null, "ensure_ascii": .boolean(true)]
+            defaults: ["indent": .null, "ensure_ascii": .null]
         )
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting.insert(.sortedKeys)
-        if let indent = arguments["indent"],
-            case .int(let count) = indent,
-            count > 0
-        {
-            encoder.outputFormatting.insert(.prettyPrinted)
+        let policies = env.policies
+        var options = policies.jsonDumpsOptions
+        switch arguments["indent"] {
+        case .int(let count):
+            options.indent = count
+        case .null, .undefined, nil:
+            break
+        default:
+            throw JinjaError.runtime("tojson indent must be an integer or none")
+        }
+        if let ensureASCII = arguments["ensure_ascii"], ensureASCII != .null {
+            options.ensureASCII = ensureASCII.isTruthy
         }
 
-        let ensureASCII: Bool
-        if let ensureASCIIValue = arguments["ensure_ascii"] {
-            ensureASCII = ensureASCIIValue.isTruthy
-        } else {
-            ensureASCII = true
-        }
-
-        if let jsonData = (try? encoder.encode(value)),
-            let jsonString = String(data: jsonData, encoding: .utf8)
-        {
-            if ensureASCII {
-                return .string(escapeNonASCII(jsonString))
-            }
-            return .string(jsonString)
-        } else {
-            return .string("null")
-        }
-    }
-
-    /// Escapes non-ASCII characters in a string as `\uXXXX` sequences.
-    private static func escapeNonASCII(_ string: String) -> String {
-        var result = ""
-        result.reserveCapacity(string.utf16.count)
-        // Iterate UTF-16 code units so non-BMP scalars emit surrogate pairs.
-        for codeUnit in string.utf16 {
-            if codeUnit > 127 {
-                result += String(format: "\\u%04x", codeUnit)
-            } else if let scalar = UnicodeScalar(codeUnit) {
-                result.append(Character(scalar))
-            }
-        }
-        return result
+        return .string(try policies.jsonSerializer.dumps(value, options: options))
     }
 
     /// Returns absolute value of a number.
@@ -1162,10 +1131,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return .string("")
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -1173,6 +1138,7 @@ public enum Filters {
             defaults: [:]
         )
 
+        let str = softString(args.first)
         return .string(str.prefix(1).uppercased() + str.dropFirst().lowercased())
     }
 
@@ -1182,10 +1148,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return args.first ?? .string("")
-        }
-
         let arguments = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -1197,6 +1159,7 @@ public enum Filters {
             throw JinjaError.runtime("center filter requires width parameter")
         }
 
+        let str = softString(args.first)
         let padCount = width - str.count
         if padCount <= 0 {
             return .string(str)
@@ -1450,10 +1413,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return .string("")
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -1461,7 +1420,7 @@ public enum Filters {
             defaults: [:]
         )
 
-        return .string(str.capitalized)
+        return .string(softString(args.first).capitalized)
     }
 
     /// Counts words in a string.
@@ -1470,10 +1429,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return .int(0)
-        }
-
         _ = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -1481,7 +1436,7 @@ public enum Filters {
             defaults: [:]
         )
 
-        let words = str.split { $0.isWhitespace || $0.isNewline }
+        let words = softString(args.first).split { $0.isWhitespace || $0.isNewline }
         return .int(words.count)
     }
 
@@ -1495,10 +1450,6 @@ public enum Filters {
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            return args.first ?? .string("")
-        }
-
         let arguments = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
@@ -1506,11 +1457,9 @@ public enum Filters {
             defaults: ["count": .null]
         )
 
-        guard case let .string(old) = arguments["old"],
-            case let .string(new) = arguments["new"]
-        else {
-            throw JinjaError.runtime("replace() requires 'old' and 'new' string arguments.")
-        }
+        let str = softString(args.first)
+        let old = softString(arguments["old"])
+        let new = softString(arguments["new"])
 
         // Handle count parameter - can be positional (3rd arg) or named (count=)
         let count: Int?
@@ -1586,7 +1535,7 @@ public enum Filters {
         if case .object(let dict) = value {
             var components = URLComponents()
             components.queryItems = dict.map { key, value in
-                URLQueryItem(name: key, value: value.description)
+                URLQueryItem(name: key.stringValue, value: value.description)
             }
             return .string(components.percentEncodedQuery ?? "")
         }
@@ -1840,7 +1789,7 @@ public enum Filters {
 
         if case let .object(obj) = value {
             let pairs = obj.map { key, value in
-                Value.array([.string(key), value])
+                Value.array([Value(key), value])
             }
             return .array(pairs)
         }
@@ -1874,7 +1823,7 @@ public enum Filters {
             case let .object(dict):
                 if dict.isEmpty { return "{}" }
                 let items = dict.map { key, value in
-                    "\(indentString)  \"\(key)\": \(prettyPrint(value, indent: indent + 1))"
+                    "\(indentString)  \"\(key.stringValue)\": \(prettyPrint(value, indent: indent + 1))"
                 }
                 return "{\n" + items.joined(separator: ",\n") + "\n\(indentString)}"
             case let .string(str):
@@ -2091,6 +2040,52 @@ public enum Filters {
 
 // MARK: -
 
+/// Returns the string form of a value, matching Jinja2's `soft_str`.
+///
+/// Treats `undefined` and `null` as an empty string.
+/// Other values use the same representation as template interpolation
+/// (`Value.description`).
+/// String filters call this instead of requiring a `.string` case,
+/// so expressions like `value['type'] | upper` succeed when the value is missing.
+///
+/// - Parameter value: The value to convert, or `nil` to treat as undefined.
+/// - Returns: A string suitable for string filters that accept non-string input.
+private func softString(_ value: Value?) -> String {
+    (value ?? .undefined).description
+}
+
+/// Escapes HTML special characters in a string.
+///
+/// Replaces `&`, `<`, `>`, `"`, and `'` with their corresponding HTML entities.
+///
+/// - Parameter string: The string to escape.
+/// - Returns: An HTML-safe copy of `string`.
+private func htmlEscape(_ string: String) -> String {
+    string
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+        .replacingOccurrences(of: "\"", with: "&#34;")
+        .replacingOccurrences(of: "'", with: "&#39;")
+}
+
+/// Escapes non-ASCII characters in a string as `\uXXXX` sequences.
+///
+/// Iterates UTF-16 code units so non-BMP scalars emit surrogate pairs.
+///
+/// - Parameter string: The string to escape.
+/// - Returns: An ASCII-only string with non-ASCII characters escaped.
+/// Returns the value of an attribute on an item.
+///
+/// Resolves string attribute names through property members,
+/// and integer indexes into arrays or objects.
+/// Returns `undefined` when the attribute cannot be resolved.
+///
+/// - Parameters:
+///   - item: The value to read from.
+///   - attribute: A string name or integer index identifying the attribute.
+/// - Returns: The attribute value, or `undefined` if it is missing.
+/// - Throws: An error if evaluating a string attribute fails.
 private func resolveAttributeValue(_ item: Value, attribute: Value) throws -> Value {
     switch attribute {
     case let .string(name):
@@ -2103,7 +2098,7 @@ private func resolveAttributeValue(_ item: Value, attribute: Value) throws -> Va
             }
             return .undefined
         case let .object(values):
-            return values[String(index)] ?? .undefined
+            return values[.int(index)] ?? values[.string(String(index))] ?? .undefined
         default:
             return .undefined
         }
@@ -2112,6 +2107,28 @@ private func resolveAttributeValue(_ item: Value, attribute: Value) throws -> Va
     }
 }
 
+/// Compares two values for ordering.
+///
+/// When both values are strings and comparison is case-insensitive,
+/// or when `useStringComparisonWhenCaseSensitive` is true,
+/// compares their string forms directly.
+/// Otherwise uses ``Value/compare(to:)``,
+/// optionally falling back to description-based ordering on failure.
+///
+/// - Parameters:
+///   - lhs: The left-hand value.
+///   - rhs: The right-hand value.
+///   - caseSensitive: A Boolean value that indicates whether string comparison
+///     is case-sensitive.
+///   - useStringComparisonWhenCaseSensitive: A Boolean value that indicates whether
+///     to compare strings lexicographically even when `caseSensitive` is true.
+///   - fallbackToDescription: A Boolean value that indicates whether to compare
+///     `description` strings when ``Value/compare(to:)`` fails.
+/// - Returns: A negative value if `lhs` precedes `rhs`,
+///   zero if they are equal,
+///   and a positive value if `lhs` follows `rhs`.
+/// - Throws: An error if the values cannot be compared
+///   and `fallbackToDescription` is false.
 private func compareValues(
     _ lhs: Value,
     _ rhs: Value,
@@ -2139,13 +2156,4 @@ private func compareValues(
         }
         throw error
     }
-}
-
-private func htmlEscape(_ string: String) -> String {
-    string
-        .replacingOccurrences(of: "&", with: "&amp;")
-        .replacingOccurrences(of: "<", with: "&lt;")
-        .replacingOccurrences(of: ">", with: "&gt;")
-        .replacingOccurrences(of: "\"", with: "&#34;")
-        .replacingOccurrences(of: "'", with: "&#39;")
 }

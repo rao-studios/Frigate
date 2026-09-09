@@ -155,7 +155,12 @@ let noCudaCmlxExcludes = [
                 "mlx-conditional",
                 "mlx-c/mlx/c/metal.cpp",
 
-                "mlx-c/mlx/c/fast.cpp",
+                // mlx-c/mlx/c/fast.cpp is deliberately NOT excluded: it is a thin C binding
+                // over `mlx::core::fast::*`, whose implementation (mlx/mlx/fast.cpp) is
+                // backend-agnostic and already compiled here. Excluding it left
+                // mlx_fast_{rms_norm,layer_norm,rope,scaled_dot_product_attention}
+                // undefined, which a library build does not notice — only the first
+                // executable to link Frigate (Thread) did.
             ] + noMetalCmlxExcludes + noCudaCmlxExcludes
 
         cxxSettings = []
@@ -167,12 +172,22 @@ let noCudaCmlxExcludes = [
             .linkedLibrary("openblas", .when(platforms: [.linux])),
         ]
 
+        // Same list as the CUDA branch above, and deliberately so: the Swift layer's only
+        // platform axis is Metal-vs-not, so the no-GPU build excludes exactly the Metal
+        // files. The three extra exclusions this list used to carry each removed a symbol
+        // something else still referenced, and broke the CPU-only build:
+        //   • GPU+CUDA.swift    — despite the name, a portable stub (`import Cmlx`, one
+        //                         enum, `maxRecommendedWorkingSetBytes()` returning nil).
+        //                         It is the ONLY definition of `GPU` once GPU+Metal.swift
+        //                         is gone, and MLXLMCommon/SpeculativeDecoding.swift calls it.
+        //   • MLXFast.swift     — imports only Cmlx; its "Metal kernel" mentions are doc
+        //                         comments about mlx's internal dispatch. Removing it took
+        //                         `MLX.MLXFast` with it, which the MLXFast shim target
+        //                         dereferences.
+        //   • MLXFastKernel.swift — already carries its own `#else` stub for non-Metal.
         mlxSwiftExcludes = [
             "GPU+Metal.swift",
-            "GPU+CUDA.swift",
             "MLXArray+Metal.swift",
-            "MLXFast.swift",
-            "MLXFastKernel.swift",
         ]
     }
 #else
@@ -254,10 +269,57 @@ var visionTestDependencies: [Target.Dependency] = []
     visionTestDependencies = ["FrigateVision"]
 #endif
 
+// FLUX.2 / Obscur are image-generation code: ObscurDinov2 decodes a `CGImage` through
+// CGContext/CGColorSpace, and FluxKit + the flux2-cli harness follow it in. They are
+// Apple-only in practice (flux2-cli is even labelled a macOS verification harness) and no
+// consumer takes them, so they leave the Linux graph entirely — the FrigateVision treatment.
+var imageGenTargets: [Target] = []
+var imageGenProducts: [Product] = []
+#if !os(Linux)
+    imageGenTargets = [
+        // ── Obscur Signet adapter: per-corpus KV banks + attribution ─────────
+        .target(
+            name: "ObscurKit",
+            dependencies: [
+                "MLX", "MLXNN", "MLXFast", "MLXRandom", "MLXAccelerate",
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // ── FLUX.2 Klein text-to-image (MLX port of mflux's flux2) ───────────
+        .target(
+            name: "FluxKit",
+            dependencies: [
+                "MLX", "MLXNN", "MLXFast", "MLXRandom",
+                "Tokenizers", "Hub", "ObscurKit",
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // macOS verification harness: downloads the model, generates, writes a PNG.
+        .executableTarget(
+            name: "flux2-cli",
+            dependencies: [
+                "FluxKit",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+    ]
+    imageGenProducts = [
+        .library(name: "FluxKit", targets: ["FluxKit"]),
+        .library(name: "ObscurKit", targets: ["ObscurKit"]),
+    ]
+#endif
+
 // MLXVLM uses AVFoundation, CoreImage, CoreGraphics — macOS/iOS only.
 // On Linux exclude the model files and media processing; keep VLMModel.swift (protocol).
 #if os(Linux)
-    let vlmExcludes: [String] = ["README.md", "MediaProcessing.swift", "Models", "VLMModelFactory.swift"]
+    // Gemma4AssistantRegistration.swift is not itself Apple-only, but it references
+    // Gemma4AssistantConfiguration / Gemma4AssistantDraftModel from Models/, which is
+    // excluded here — so it has to go with them.
+    let vlmExcludes: [String] = [
+        "README.md", "MediaProcessing.swift", "Models", "VLMModelFactory.swift",
+        "Gemma4AssistantRegistration.swift",
+    ]
 #else
     let vlmExcludes: [String] = ["README.md"]
 #endif
@@ -372,16 +434,23 @@ let package = Package(
         .library(name: "MLXVLM", targets: ["MLXVLM"]),
         .library(name: "MLXLMCommon", targets: ["MLXLMCommon"]),
         .library(name: "MLXEmbedders", targets: ["MLXEmbedders"]),
+        .library(name: "FrigateBridge", targets: ["FrigateBridge"]),
         .library(name: "mlx_embeddings", targets: ["mlx_embeddings"]),
 
-        // FLUX.2 Klein text-to-image pipeline (MLX)
-        .library(name: "FluxKit", targets: ["FluxKit"]),
-        // Obscur per-corpus KV-bank adapter (Signets) over FLUX.2 Klein
-        .library(name: "ObscurKit", targets: ["ObscurKit"]),
-    ] + visionProducts,
+    ] + visionProducts + imageGenProducts,
 
     dependencies: [
         .package(url: "https://github.com/apple/swift-numerics", from: "1.0.0"),
+        // yyjson is taken by URL rather than vendored, and deliberately so. swift-transformers
+        // 1.3.x needs it, and WhisperKit brings its own swift-transformers into the same link
+        // in at least one consumer (Bonnie). Two copies of yyjson.c define the same C symbols,
+        // and nothing in SwiftPM can separate them: module aliasing explicitly does not cover
+        // non-Swift symbols, renaming the target does not rename its symbols, and even hidden
+        // ("private external") visibility still trips ld64's duplicate check. Depending on the
+        // same package URL makes SwiftPM dedupe by identity, so every graph gets exactly one.
+        // This does not weaken the vendoring rule in README: that rule is about *patched* fork
+        // sources, and this is stock upstream C taken at the pin swift-transformers itself uses.
+        .package(url: "https://github.com/ibireme/yyjson.git", exact: "0.12.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
@@ -399,32 +468,6 @@ let package = Package(
             ]
         ),
 
-        // ── Obscur Signet adapter: per-corpus KV banks + attribution ─────────
-        .target(
-            name: "ObscurKit",
-            dependencies: [
-                "MLX", "MLXNN", "MLXFast", "MLXRandom", "MLXAccelerate",
-            ],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        // ── FLUX.2 Klein text-to-image (MLX port of mflux's flux2) ───────────
-        .target(
-            name: "FluxKit",
-            dependencies: [
-                "MLX", "MLXNN", "MLXFast", "MLXRandom",
-                "Tokenizers", "Hub", "ObscurKit",
-            ],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        // macOS verification harness: downloads the model, generates, writes a PNG.
-        .executableTarget(
-            name: "flux2-cli",
-            dependencies: [
-                "FluxKit",
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
         .plugin(
             name: "CudaBuild",
             capability: .buildTool(),
@@ -496,11 +539,27 @@ let package = Package(
             ]
         ),
 
+        // ── EventSource (vendored; AsyncHTTPClient trait deliberately off) ────
+        .target(
+            name: "EventSource"
+        ),
+
+        // ── swift-huggingface (vendored; Xet trait deliberately off) ──────────
+        .target(
+            name: "HuggingFace",
+            dependencies: [
+                "EventSource",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+
         // ── Transformers stack (swift-transformers vendored) ──────────────────
         .target(
             name: "Hub",
             dependencies: [
                 "Jinja",
+                "HuggingFace",
+                .product(name: "yyjson", package: "yyjson"),
                 .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
@@ -529,7 +588,6 @@ let package = Package(
             name: "MLXLMCommon",
             dependencies: [
                 "MLX", "MLXNN", "MLXOptimizers",
-                "Tokenizers", "Generation", "Models",
             ],
             exclude: ["README.md"],
             swiftSettings: [
@@ -543,7 +601,6 @@ let package = Package(
             name: "MLXLLM",
             dependencies: [
                 "MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers",
-                "Tokenizers", "Generation", "Models",
             ],
             exclude: ["README.md"],
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -552,7 +609,6 @@ let package = Package(
             name: "MLXVLM",
             dependencies: [
                 "MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers",
-                "Tokenizers", "Generation", "Models",
             ],
             exclude: vlmExcludes,
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -561,10 +617,18 @@ let package = Package(
             name: "MLXEmbedders",
             dependencies: [
                 "MLX", "MLXNN", "MLXLMCommon",
-                "Tokenizers", "Generation", "Models",
             ],
             exclude: ["README.md"],
             swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+
+        // ── FrigateBridge — concrete Downloader/Tokenizer for MLXLMCommon 3.x ──
+        // mlx-swift-lm 3.x made download + tokenization protocols. Upstream supplies these
+        // via the MLXHuggingFace macro target (swift-syntax); this package wires them by
+        // hand so nothing here needs a compiler plugin.
+        .target(
+            name: "FrigateBridge",
+            dependencies: ["MLXLMCommon", "Hub", "Tokenizers"]
         ),
 
         // ── mlx_embeddings (mlx.embeddings vendored) ──────────────────────────
@@ -592,7 +656,7 @@ let package = Package(
             dependencies: [
                 "MLX", "MLXNN", "Tokenizers",
                 "MLXLMCommon", "MLXLLM", "mlx_embeddings",
-                "MLXAccelerate",
+                "MLXAccelerate", "FrigateBridge",
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
@@ -605,7 +669,7 @@ let package = Package(
             dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon"]
                 + visionTestDependencies
         ),
-    ] + visionTargets,
+    ] + visionTargets + imageGenTargets,
 
     cxxLanguageStandard: .gnucxx20
 )

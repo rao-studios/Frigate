@@ -10,136 +10,14 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// MARK: - Gated Delta Helpers
+// MARK: - Helpers
 
-private func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
     x * sigmoid(gate)
 }
 
-private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(aLog.dtype)
-}
-
-private func gatedDeltaStepOps(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
-    state: MLXArray,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let oldState = state
-    let decay: MLXArray
-    if g.ndim == 2 {
-        decay = expandedDimensions(g, axes: [2, 3])
-    } else if g.ndim == 3 {
-        decay = expandedDimensions(g, axis: -2)
-    } else {
-        fatalError("Unsupported gating shape \(g.shape)")
-    }
-
-    var state = state * decay
-    let kvMem = (state * expandedDimensions(k, axis: -2)).sum(axis: -1)
-    let delta = (v - kvMem) * expandedDimensions(beta, axis: -1)
-    state = state + expandedDimensions(k, axis: -2) * expandedDimensions(delta, axis: -1)
-    let y = (state * expandedDimensions(q, axis: -2)).sum(axis: -1)
-
-    if let mask {
-        let expandedMask: MLXArray
-        if mask.ndim == 1 {
-            expandedMask = expandedDimensions(mask, axes: [1, 2, 3])
-        } else if mask.ndim == 2 {
-            expandedMask = expandedDimensions(mask, axes: [2, 3])
-        } else if mask.ndim == 3 {
-            expandedMask = expandedDimensions(mask, axis: -1)
-        } else {
-            fatalError("Unsupported mask shape \(mask.shape)")
-        }
-        state = MLX.where(expandedMask, state, oldState)
-    }
-
-    return (y, state)
-}
-
-private func gatedDeltaOps(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
-    state: MLXArray? = nil,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let B = q.dim(0)
-    let T = q.dim(1)
-    let Hk = q.dim(2)
-    let Dk = q.dim(3)
-    let Hv = v.dim(2)
-    let Dv = v.dim(3)
-
-    var q = q
-    var k = k
-
-    let repeatFactor = Hv / Hk
-    if repeatFactor > 1 {
-        q = repeated(q, count: repeatFactor, axis: -2)
-        k = repeated(k, count: repeatFactor, axis: -2)
-    }
-
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
-
-    var ys = [MLXArray]()
-    ys.reserveCapacity(T)
-
-    for t in 0 ..< T {
-        let qT = q[0..., t]
-        let kT = k[0..., t]
-        let vT = v[0..., t]
-        let gT = g[0..., t]
-        let betaT = beta[0..., t]
-        let maskT = mask == nil ? nil : mask![0..., t]
-
-        let (y, newState) = gatedDeltaStepOps(
-            q: qT,
-            k: kT,
-            v: vT,
-            g: gT,
-            beta: betaT,
-            state: state,
-            mask: maskT
-        )
-        ys.append(y)
-        state = newState
-    }
-
-    let y = MLX.stacked(ys, axis: 1)
-    return (y, state)
-}
-
-private func gatedDeltaUpdate(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    a: MLXArray,
-    b: MLXArray,
-    aLog: MLXArray,
-    dtBias: MLXArray,
-    state: MLXArray? = nil,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
-    let g = computeGatedDeltaG(aLog, a, dtBias)
-
-    let B = q.dim(0)
-    let Dk = q.dim(3)
-    let Hv = v.dim(2)
-    let Dv = v.dim(3)
-
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
-
-    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+private func preciseSwiGLU(_ hiddenStates: MLXArray, gate: MLXArray, x: MLXArray) -> MLXArray {
+    (silu(gate.asType(.float32)) * x.asType(.float32)).asType(hiddenStates.dtype)
 }
 
 // MARK: - Model Components
@@ -157,7 +35,7 @@ final class Qwen3NextRMSNormGated: Module {
     func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
         var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
         if let gate {
-            x = x * silu(gate)
+            x = preciseSwiGLU(hiddenStates, gate: gate, x: x)
         }
         return x
     }
@@ -175,7 +53,7 @@ public final class Qwen3NextAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: OffsetLayer
+    let rope: RoPELayer
 
     init(_ args: Qwen3NextConfiguration) {
         self.args = args
@@ -225,13 +103,9 @@ public final class Qwen3NextAttention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -388,7 +262,7 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         let convInput = concatenated([convState, mixedQKV], axis: 1)
         if let cache {
-            cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
+            cache[0] = contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
         }
 
         let convOut = silu(conv1d(convInput))
@@ -400,9 +274,11 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         let invScale = pow(Float(headKDim), -0.5)
         qOut =
-            (invScale * invScale)
+            MLXArray(invScale * invScale).asType(dtype)
             * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
-        kOut = invScale * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
+        kOut =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newState) = gatedDeltaUpdate(
             q: qOut,
@@ -418,6 +294,7 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         if let cache {
             cache[1] = newState
+            cache.advance(S)
         }
 
         let normalized = norm(out, gate: z)
@@ -468,7 +345,7 @@ final class Qwen3NextSparseMoeBlock: Module {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = weightedExpertSum(y, scores)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
@@ -679,7 +556,7 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
                 continue
             }
             if normSuffixes.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
-                sanitizedWeights[key] = value + 1.0
+                sanitizedWeights[key] = value + MLXArray(1, dtype: value.dtype)
             }
         }
 
@@ -788,6 +665,12 @@ public struct Qwen3NextConfiguration: Codable, Sendable {
             [String: StringOrNumber].self, forKey: .ropeScaling)
         self.fullAttentionInterval =
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+    }
+}
+
+extension Qwen3NextConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        try validateRoPEConfiguration(ropeScaling, context: "Qwen3NextConfiguration.rope_scaling")
     }
 }
 

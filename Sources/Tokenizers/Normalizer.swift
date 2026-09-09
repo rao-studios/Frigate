@@ -226,7 +226,7 @@ class BertNormalizer: Normalizer {
 
     private func handleChineseChars(text: String) -> String {
         text.map { c in
-            if let scalar = c.unicodeScalars.first, Utils.isChineseChar(scalar) {
+            if let scalar = c.unicodeScalars.first, scalar.isCJKUnifiedIdeograph {
                 " \(c) "
             } else {
                 "\(c)"
@@ -236,11 +236,32 @@ class BertNormalizer: Normalizer {
     }
 
     private func stripAccents(text: String) -> String {
-        // This might be the same as `text.folding(options: .diacriticInsensitive, locale: nil)`
+        // Equivalent of HF Python's `_run_strip_accents`: NFD-decompose then drop every
+        // nonspacing-mark scalar (Unicode general category Mn). Filtering only
+        // U+0300..U+036F handled Latin diacritics but missed marks in other blocks —
+        // notably the Japanese voiced-kana combining marks U+3099/U+309A.
+        // This matches Rust `tokenizers` and HF Python.
         String(
-            text.decomposedStringWithCanonicalMapping.unicodeScalars.filter { scalar in
-                !(scalar.value >= 0x0300 && scalar.value <= 0x036F)
-            })
+            String.UnicodeScalarView(
+                text.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
+                    $0.properties.generalCategory != .nonspacingMark
+                }
+            )
+        )
+    }
+}
+
+extension UnicodeScalar {
+    /// https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+    var isCJKUnifiedIdeograph: Bool {
+        (value >= 0x4E00 && value <= 0x9FFF)
+            || (value >= 0x3400 && value <= 0x4DBF)
+            || (value >= 0x20000 && value <= 0x2A6DF)
+            || (value >= 0x2A700 && value <= 0x2B73F)
+            || (value >= 0x2B740 && value <= 0x2B81F)
+            || (value >= 0x2B820 && value <= 0x2CEAF)
+            || (value >= 0xF900 && value <= 0xFAFF)
+            || (value >= 0x2F800 && value <= 0x2FA1F)
     }
 }
 

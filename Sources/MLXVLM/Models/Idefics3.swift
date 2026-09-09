@@ -5,13 +5,13 @@
 //  Created by SHUHONG WU on 12/13/24.
 //
 
+// port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/idefics3
+
 import CoreImage
 import Foundation
-import Hub
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
 // MARK: - Configuration
 
@@ -591,7 +591,11 @@ private enum Vision {
             MLXArray,
             [MLXArray]?
         ) {
-            let e = embeddings(x)
+            // Cast to the patch-embedding weight dtype (bf16) before the encoder,
+            // matching mlx-vlm's `VisionModel.__call__`. `VisionEmbeddings` sums a
+            // float32 conv output with the bf16 position embedding, promoting to
+            // float32 — without this the encoder would run in float32, not bf16.
+            let e = embeddings(x).asType(embeddings.patchEmbedding.weight.dtype)
             let (encoded, hiddenStates) = encoder(
                 e,
                 outputHiddenStates: outputHiddenStates
@@ -697,8 +701,8 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         var segments = [MLXArray]()
         var start_idx = 0
 
-        let chunkSize = imageFeatures.shape[1]  // 64
-        let chunkCount = imagePositions.count / chunkSize  // Should be imageFeatures.shape[0]
+        let chunkSize = imageFeatures.dim(1)  // 64
+        let chunkCount = imagePositions.count / chunkSize  // Should be imageFeatures.dim(0)
         let chunks = (0 ..< chunkCount).map { startIndex in
             let start = startIndex * chunkSize
             let end = start + chunkSize
@@ -730,10 +734,33 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     {
         let inputIds = input.text.tokens
         let pixelValues = input.image?.pixels
-        let embeddings = getInputEmbeddings(
+        var embeddings = getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues
         )
+
+        // Prefill the merged image+text embeddings in windowSize-sized chunks,
+        // matching mlx-vlm (and `LLMModel.prepare`'s token chunking): evaluate
+        // the KV cache between chunks, leaving the last embedding for the logits.
+        let prefillStepSize = windowSize ?? 512
+        let totalTokens = embeddings.dim(1)
+
+        var processed = 0
+        while embeddings.dim(1) > 1 {
+            let nToProcess = min(prefillStepSize, embeddings.dim(1) - 1)
+            let chunk = embeddings[0..., ..<nToProcess]
+            _ = languageModel(nil, cache: cache, inputs_embeds: chunk)
+            eval(cache)
+            embeddings = embeddings[0..., nToProcess...]
+            processed += nToProcess
+        }
+
+        // The prefix is now in the KV cache; the final embedding yields the
+        // first-token logits.
+        precondition(
+            processed == totalTokens - 1,
+            "Idefics3 chunked prefill: expected one residual embedding, processed "
+                + "\(processed) of \(totalTokens)")
         let result = languageModel(nil, cache: cache, inputs_embeds: embeddings)
         return .logits(result)
     }

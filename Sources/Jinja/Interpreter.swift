@@ -27,6 +27,50 @@ public final class Environment: @unchecked Sendable {
     /// The default value is `false`.
     public var trimBlocks: Bool = false
 
+    /// Settings that adjust the behavior of built-in filters.
+    public struct Policies: Sendable {
+        /// The serializer corresponding to Jinja2's `json.dumps_function` policy.
+        public var jsonSerializer: JSON.Serializer
+
+        /// Options corresponding to Jinja2's `json.dumps_kwargs` policy.
+        /// Explicit non-null `tojson` arguments override these options for that call.
+        public var jsonDumpsOptions: JSON.DumpsOptions
+
+        /// Creates policies with Transformers-compatible defaults.
+        public init(
+            jsonSerializer: JSON.Serializer = .standard,
+            jsonDumpsOptions: JSON.DumpsOptions = .init(ensureASCII: false)
+        ) {
+            self.jsonSerializer = jsonSerializer
+            self.jsonDumpsOptions = jsonDumpsOptions
+        }
+
+        /// Plain JSON with non-ASCII characters and insertion order preserved.
+        public static let transformers = Policies()
+
+        /// HTML-safe JSON with sorted keys and non-ASCII characters escaped.
+        public static let jinja2 = Policies(
+            jsonSerializer: .htmlSafe,
+            jsonDumpsOptions: .init(ensureASCII: true, sortKeys: true)
+        )
+    }
+
+    /// Settings that adjust how built-in filters behave.
+    ///
+    /// Policies are inherited from the parent environment until any policy is set.
+    /// Mutating a policy copies all inherited settings into this environment;
+    /// subsequent parent changes do not affect that copy.
+    /// Root environments default to ``Policies/transformers``.
+    /// Set `environment.policies = .jinja2` for sorted, ASCII, HTML-safe JSON.
+    public var policies: Policies {
+        get { policyStorage ?? parent?.policies ?? Environment.defaultPolicies }
+        set { policyStorage = newValue }
+    }
+    private var policyStorage: Policies?
+
+    /// The policies a root environment starts with.
+    public static let defaultPolicies: Policies = .transformers
+
     // MARK: -
 
     /// Creates a new environment with optional parent and initial variables.
@@ -118,6 +162,7 @@ public enum Interpreter {
     public static func interpret(_ nodes: [Node], environment: Environment) throws -> String {
         // Use the fast path with synchronous environment
         let env = Environment(initial: environment.variables)
+        env.policies = environment.policies
         var buffer = ""
         buffer.reserveCapacity(1024)
         try interpret(nodes, env: env, into: &buffer)
@@ -364,19 +409,19 @@ public enum Interpreter {
                     let items: [Value]
                     switch loopVar {
                     case .single:
-                        items = entries.map { .string($0.key) }
+                        items = entries.map { Value($0.key) }
                     case .tuple:
-                        items = entries.map { .array([.string($0.key), $0.value]) }
+                        items = entries.map { .array([Value($0.key), $0.value]) }
                     }
                     for (index, (key, value)) in entries.enumerated() {
                         switch loopVar {
                         case let .single(varName):
                             // Single variable gets the key
-                            childEnv[varName] = .string(key)
+                            childEnv[varName] = Value(key)
                         case let .tuple(varNames):
                             // Tuple unpacking: first gets key, second gets value
                             if varNames.count >= 1 {
-                                childEnv[varNames[0]] = .string(key)
+                                childEnv[varNames[0]] = Value(key)
                             }
                             if varNames.count >= 2 {
                                 childEnv[varNames[1]] = value
@@ -579,8 +624,8 @@ public enum Interpreter {
 
             if computed {
                 let propertyValue = try evaluateExpression(propertyExpr, env: env)
-                guard case let .string(key) = propertyValue else {
-                    throw JinjaError.runtime("Computed property key must be a string")
+                guard let key = ObjectKey(propertyValue) else {
+                    throw JinjaError.runtime("Computed property key must be a string or integer")
                 }
                 if case var .object(dict) = objectValue {
                     dict[key] = value
@@ -594,7 +639,7 @@ public enum Interpreter {
                     throw JinjaError.runtime("Property assignment requires identifier")
                 }
                 if case var .object(dict) = objectValue {
-                    dict[propertyName] = value
+                    dict[.string(propertyName)] = value
                     // Update the object in the environment
                     if case let .identifier(name) = objectExpr {
                         env.setInChain(name: name, value: .object(dict))
@@ -740,7 +785,10 @@ public enum Interpreter {
             return arr[safeIndex]
 
         case let (.object(obj), .string(key)):
-            return obj[key] ?? .undefined
+            return obj[.string(key)] ?? .undefined
+
+        case let (.object(obj), .int(key)):
+            return obj[.int(key)] ?? .undefined
 
         case let (.string(str), .int(index)):
             let safeIndex = index < 0 ? str.count + index : index
@@ -801,7 +849,7 @@ public enum Interpreter {
         index: Int
     ) -> Value {
         let count = items.count
-        var loopContext: OrderedDictionary<String, Value> = [
+        var loopContext: OrderedDictionary<ObjectKey, Value> = [
             "index": .int(index + 1),
             "index0": .int(index),
             "first": .boolean(index == 0),

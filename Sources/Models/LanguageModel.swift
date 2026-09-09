@@ -572,11 +572,20 @@ public enum TokenizerError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .tokenizerConfigNotFound:
-            "Tokenizer configuration could not be found. The model may be missing required tokenizer files."
+            String(localized: "Tokenizer configuration could not be found. The model may be missing required tokenizer files.", comment: "Error when tokenizer configuration is missing")
         case .missingConfig:
-            "Language model configuration was not set, tokenizer assets could not be loaded."
+            String(localized: "Language model configuration was not set, tokenizer assets could not be loaded.", comment: "Error when configuration needed for tokenizer data is missing")
         }
     }
 }
 
 #endif // canImport(CoreML)
+
+#if !canImport(Darwin)
+// Linux Foundation may not provide String(localized:comment:), so keep call sites portable.
+private extension String {
+    init(localized key: String, comment: String? = nil) {
+        self = key
+    }
+}
+#endif

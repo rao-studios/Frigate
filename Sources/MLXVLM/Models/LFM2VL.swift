@@ -2,11 +2,9 @@
 
 import CoreImage
 import Foundation
-import Hub
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
 // MARK: - Vision
 
@@ -410,7 +408,8 @@ private enum Language {
 
             Bx = concatenated([state!, Bx], axis: -2)
             if let cache {
-                cache[0] = Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...]
+                cache[0] = contiguous(Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...])
+                cache.advance(x.dim(1))
             }
 
             let convOut = conv(Bx)
@@ -572,7 +571,7 @@ private enum Language {
                 var sanitizedParam = param
 
                 if name.contains("conv.weight") {
-                    if param.shape[param.shape.count - 1] > param.shape[1] {
+                    if param.shape[param.shape.count - 1] > param.dim(1) {
                         sanitizedParam = param.transposed(0, 2, 1)
                     }
                 }
@@ -748,7 +747,11 @@ public struct LFM2VLProcessor: UserInputProcessor {
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen2VLMessageGenerator().generate(from: input)
 
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext
+        )
 
         // Text-only input
         if input.images.isEmpty {
@@ -987,7 +990,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         var spatialShapes: MLXArray? = nil
         var pixelAttentionMask: MLXArray? = nil
 
-        if let pixels = pixelValues, let frames = input.image?.frames, !frames.isEmpty {
+        if pixelValues != nil, let frames = input.image?.frames, !frames.isEmpty {
             // Extract spatial shapes from frames (THW format where t=1 for images)
 
             // Convert frames to spatial shapes array [numImages, 2]
@@ -996,7 +999,6 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
             // Create attention mask based on actual feature lengths per image
             var maskArrays = [MLXArray]()
-            let maxPatches = pixels.dim(1)
             for frame in frames {
                 let numPatches = frame.h * frame.w
                 let imageMask = MLXArray.ones([numPatches]).asType(.int32)
@@ -1032,7 +1034,24 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask: pixelAttentionMask
         )
 
-        let result = languageModel(nil, cache: cache, inputsEmbeds: inputEmbeddings)
+        let result = withPreparedCache(cache, lengths: input.text.sequenceLengths) {
+            let prefillStepSize = windowSize ?? 512
+            let totalPositions = inputEmbeddings.dim(1)
+            var processed = 0
+            while totalPositions - processed > 1 {
+                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+                let range = processed ..< (processed + chunkLength)
+                _ = languageModel(
+                    nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., range, 0...])
+                asyncEval(cache)
+                processed += chunkLength
+            }
+            eval(cache)
+
+            let result = languageModel(
+                nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., processed..., 0...])
+            return result
+        }
 
         return .logits(result)
     }
@@ -1074,7 +1093,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             // Handle conv weight transposition
             var value = v
             if newKey.contains("conv.weight") {
-                if v.shape[v.shape.count - 1] > v.shape[1] {
+                if v.shape[v.shape.count - 1] > v.dim(1) {
                     value = v.transposed(0, 2, 1)
                 }
             }

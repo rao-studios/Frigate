@@ -16,7 +16,7 @@ public actor FrigateEmbedder {
     /// `Tokenizer` is `Sendable`; cached here so tokenization runs on this actor
     /// *before* `container.perform` — CPU tokenization no longer serializes under
     /// the model lock, overlapping with another request's GPU evaluation.
-    private var cachedTokenizer: Tokenizer?
+    private var cachedTokenizer: Tokenizers.Tokenizer?
     private var requestsSinceCacheClear = 0
 
     // Batch limits tuned for RTX 3090 / sm_86. Override via environment without
@@ -36,7 +36,12 @@ public actor FrigateEmbedder {
     static let cacheClearInterval: Int =
         ProcessInfo.processInfo.environment["FRIGATE_CACHE_CLEAR_INTERVAL"].flatMap(Int.init) ?? 32
 
-    public init(modelId: String = "mlx-community/snowflake-arctic-embed-m-v1.5") {
+    /// - Note: the previous default, `mlx-community/snowflake-arctic-embed-m-v1.5`, now
+    ///   returns HTTP 401 — it has been gated or withdrawn — so it failed at runtime.
+    ///   Qwen3-Embedding-0.6B is public, is `model_type: qwen3` (registered in
+    ///   `mlx_embeddings/Configuration.swift`), and is 1024-dimensional, which matches the
+    ///   product-quantizer calibration downstream consumers already index against.
+    public init(modelId: String = "mlx-community/Qwen3-Embedding-0.6B-8bit") {
         // Raise SDPA LRU cache from 256 → 2048 so varying sequence lengths
         // across sub-batches don't trigger "Cache thrashing" fatal error.
         setenv("MLX_CUDA_SDPA_CACHE_SIZE", "2048", 0)
@@ -96,7 +101,7 @@ public actor FrigateEmbedder {
         }
     }
 
-    private func tokenizer(from container: mlx_embeddings.ModelContainer) async -> Tokenizer {
+    private func tokenizer(from container: mlx_embeddings.ModelContainer) async -> Tokenizers.Tokenizer {
         if let t = cachedTokenizer { return t }
         let t = await container.perform { _, tok in tok }
         cachedTokenizer = t

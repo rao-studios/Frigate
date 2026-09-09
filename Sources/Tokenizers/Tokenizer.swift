@@ -30,23 +30,23 @@ public enum TokenizerError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .missingConfig:
-            "Tokenizer configuration is missing."
+            String(localized: "Tokenizer configuration is missing.", comment: "Error when tokenizer config cannot be found")
         case .missingTokenizerClassInConfig:
-            "The tokenizer class is not specified in the configuration."
+            String(localized: "The tokenizer class is not specified in the configuration.", comment: "Error when tokenizer_class is missing in config")
         case let .unsupportedTokenizer(name):
-            "The tokenizer type '\(name)' is not supported."
+            String(localized: "The tokenizer type '\(name)' is not supported.", comment: "Error when tokenizer type is not supported")
         case .missingVocab:
-            "Vocabulary file is missing from the tokenizer configuration."
+            String(localized: "Vocabulary file is missing from the tokenizer configuration.", comment: "Error when vocab file is missing")
         case .malformedVocab:
-            "The vocabulary file is malformed or corrupted."
+            String(localized: "The vocabulary file is malformed or corrupted.", comment: "Error when vocab file is malformed")
         case let .chatTemplate(message):
-            "Chat template error: \(message)"
+            String(localized: "Chat template error: \(message)", comment: "Error with chat template")
         case .missingChatTemplate:
-            "This tokenizer does not have a chat template, and no template was passed."
+            String(localized: "This tokenizer does not have a chat template, and no template was passed.")
         case let .tooLong(message):
-            "Input is too long: \(message)"
+            String(localized: "Input is too long: \(message)", comment: "Error when input exceeds maximum length")
         case let .mismatchedConfig(message):
-            "Tokenizer configuration mismatch: \(message)"
+            String(localized: "Tokenizer configuration mismatch: \(message)", comment: "Error when tokenizer configuration is inconsistent")
         }
     }
 }
@@ -173,6 +173,7 @@ enum TokenizerModel {
         "Qwen2Tokenizer": BPETokenizer.self,
         "WhisperTokenizer": BPETokenizer.self,
         "XLMRobertaTokenizer": UnigramTokenizer.self,
+        "Xlm-RobertaTokenizer": UnigramTokenizer.self,
     ]
 
     static func unknownToken(from tokenizerConfig: Config) -> String? {
@@ -544,7 +545,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         cacheLock.unlock()
 
         // Compile template outside of lock to avoid holding lock during expensive operation
-        let compiled = try Template(templateString)
+        let compiled = try Template(templateString, with: .init(lstripBlocks: true, trimBlocks: true))
 
         // Insert into cache under lock (using double-checked locking pattern)
         cacheLock.lock()
@@ -897,7 +898,25 @@ public extension AutoTokenizer {
         hubApi: HubApi = .shared,
         strict: Bool = true
     ) async throws -> Tokenizer {
-        let config = LanguageModelConfigurationFromHub(modelName: model, hubApi: hubApi)
+        try await from(pretrained: model, revision: "main", hubApi: hubApi, strict: strict)
+    }
+
+    /// Loads a tokenizer from a pre-trained model on the Hugging Face Hub at a specific revision.
+    ///
+    /// - Parameters:
+    ///   - model: The model identifier (e.g., "bert-base-uncased")
+    ///   - revision: Git revision to load — a branch, tag, commit SHA, or PR ref like `"refs/pr/1"`.
+    ///   - hubApi: The Hub API instance to use for downloading
+    ///   - strict: Whether to enforce strict validation
+    /// - Returns: A configured `Tokenizer` instance
+    /// - Throws: `TokenizerError` if the model cannot be loaded or configured
+    static func from(
+        pretrained model: String,
+        revision: String,
+        hubApi: HubApi = .shared,
+        strict: Bool = true
+    ) async throws -> Tokenizer {
+        let config = LanguageModelConfigurationFromHub(modelName: model, revision: revision, hubApi: hubApi)
         guard let tokenizerConfig = try await config.tokenizerConfig else { throw TokenizerError.missingConfig }
         let tokenizerData = try await config.tokenizerData
 
@@ -1011,3 +1030,12 @@ class LlamaPreTrainedTokenizer: PreTrainedTokenizer, @unchecked Sendable {
         return tokens
     }
 }
+
+#if !canImport(Darwin)
+// Linux Foundation may not provide String(localized:comment:), so keep call sites portable.
+private extension String {
+    init(localized key: String, comment: String? = nil) {
+        self = key
+    }
+}
+#endif

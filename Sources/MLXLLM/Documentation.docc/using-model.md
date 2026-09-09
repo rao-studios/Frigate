@@ -16,7 +16,13 @@ let modelFactory: ModelFactory
 // e.g. LLMRegistry.llama3_8B_4bit
 let modelConfiguration: ModelConfiguration
 
-let container = try await modelFactory.loadContainer(configuration: modelConfiguration)
+// e.g. TokenizersLoader() from MLXLMTokenizers
+let tokenizerLoader: any TokenizerLoader
+
+let container = try await modelFactory.loadContainer(
+    using: tokenizerLoader,
+    configuration: modelConfiguration
+)
 ```
 
 The `container` provides an isolation context (an `actor`) to run inference in the model.
@@ -34,16 +40,15 @@ The flow inside the `ModelFactory` goes like this:
 public class LLMModelFactory: ModelFactory {
 
     public func _load(
-        hub: HubApi, configuration: ModelConfiguration,
-        progressHandler: @Sendable @escaping (Progress) -> Void
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
-        // download the weight and config using HubApi
+        // modelDirectory and tokenizerDirectory are already resolved
         // load the base configuration
         // using the typeRegistry create a model (random weights)
         // load the weights, apply quantization as needed, update the model
             // calls model.sanitize() for weight preparation
-        // load the tokenizer
-        // (vlm) load the processor configuration, create the processor
+        // load the tokenizer via tokenizerLoader.load(from: directory)
     }
 }
 ```
@@ -118,3 +123,36 @@ The stream is stopped after we hit a maximum number of tokens:
     }
 }
 ```
+
+### Wired Memory (Optional)
+
+Use the policy-based API to coordinate a single global wired limit across tasks.
+`WiredMemoryManager` and `WiredMemoryTicket` are provided by MLX, while
+MLXLMCommon adds LLM-oriented policies (like `WiredFixedPolicy` or capped sum).
+Policy-only admission is enabled by default on unsupported backends so the same
+ticket logic applies on CPU (no OS limit changes are attempted).
+
+```swift
+let policy = WiredSumPolicy()
+let ticket = policy.ticket(size: estimatedBytes)
+
+let stream = try MLXLMCommon.generate(
+    input: input,
+    parameters: generateParameters,
+    context: context,
+    wiredMemoryTicket: ticket
+)
+```
+
+Policies are pure and compute a single limit for all active tickets. Built-in
+policies include `WiredSumPolicy`, `WiredMaxPolicy`, and `WiredFixedPolicy`.
+Use `WiredMemoryTicket.withWiredLimit` for cancellation-safe start/end pairing.
+
+Policies can also gate concurrency by implementing `canAdmit`. When admission is
+denied, `start()` suspends until capacity is available. For debugging, the
+`WiredMemoryManager.events()` stream emits changes in DEBUG builds and is a no-op
+in release builds.
+
+If you want to account for long-lived model weights without keeping the wired
+limit elevated while idle, create tickets with `kind: .reservation` so they
+participate in admission and limit calculation only when active tickets exist.

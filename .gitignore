@@ -4,3 +4,4 @@
 *.d
 *.swp
 .DS_Store
+.claude/settings.json

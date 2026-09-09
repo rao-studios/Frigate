@@ -23,7 +23,7 @@ class GLM4MoEAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm?
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: GLM4MoEConfiguration) {
         self.args = args
@@ -42,11 +42,11 @@ class GLM4MoEAttention: Module {
             _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
         }
 
-        self.rope = RoPE(
-            dimensions: Int(Float(headDim) * args.partialRotaryFactor),
-            traditional: false,
-            base: args.ropeTheta
-        )
+        self.rope = initializeRope(
+            dims: Int(Float(headDim) * args.partialRotaryFactor),
+            base: args.ropeTheta,
+            traditional: false, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(
@@ -70,13 +70,9 @@ class GLM4MoEAttention: Module {
         keys = keys.transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -218,7 +214,7 @@ class GLM4MoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
         var y = switchMLP(x, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        y = weightedExpertSum(y, scores).asType(y.dtype)
         if let sharedExperts {
             y = y + sharedExperts(x)
         }

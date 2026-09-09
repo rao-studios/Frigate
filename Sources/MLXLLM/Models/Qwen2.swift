@@ -10,7 +10,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/qwen2.py
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen2.py
 
 class Qwen2Attention: Module {
     let args: Qwen2Configuration
@@ -70,13 +70,9 @@ class Qwen2Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

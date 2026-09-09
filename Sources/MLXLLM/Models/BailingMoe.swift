@@ -89,7 +89,7 @@ class BailingMoeAttention: Module {
     @ModuleInfo(key: "query_layernorm") var qNorm: RMSNorm?
     @ModuleInfo(key: "key_layernorm") var kNorm: RMSNorm?
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: BailingMoeConfiguration) {
         self.args = args
@@ -114,9 +114,11 @@ class BailingMoeAttention: Module {
             _kNorm.wrappedValue = nil
         }
 
-        self.rope = RoPE(
-            dimensions: ropeDim, traditional: false, base: args.ropeTheta,
-            scale: 1.0)
+        self.rope = initializeRope(
+            dims: ropeDim, base: args.ropeTheta,
+            traditional: false, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: nil
+        )
     }
 
     func callAsFunction(
@@ -143,13 +145,9 @@ class BailingMoeAttention: Module {
         keys = keys.transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -265,7 +263,7 @@ class BailingMoeSparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate.groupSelect(x)
         var out = switchMLP(x, inds)
-        out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        out = weightedExpertSum(out, weights)
         if let shared = sharedExperts {
             out = out + shared(x)
         }

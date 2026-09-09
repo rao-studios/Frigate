@@ -49,35 +49,35 @@ public extension Hub {
         public var errorDescription: String? {
             switch self {
             case .authorizationRequired:
-                "Authentication required. Please provide a valid Hugging Face token."
+                String(localized: "Authentication required. Please provide a valid Hugging Face token.")
             case let .httpStatusCode(code):
-                "HTTP error with status code: \(code)"
+                String(localized: "HTTP error with status code: \(code)")
             case .parse:
-                "Failed to parse server response."
+                String(localized: "Failed to parse server response.")
             case .jsonSerialization(_, let message):
                 message
             case .unexpectedError:
-                "An unexpected error occurred."
+                String(localized: "An unexpected error occurred.")
             case let .downloadError(message):
-                "Download failed: \(message)"
+                String(localized: "Download failed: \(message)")
             case let .fileNotFound(filename):
-                "File not found: \(filename)"
+                String(localized: "File not found: \(filename)")
             case let .networkError(error):
-                "Network error: \(error.localizedDescription)"
+                String(localized: "Network error: \(error.localizedDescription)")
             case let .resourceNotFound(resource):
-                "Resource not found: \(resource)"
+                String(localized: "Resource not found: \(resource)")
             case let .configurationMissing(file):
-                "Required configuration file missing: \(file)"
+                String(localized: "Required configuration file missing: \(file)")
             case let .fileSystemError(error):
-                "File system error: \(error.localizedDescription)"
+                String(localized: "File system error: \(error.localizedDescription)")
             case let .parseError(message):
-                "Parse error: \(message)"
+                String(localized: "Parse error: \(message)")
             }
         }
     }
 
     /// The type of repository on the Hugging Face Hub.
-    enum RepoType: String, Codable {
+    enum RepoType: String, Codable, Sendable {
         /// Model repositories containing machine learning models.
         case models
         /// Dataset repositories containing training and evaluation data.
@@ -90,7 +90,7 @@ public extension Hub {
     ///
     /// A repository is identified by its unique ID and type, allowing access to
     /// different kinds of resources hosted on the Hub platform.
-    struct Repo: Codable {
+    struct Repo: Codable, Sendable {
         /// The unique identifier for the repository (e.g., "microsoft/DialoGPT-medium").
         public let id: String
         /// The type of repository (models, datasets, or spaces).
@@ -317,10 +317,41 @@ public final class LanguageModelConfigurationFromHub: Sendable {
     }
 
     static func fallbackTokenizerConfig(for modelType: String) -> Config? {
-        // Fallback tokenizer configuration files are located in the `Sources/Hub/Resources` directory
-        guard let url = Bundle.module.url(forResource: "\(modelType)_tokenizer_config", withExtension: "json") else {
+        let allowedModelTypeScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        guard !modelType.isEmpty, modelType.unicodeScalars.allSatisfy(allowedModelTypeScalars.contains) else {
             return nil
         }
+        let fallbackTokenizerConfigBaseName = "\(modelType)_tokenizer_config"
+
+        // Fallback tokenizer configuration files are located in the `Sources/Hub/Resources` directory
+        // On Linux, Bundle.module may not be available if resources aren't properly bundled
+        #if canImport(Darwin)
+        guard let url = Bundle.module.url(forResource: fallbackTokenizerConfigBaseName, withExtension: "json") else {
+            return nil
+        }
+        #else
+        let fileName = "\(fallbackTokenizerConfigBaseName).json"
+        // On non-Darwin platforms, also try to locate resources relative to the executable
+        var possiblePaths: [URL] = []
+        if let executableDirectoryURL = Bundle.main.executableURL?.deletingLastPathComponent() {
+            possiblePaths = [
+                executableDirectoryURL
+                    .appendingPathComponent("swift-transformers_Hub.resources", isDirectory: true)
+                    .appendingPathComponent(fileName, isDirectory: false),
+
+                executableDirectoryURL
+                    .appendingPathComponent("swift-transformers_Hub.resources", isDirectory: true)
+                    .appendingPathComponent("Contents", isDirectory: true)
+                    .appendingPathComponent("Resources", isDirectory: true)
+                    .appendingPathComponent("Resources", isDirectory: true)
+                    .appendingPathComponent(fileName, isDirectory: false)
+                    .standardizedFileURL,
+            ]
+        }
+        guard let url = possiblePaths.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            return nil
+        }
+        #endif
 
         do {
             let data = try Data(contentsOf: url)
@@ -338,3 +369,12 @@ public final class LanguageModelConfigurationFromHub: Sendable {
         }
     }
 }
+
+#if !canImport(Darwin)
+// Linux Foundation may not provide String(localized:comment:), so keep call sites portable.
+private extension String {
+    init(localized key: String, comment: String? = nil) {
+        self = key
+    }
+}
+#endif

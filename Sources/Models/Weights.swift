@@ -16,9 +16,9 @@ public struct Weights {
         var errorDescription: String? {
             switch self {
             case let .notSupported(message):
-                "The weight format '\(message)' is not supported by this application."
+                String(localized: "The weight format '\(message)' is not supported by this application.", comment: "Error when weight format is not supported")
             case .invalidFile:
-                "The weights file is invalid or corrupted."
+                String(localized: "The weights file is invalid or corrupted.", comment: "Error when weight file is invalid")
             }
         }
     }
@@ -135,3 +135,12 @@ enum Safetensor {
     }
 }
 #endif // canImport(CoreML)
+
+#if !canImport(Darwin)
+// Linux Foundation may not provide String(localized:comment:), so keep call sites portable.
+private extension String {
+    init(localized key: String, comment: String? = nil) {
+        self = key
+    }
+}
+#endif

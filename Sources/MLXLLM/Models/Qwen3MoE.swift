@@ -76,13 +76,9 @@ class Qwen3MoEAttention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -147,7 +143,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(y, scores)
     }
 }
 
@@ -352,6 +348,12 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? false
         self.ropeScaling = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeScaling)
+    }
+}
+
+extension Qwen3MoEConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        try validateRoPEConfiguration(ropeScaling, context: "Qwen3MoEConfiguration.rope_scaling")
     }
 }
 

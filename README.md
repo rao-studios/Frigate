@@ -182,9 +182,25 @@ PATH="/usr/local/cuda/bin:$PATH" SPM_CUDA=1 CUDA_ARCH=sm_86 swift build -c relea
 git clone <this-repo> Frigate
 cd Frigate
 swift build -c release
+./scripts/build-metallib.sh release     # required — see below
 ```
 
-No additional setup needed. MLX uses Metal automatically. Swift 6.3+ required (`brew install swiftly && swiftly install latest`).
+Swift 6.3+ required (`brew install swiftly && swiftly install latest`).
+
+**The metallib step is not optional on macOS.** `swift build` has no Metal stage — SwiftPM
+never compiles `Sources/Cmlx/mlx-generated/metal/*.metal` — so a fresh checkout has no
+`mlx.metallib` and the first GPU op dies with *"Failed to load the default metallib"*. Nothing
+warns you at build time; it looks fine until inference runs. `scripts/build-metallib.sh`
+compiles the shaders and installs the result beside every binary in `.build`, including inside
+`.xctest` bundles, which is what lets the `FRIGATE_MLX_TESTS=1` suites run at all.
+
+It is a no-op on Linux (no Metal backend), so it is safe to put in a build script that runs on
+both. Consumers should call it rather than keeping their own copy — `Bonnie`, `Fleet`, `Sewn`,
+`Thread` and `Zehn` each ship a one-line `build-metallib.sh` that delegates here:
+
+```bash
+./scripts/build-metallib.sh release --package ../Thread   # or, from Thread: ./build-metallib.sh release
+```
 
 ---
 
@@ -231,16 +247,59 @@ public actor FrigateBoost {
 
 All fork sources are copied directly into `Sources/`. No git submodules, no external URLs for patched code.
 
-| Directory | From |
-|---|---|
-| `Sources/Cmlx/` | `riteshpakala/mlx` @ `gab/cuda1` — C++ MLX with CUDA sm_86 patches |
-| `Sources/MLX/` … `Sources/MLXLinalg/` | `riteshpakala/mlx-swift` @ `gab/cuda1` |
-| `Sources/Jinja/` | `huggingface/swift-jinja` |
-| `Sources/Hub/` … `Sources/Models/` | `riteshpakala/swift-transformers` |
-| `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `riteshpakala/mlx-swift-lm` |
-| `Sources/mlx_embeddings/` | `riteshpakala/mlx.embeddings` |
-| `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |
-| `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |
+Record the **tag**, not a branch — the absence of that record is what made the
+2026-09 audit necessary. Last synced 2026-09-08.
+
+| Directory | From | Version | Local patches |
+|---|---|---|---|
+| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.31.1** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86) |
+| `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | v0.6.0 | none |
+| `Sources/Cmlx/{json,fmt,metal-cpp}/` | pinned by mlx-swift | json 3.11.3, fmt 12.1.0 | none — these are mlx's own pins, **not** drift |
+| `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.31.6** | none |
+| `Sources/Jinja/` | `huggingface/swift-jinja` | **2.5.0** | none |
+| `Sources/Hub/` … `Sources/Models/` | `huggingface/swift-transformers` | **1.3.4** | upstream adopted the fork's Linux patches; only `LocalizedStringLinuxShim.swift` added |
+| `Sources/HuggingFace/` | `huggingface/swift-huggingface` | **0.10.1** | none (Xet trait off) |
+| `Sources/EventSource/` | `mattt/EventSource` | **1.5.1** | `EventSource+AsyncHTTPClient.swift` dropped (AsyncHTTPClient trait off — keeps SwiftNIO out) |
+| `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `ml-explore/mlx-swift-lm` | **3.31.4** | `LinuxCompat.swift` added; Linux `canImport` guards on `UserInput` (incl. `AudioProcessing.audioFormat`), `UserInput+Audio`, `ChatSession`, `ParoQuant/ParoQuantLoader`; `MLXEmbedders/Models/Bert.swift` sanitize chain made table-driven |
+| `Sources/mlx_embeddings/` | `mzbac/mlx.embeddings` | v0.1.3 | `Bert.swift` |
+| `Sources/FrigateBridge/` | This package — concrete `Downloader` / `TokenizerLoader` for mlx-swift-lm 3.x |  |  |
+| `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
+| `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |
+
+**mlx C++ is deliberately held at 0.31.1.** v0.32.2 exists, but every mlx-swift release through
+0.31.6 defines `MLX_VERSION` as `"0.31.1"` (see `Package.swift`), so bumping the C++ core would
+outrun the `mlx-c` / Swift bindings. Revisit when mlx-swift 0.32.x ships.
+
+**mlx-swift-lm 3.x takes the downloader and tokenizer as parameters.** Upstream supplies that
+wiring through its `MLXHuggingFace` macro target, which needs swift-syntax; this package wires
+it by hand in `Sources/FrigateBridge/` instead, so no compiler plugin enters the Linux build.
+
+**yyjson is an external dependency, not vendored — deliberately.** swift-transformers 1.3.x needs
+it, and WhisperKit brings its own swift-transformers into the same link in at least one consumer
+(Bonnie). Two copies of `yyjson.c` define the same C symbols and nothing in SwiftPM separates
+them: module aliasing explicitly does not cover non-Swift symbols, renaming the target does not
+rename its symbols, and even hidden (`private external`) visibility still trips ld64's duplicate
+check — all three were tried. Depending on the same package URL makes SwiftPM dedupe by identity,
+so every graph gets exactly one copy. The vendoring rule above is about *patched fork* sources;
+this is stock upstream C at the pin swift-transformers itself uses.
+
+**`String(localized:)` does not exist on Linux.** swift-corelibs-foundation ships no `localized:`
+overload (checked on Swift 6.3 / Ubuntu 24.04, with and without `FoundationEssentials`), and
+swift-transformers 1.3.x and mlx-swift-lm 3.x both use it for error text. Each affected vendored
+module carries an internal `LocalizedStringLinuxShim.swift` that returns the already-interpolated
+literal: `Hub`, `Tokenizers`, `Models`, `MLXLMCommon`, `MLXLLM`, `MLXVLM`.
+
+**Three targets leave the Linux graph entirely**, alongside `FrigateVision`: `ObscurKit`,
+`FluxKit` and `flux2-cli`. `ObscurDinov2` decodes a `CGImage` through CGContext/CGColorSpace and
+the other two follow it in; no consumer takes them. See `imageGenTargets` in `Package.swift`.
+
+**The CPU-only Linux build (`SPM_CUDA=0`) was broken before the 2026-09 audit** and is now fixed.
+Its exclude lists had drifted: `GPU+CUDA.swift` (a portable stub that is the only definition of
+`GPU`), `MLXFast.swift`/`MLXFastKernel.swift` (which the `MLXFast` shim target dereferences), and
+`mlx-c/mlx/c/fast.cpp` (leaving `mlx_fast_*` undefined — invisible to a library build, caught only
+when Thread linked an executable). All four are now built. `MLXAccelerate/BatchedImageOps.swift`
+also needed `nonisolated(unsafe)` on two pointers, because Linux's libdispatch declares
+`concurrentPerform`'s closure `@Sendable` where Darwin's does not.
 
 ---
 
@@ -313,7 +372,10 @@ Wrap any remaining calls with `#if canImport(CoreImage) ... #else ... #endif`.
 ```swift
 // Before
 #if os(Linux)
-let vlmExcludes: [String] = ["README.md", "MediaProcessing.swift", "Models", "VLMModelFactory.swift"]
+let vlmExcludes: [String] = [
+    "README.md", "MediaProcessing.swift", "Models", "VLMModelFactory.swift",
+    "Gemma4AssistantRegistration.swift",
+]
 #else
 let vlmExcludes: [String] = ["README.md"]
 #endif

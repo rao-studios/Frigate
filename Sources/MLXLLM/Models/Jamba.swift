@@ -5,6 +5,8 @@
 //  Created by Sai Ramana on 10/26/25.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/jamba.py
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -323,8 +325,9 @@ class JambaMambaMixer: Module {
             x, convState: convState, ssmState: ssmState)
 
         if let cache = cache {
-            cache[0] = newConvState
+            cache[0] = contiguous(newConvState)
             cache[1] = newSsmState
+            cache.advance(x.dim(1))
         }
 
         return output
@@ -357,7 +360,7 @@ class JambaSparseMoeBlock: Module {
         scores = MLX.softmax(scores, axis: -1, precise: true)
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(y, scores)
     }
 }
 

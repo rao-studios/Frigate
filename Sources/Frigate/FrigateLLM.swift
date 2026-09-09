@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import FrigateBridge
 
 /// On-device LLM inference via an MLX model downloaded from HuggingFace Hub.
 ///
@@ -64,7 +65,12 @@ public actor FrigateLLM {
         let modelId = self.modelId
         let task = Task<MLXLMCommon.ModelContainer, Error> {
             let config = MLXLMCommon.ModelConfiguration(id: modelId)
-            return try await LLMModelFactory.shared.loadContainer(configuration: config)
+            // mlx-swift-lm 3.x takes the downloader and tokenizer as parameters; FrigateBridge
+            // supplies the swift-transformers-backed implementations.
+            return try await LLMModelFactory.shared.loadContainer(
+                from: HubDownloader(),
+                using: HubTokenizerLoader(),
+                configuration: config)
         }
         loadingTask = task
 

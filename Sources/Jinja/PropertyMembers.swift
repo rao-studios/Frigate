@@ -47,20 +47,94 @@ public enum PropertyMembers {
             }
         case "strip":
             return .function { args, kwargs, _ in
-                _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                return .string(str.trimmingCharacters(in: .whitespacesAndNewlines))
+                guard args.count <= 1 else {
+                    throw JinjaError.runtime(
+                        "strip() takes at most 1 argument (\(args.count) given)"
+                    )
+                }
+                let arguments = try resolveCallArguments(
+                    args: args,
+                    kwargs: kwargs,
+                    parameters: ["chars"],
+                    defaults: ["chars": .null]
+                )
+                let characterSet: CharacterSet
+                switch arguments["chars"] {
+                case let .string(chars):
+                    characterSet = CharacterSet(charactersIn: chars)
+                case .null, .none:
+                    characterSet = .whitespacesAndNewlines
+                default:
+                    throw JinjaError.runtime(
+                        "strip() chars argument must be a string or null"
+                    )
+                }
+                return .string(str.trimmingCharacters(in: characterSet))
             }
         case "lstrip":
             return .function { args, kwargs, _ in
-                _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                let trimmed = str.drop(while: { $0.isWhitespace })
-                return .string(String(trimmed))
+                guard args.count <= 1 else {
+                    throw JinjaError.runtime(
+                        "lstrip() takes at most 1 argument (\(args.count) given)"
+                    )
+                }
+                let arguments = try resolveCallArguments(
+                    args: args,
+                    kwargs: kwargs,
+                    parameters: ["chars"],
+                    defaults: ["chars": .null]
+                )
+                let characterSet: CharacterSet
+                switch arguments["chars"] {
+                case let .string(chars):
+                    characterSet = CharacterSet(charactersIn: chars)
+                case .null, .none:
+                    characterSet = .whitespacesAndNewlines
+                default:
+                    throw JinjaError.runtime(
+                        "lstrip() chars argument must be a string or null"
+                    )
+                }
+                return .string(
+                    String(
+                        String.UnicodeScalarView(
+                            str.unicodeScalars.drop(while: characterSet.contains)
+                        )
+                    )
+                )
             }
         case "rstrip":
             return .function { args, kwargs, _ in
-                _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                let reversed = str.reversed().drop(while: { $0.isWhitespace })
-                return .string(String(reversed.reversed()))
+                guard args.count <= 1 else {
+                    throw JinjaError.runtime(
+                        "rstrip() takes at most 1 argument (\(args.count) given)"
+                    )
+                }
+                let arguments = try resolveCallArguments(
+                    args: args,
+                    kwargs: kwargs,
+                    parameters: ["chars"],
+                    defaults: ["chars": .null]
+                )
+                let characterSet: CharacterSet
+                switch arguments["chars"] {
+                case let .string(chars):
+                    characterSet = CharacterSet(charactersIn: chars)
+                case .null, .none:
+                    characterSet = .whitespacesAndNewlines
+                default:
+                    throw JinjaError.runtime(
+                        "rstrip() chars argument must be a string or null"
+                    )
+                }
+                return .string(
+                    String(
+                        String.UnicodeScalarView(
+                            str.unicodeScalars.reversed().drop(while: characterSet.contains)
+                                .reversed()
+                        )
+                    )
+                )
             }
         case "split":
             return .function { args, kwargs, _ in
@@ -148,7 +222,7 @@ public enum PropertyMembers {
     // MARK: - Object Properties
 
     private static func evaluateObjectProperty(
-        _ obj: OrderedDictionary<String, Value>,
+        _ obj: OrderedDictionary<ObjectKey, Value>,
         _ propertyName: String
     ) throws -> Value {
         switch propertyName {
@@ -158,7 +232,7 @@ public enum PropertyMembers {
                 kwargs,
                 _ in
                 _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                let pairs = obj.map { key, value in Value.array([.string(key), value]) }
+                let pairs = obj.map { key, value in Value.array([Value(key), value]) }
                 return .array(pairs)
             }
             return .function(fn)
@@ -178,15 +252,10 @@ public enum PropertyMembers {
                     throw JinjaError.runtime("get() requires a 'key' argument")
                 }
 
-                let key: String
-                switch keyValue {
-                case let .string(s):
-                    key = s
-                default:
-                    key = keyValue.description
-                }
-
                 let defaultValue = arguments["default"] ?? .null
+                guard let key = ObjectKey(keyValue) else {
+                    return defaultValue
+                }
                 return obj[key] ?? defaultValue
             }
             return .function(fn)
@@ -196,7 +265,7 @@ public enum PropertyMembers {
                 kwargs,
                 _ in
                 _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                let keys = obj.keys.map { Value.string($0) }
+                let keys = obj.keys.map(Value.init)
                 return .array(keys)
             }
             return .function(fn)
@@ -210,7 +279,7 @@ public enum PropertyMembers {
             }
             return .function(fn)
         default:
-            return obj[propertyName] ?? .undefined
+            return obj[.string(propertyName)] ?? .undefined
         }
     }
 }

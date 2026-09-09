@@ -3,9 +3,8 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
-// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/mistral3/mistral3.py
+// Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/mistral3
 // Note: Mistral3 reuses the vision model from Pixtral
 
 // MARK: - Configuration
@@ -305,7 +304,7 @@ private enum Language {
         @ModuleInfo(key: "v_proj") var wv: Linear
         @ModuleInfo(key: "o_proj") var wo: Linear
 
-        let rope: Module
+        let rope: RoPELayer
 
         init(_ config: Mistral3VLMTextConfiguration) {
             self.config = config
@@ -337,19 +336,6 @@ private enum Language {
             )
         }
 
-        private func applyRoPE(_ x: MLXArray, offset: Int) -> MLXArray {
-            if let ropeModule = rope as? RoPE {
-                return ropeModule(x, offset: offset)
-            } else if let llama3Rope = rope as? Llama3RoPE {
-                return llama3Rope(x, offset: offset)
-            } else if let yarnRope = rope as? YarnRoPE {
-                return yarnRope(x, offset: offset)
-            } else if let suScaledRope = rope as? SuScaledRoPE {
-                return suScaledRope(x, offset: offset)
-            }
-            return x
-        }
-
         func callAsFunction(
             _ x: MLXArray,
             attentionScale: MLXArray,
@@ -367,8 +353,8 @@ private enum Language {
             values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
-            queries = applyRoPE(queries, offset: offset)
-            keys = applyRoPE(keys, offset: offset)
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
 
             queries = queries * attentionScale
 
@@ -757,7 +743,24 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes: imageSizes
         )
 
-        let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
+        var tokens = inputIds
+        if tokens.ndim == 1 { tokens = tokens.expandedDimensions(axis: 0) }
+        let prefillStepSize = windowSize ?? 512
+        let totalPositions = embeddings.dim(1)
+        var processed = 0
+        while totalPositions - processed > 1 {
+            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+            let range = processed ..< (processed + chunkLength)
+            _ = languageModel(
+                tokens[0..., range], cache: cache,
+                inputsEmbeds: embeddings[0..., range, 0...])
+            asyncEval(cache)
+            processed += chunkLength
+        }
+        eval(cache)
+        let logits = languageModel(
+            tokens[0..., processed...], cache: cache,
+            inputsEmbeds: embeddings[0..., processed..., 0...])
         return .logits(.init(logits: logits))
     }
 
@@ -904,12 +907,14 @@ public struct Mistral3MessageGenerator: MessageGenerator {
 
     public func generate(message: Chat.Message) -> Message {
         // For Mistral3 VLM, images come before text in the content
-        [
+        var dictionary: Message = [
             "role": message.role.rawValue,
             "content": message.images.map { _ in
                 ["type": "image"]
             } + [["type": "text", "text": message.content]],
         ]
+        addToolMetadata(to: &dictionary, for: message)
+        return dictionary
     }
 }
 
@@ -1016,7 +1021,11 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
 
         if input.images.isEmpty {
             // No image - just apply chat template
-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+            let promptTokens = try tokenizer.applyChatTemplate(
+                messages: messages,
+                tools: input.tools,
+                additionalContext: input.additionalContext
+            )
             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
@@ -1029,10 +1038,14 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         let patchSize = config.imageProcessor.patchSize
 
         // Apply chat template to get tokenized prompt with image placeholder
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext
+        )
 
         // Decode to find and replace image placeholder token
-        let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+        let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
 
         // Process image to get dimensions
         let preprocessResult = try preprocessImage(

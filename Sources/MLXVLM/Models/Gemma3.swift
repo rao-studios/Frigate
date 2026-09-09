@@ -2,7 +2,6 @@ import CoreImage
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma3
 
@@ -866,12 +865,12 @@ private func maskedScatter(
 
     // Scatter the scaled image features into the special image token positions
     let imagePositions = MLXArray(imagePositionIndices)
-    guard scaledImageFeaturesFlattened.shape[0] == imagePositions.shape[0] else {
+    guard scaledImageFeaturesFlattened.dim(0) == imagePositions.dim(0) else {
         fatalError(
             """
             Critical error in maskedScatter: Size mismatch between image features and positions.
-            Image features: \(scaledImageFeaturesFlattened.shape[0])
-            Image positions: \(imagePositions.shape[0])
+            Image features: \(scaledImageFeaturesFlattened.dim(0))
+            Image positions: \(imagePositions.dim(0))
             """)
     }
     finalEmbeddingFlattened[imagePositions] = scaledImageFeaturesFlattened
@@ -986,11 +985,25 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        let prefillStepSize = windowSize ?? 512
+        let convertedCache = cache.compactMap { $0 as KVCache }
+
         guard let imagePixels = input.image?.pixels else {
-            // Text-only input
-            let convertedCache = cache.compactMap { $0 as KVCache }
+            var tokens = input.text.tokens
+            if tokens.ndim == 1 { tokens = tokens.expandedDimensions(axis: 0) }
+            let totalPositions = tokens.dim(1)
+            var processed = 0
+            while totalPositions - processed > 1 {
+                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+                _ = languageModel(
+                    tokens[0..., processed ..< (processed + chunkLength)],
+                    cache: convertedCache, inputEmbedding: nil, mask: nil)
+                asyncEval(cache)
+                processed += chunkLength
+            }
+            eval(cache)
             let result = languageModel(
-                input.text.tokens, cache: convertedCache, inputEmbedding: nil, mask: nil)
+                tokens[0..., processed...], cache: convertedCache, inputEmbedding: nil, mask: nil)
             return .logits(result)
         }
 
@@ -1000,17 +1013,22 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             mask: input.text.mask
         )
 
-        let convertedCache = cache.compactMap { $0 as KVCache }
-        // Use causal masking for text generation
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
-
+        let totalPositions = inputEmbeddings.dim(1)
+        var processed = 0
+        while totalPositions - processed > 1 {
+            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+            let range = processed ..< (processed + chunkLength)
+            _ = languageModel(
+                nil, cache: convertedCache,
+                inputEmbedding: inputEmbeddings[0..., range, 0...], mask: maskMode)
+            asyncEval(cache)
+            processed += chunkLength
+        }
+        eval(cache)
         let result = languageModel(
-            nil,  // Pass nil for tokens when using embeddings
-            cache: convertedCache,
-            inputEmbedding: inputEmbeddings,
-            mask: maskMode
-        )
-
+            nil, cache: convertedCache,
+            inputEmbedding: inputEmbeddings[0..., processed..., 0...], mask: maskMode)
         return .logits(result)
     }
 
@@ -1067,7 +1085,9 @@ public struct Gemma3Processor: UserInputProcessor {
         // Use structured content message generator for Gemma3's chat template
         let messages = Qwen2VLMessageGenerator().generate(from: input)
 
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools,
+            additionalContext: input.additionalContext)
 
         // Process images if any
         var processedImage: LMInput.ProcessedImage?

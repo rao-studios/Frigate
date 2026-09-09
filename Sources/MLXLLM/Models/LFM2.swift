@@ -5,6 +5,8 @@
 //  Created by John Mai on 2025/7/12.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/lfm2.py
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -30,6 +32,7 @@ public struct LFM2Configuration: Codable, Sendable {
     let blockAutoAdjustFFDim: Bool
     private let _fullAttnIdxs: [Int]?
     private let layerTypes: [String]?
+    private let ropeParameters: [String: StringOrNumber]?
     var fullAttnIdxs: [Int] {
         if let fullAttnIdxs = _fullAttnIdxs {
             return fullAttnIdxs
@@ -65,6 +68,7 @@ public struct LFM2Configuration: Codable, Sendable {
         case _fullAttnIdxs = "full_attn_idxs"
         case layerTypes = "layer_types"
         case ropeTheta = "rope_theta"
+        case ropeParameters = "rope_parameters"
     }
 
     public init(from decoder: Decoder) throws {
@@ -92,7 +96,11 @@ public struct LFM2Configuration: Codable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .blockAutoAdjustFFDim) ?? true
         self._fullAttnIdxs = try container.decodeIfPresent([Int].self, forKey: ._fullAttnIdxs)
         self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
-        self.ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1000000.0
+        self.ropeParameters = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
+
+        let ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1000000.0
+        self.ropeTheta = ropeParameters?["rope_theta"]?.asFloat() ?? ropeTheta
     }
 }
 
@@ -149,13 +157,9 @@ class LFM2Attention: Module {
         keys = kLayerNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -218,7 +222,8 @@ class LFM2ShortConv: Module {
 
         Bx = concatenated([state!, Bx], axis: -2)
         if let cache {
-            cache[0] = Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...]
+            cache[0] = contiguous(Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...])
+            cache.advance(x.dim(1))
         }
 
         let convOut = conv(Bx)
@@ -382,7 +387,7 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
             var sanitizedParam = param
 
             if name.contains("conv.weight") {
-                if param.shape[param.shape.count - 1] > param.shape[1] {
+                if param.shape[param.shape.count - 1] > param.dim(1) {
                     sanitizedParam = param.transposed(0, 2, 1)
                 }
             }

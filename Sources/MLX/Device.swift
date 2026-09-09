@@ -102,7 +102,18 @@ public final class Device: @unchecked Sendable, Equatable {
 
     private static func _resolveGlobalDefaultDevice() -> Device {
         _lock.withLock {
-            _defaultDevice ?? .gpu
+            if let device = _defaultDevice {
+                return device
+            }
+            // Ask the underlying MLX C++ core for its default device rather
+            // than hard-coding `.gpu`. On Apple platforms with Metal this
+            // still resolves to GPU; on a CPU-only host (Linux without
+            // CUDA / no Metal) it correctly resolves to CPU. Hard-coding GPU
+            // here meant `defaultDevice()` / `StreamOrDevice.default`
+            // returned an unavailable device on those hosts.
+            var ctx = mlx_device_new()
+            mlx_get_default_device(&ctx)
+            return Device(ctx)
         }
     }
 
@@ -173,8 +184,10 @@ public final class Device: @unchecked Sendable, Equatable {
 extension Device: CustomStringConvertible {
     public var description: String {
         var s = mlx_string_new()
-        mlx_device_tostring(&s, ctx)
         defer { mlx_string_free(s) }
+        _ = evalLock.withLock {
+            mlx_device_tostring(&s, ctx)
+        }
         return String(cString: mlx_string_data(s), encoding: .utf8)!
     }
 }

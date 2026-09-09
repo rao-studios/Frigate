@@ -3,7 +3,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/phimoe.py
+// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/phimoe.py
 
 public struct PhiMoEConfiguration: Codable, Sendable {
     var modelType: String = "phimoe"
@@ -91,13 +91,9 @@ class PhiMoEAttention: Module {
         var k = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         let v = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            q = rope(q, offset: cache.offset)
-            k = rope(k, offset: cache.offset)
-        } else {
-            q = rope(q)
-            k = rope(k)
-        }
+        let offset = cache?.ropeOffset
+        q = applyRotaryPosition(rope, to: q, offset: offset)
+        k = applyRotaryPosition(rope, to: k, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: q,
@@ -147,7 +143,7 @@ class PhiMoESparseMoeBlock: Module {
         let scores = MLX.softmax(MLX.takeAlong(gates, inds, axis: -1), axis: -1, precise: true)
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(y, scores)
     }
 }
 

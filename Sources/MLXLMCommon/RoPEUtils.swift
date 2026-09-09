@@ -9,11 +9,85 @@ import Foundation
 import MLX
 import MLXNN
 
-public class Llama3RoPE: Module, OffsetLayer {
+private let yarnTypes: Set<String> = ["yarn", "deepseek_yarn", "telechat3-yarn"]
+private let supportedRoPETypes: Set<String> = Set([
+    "default", "linear", "proportional", "llama3", "longrope", "mrope",
+]).union(yarnTypes)
+
+private func ropeType(in scalingConfig: [String: StringOrNumber]?) -> String? {
+    guard let value = scalingConfig?["type"] ?? scalingConfig?["rope_type"] else { return nil }
+    guard case .string(let ropeType) = value else { return nil }
+    return ropeType
+}
+
+private func invalidRoPEConfiguration(_ context: String, _ message: String) -> ModelFactoryError {
+    .invalidConfiguration("\(context): \(message)")
+}
+
+public func validateRoPEConfiguration(
+    _ scalingConfig: [String: StringOrNumber]?,
+    context: String = "rope_scaling",
+    supportedTypes: Set<String>? = nil
+) throws {
+    guard let scalingConfig else { return }
+    let supportedTypes = supportedTypes ?? supportedRoPETypes
+
+    if let typeValue = scalingConfig["type"] ?? scalingConfig["rope_type"] {
+        guard case .string(let ropeType) = typeValue else {
+            throw invalidRoPEConfiguration(context, "type must be a string")
+        }
+        guard supportedTypes.contains(ropeType) else {
+            throw invalidRoPEConfiguration(context, "unsupported type '\(ropeType)'")
+        }
+    }
+
+    if let factor = scalingConfig["factor"], factor.asFloat() == nil {
+        throw invalidRoPEConfiguration(context, "factor must be numeric")
+    }
+
+    switch ropeType(in: scalingConfig) {
+    case "llama3":
+        for key in ["low_freq_factor", "high_freq_factor", "original_max_position_embeddings"] {
+            if let value = scalingConfig[key], value.asFloat() == nil {
+                throw invalidRoPEConfiguration(context, "\(key) must be numeric")
+            }
+        }
+    case "longrope":
+        guard scalingConfig["original_max_position_embeddings"]?.asInt() != nil else {
+            throw invalidRoPEConfiguration(
+                context, "longrope requires original_max_position_embeddings")
+        }
+        guard scalingConfig["short_factor"]?.asFloats() != nil else {
+            throw invalidRoPEConfiguration(context, "longrope requires numeric short_factor")
+        }
+        guard scalingConfig["long_factor"]?.asFloats() != nil else {
+            throw invalidRoPEConfiguration(context, "longrope requires numeric long_factor")
+        }
+    case "mrope":
+        try validateMROPESection(scalingConfig, context: context)
+    default:
+        break
+    }
+}
+
+public func validateMROPESection(
+    _ scalingConfig: [String: StringOrNumber]?,
+    context: String = "rope_scaling"
+) throws {
+    guard let section = scalingConfig?["mrope_section"]?.asInts() else {
+        throw invalidRoPEConfiguration(context, "mrope_section must be an array of integers")
+    }
+    guard section.count == 3, section.allSatisfy({ $0 > 0 }) else {
+        throw invalidRoPEConfiguration(
+            context, "mrope_section must contain three positive integers")
+    }
+}
+
+public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let maxPositionEmbeddings: Int
     let traditional: Bool
-    let freqs: MLXArray
+    let _freqs: MLXArray
 
     init(
         dims: Int,
@@ -57,7 +131,7 @@ public class Llama3RoPE: Module, OffsetLayer {
             (oldContextLen / wavelens - lowFreqFactor) / (highFreqFactor - lowFreqFactor)
         let smoothFreqs = frequencies / ((1 - smoothFactors) / factor + smoothFactors)
 
-        self.freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
+        self._freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
         super.init()
     }
 
@@ -69,22 +143,31 @@ public class Llama3RoPE: Module, OffsetLayer {
             base: nil,
             scale: 1.0,
             offset: offset,
-            freqs: freqs
+            freqs: _freqs
         )
     }
+
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: _freqs
+        )
+    }
+
 }
 
-/// Gemma 4 full-attention RoPE: rotate a fraction of each half of the head.
-/// Frequencies are indexed against the full head dim, not the rotated width.
-public class ProportionalRoPE: Module, OffsetLayer {
+public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let traditional: Bool
     let rotatedDims: Int
-    /// Computed at init — not a checkpoint tensor. Leading underscore keeps
-    /// Module.filterValidParameters from demanding `rope.freqs` in Hub weights.
-    private let _freqs: MLXArray?
+    let _freqs: MLXArray?
 
-    public init(
+    init(
         dims: Int,
         traditional: Bool = false,
         base: Float = 10_000,
@@ -92,10 +175,12 @@ public class ProportionalRoPE: Module, OffsetLayer {
     ) {
         self.dims = dims
         self.traditional = traditional
+
         let factor = scalingConfig?["factor"]?.asFloat() ?? 1.0
         let partialRotaryFactor = scalingConfig?["partial_rotary_factor"]?.asFloat() ?? 1.0
         let ropeAngles = Int(partialRotaryFactor * Float(dims) / 2.0)
         self.rotatedDims = 2 * ropeAngles
+
         if rotatedDims > 0 {
             let exponents =
                 MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32) / Float(dims)
@@ -103,11 +188,15 @@ public class ProportionalRoPE: Module, OffsetLayer {
         } else {
             self._freqs = nil
         }
+
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
-        guard rotatedDims > 0, let freqs = _freqs else { return x }
+        guard rotatedDims > 0, let _freqs else {
+            return x
+        }
+
         let half = dims / 2
         let rotatedHalf = rotatedDims / 2
 
@@ -125,6 +214,7 @@ public class ProportionalRoPE: Module, OffsetLayer {
         let headParts = split(head, indices: [half], axis: -1)
         var left = headParts[0]
         var right = headParts[1]
+
         let leftParts = split(left, indices: [rotatedHalf], axis: -1)
         let rightParts = split(right, indices: [rotatedHalf], axis: -1)
         var rotated = concatenated([leftParts[0], rightParts[0]], axis: -1)
@@ -135,30 +225,73 @@ public class ProportionalRoPE: Module, OffsetLayer {
             base: nil,
             scale: 1.0,
             offset: offset,
-            freqs: freqs
+            freqs: _freqs
         )
+
         let rotatedParts = split(rotated, indices: [rotatedHalf], axis: -1)
         left = concatenated([rotatedParts[0], leftParts[1]], axis: -1)
         right = concatenated([rotatedParts[1], rightParts[1]], axis: -1)
         let updatedHead = concatenated([left, right], axis: -1)
+
         if let tail {
             return concatenated([updatedHead, tail], axis: -1)
+        } else {
+            return updatedHead
         }
-        return updatedHead
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        guard rotatedDims > 0, let _freqs else {
+            return x
+        }
+
+        let half = dims / 2
+        let rotatedHalf = rotatedDims / 2
+
+        let head: MLXArray
+        let tail: MLXArray?
+        if x.shape[x.ndim - 1] > dims {
+            let parts = split(x, indices: [dims], axis: -1)
+            head = parts[0]
+            tail = parts[1]
+        } else {
+            head = x
+            tail = nil
+        }
+
+        let headParts = split(head, indices: [half], axis: -1)
+        var left = headParts[0]
+        var right = headParts[1]
+
+        let leftParts = split(left, indices: [rotatedHalf], axis: -1)
+        let rightParts = split(right, indices: [rotatedHalf], axis: -1)
+        var rotated = concatenated([leftParts[0], rightParts[0]], axis: -1)
+        rotated = MLXFast.RoPE(
+            rotated,
+            dimensions: rotatedDims,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: _freqs
+        )
+
+        let rotatedParts = split(rotated, indices: [rotatedHalf], axis: -1)
+        left = concatenated([rotatedParts[0], leftParts[1]], axis: -1)
+        right = concatenated([rotatedParts[1], rightParts[1]], axis: -1)
+        let updatedHead = concatenated([left, right], axis: -1)
+
+        if let tail {
+            return concatenated([updatedHead, tail], axis: -1)
+        } else {
+            return updatedHead
+        }
     }
 }
 
-public class YarnRoPE: Module, OffsetLayer {
+public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dimensions: Int
     let traditional: Bool
-    let maxPositionEmbeddings: Int
-    let base: Float
-    let scalingFactor: Float
-    let originalMaxPositionEmbeddings: Int
-    let betaFast: Float
-    let betaSlow: Float
-    let mscale: Float
-    let mscaleAllDim: Float
 
     private let _mscale: Float
     private let _freqs: MLXArray
@@ -179,14 +312,6 @@ public class YarnRoPE: Module, OffsetLayer {
 
         self.dimensions = dimensions
         self.traditional = traditional
-        self.maxPositionEmbeddings = maxPositionEmbeddings
-        self.base = base
-        self.scalingFactor = scalingFactor
-        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
-        self.betaFast = betaFast
-        self.betaSlow = betaSlow
-        self.mscale = mscale
-        self.mscaleAllDim = mscaleAllDim
 
         func yarnFindCorrectionDim(numRotations: Float) -> Float {
             return Float(dimensions)
@@ -240,8 +365,13 @@ public class YarnRoPE: Module, OffsetLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        // "copy" of x as we are going to write through it and don't want to update
+        // through the reference
+        // https://github.com/ml-explore/mlx-swift/issues/364
+        var x = x
         if _mscale != 1.0 {
-            x[.ellipsis, 0 ..< dimensions] = _mscale * x[.ellipsis, 0 ..< dimensions]
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
         }
 
         return MLXFast.RoPE(
@@ -254,7 +384,28 @@ public class YarnRoPE: Module, OffsetLayer {
             freqs: self._freqs
         )
     }
+
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        var x = x
+        if _mscale != 1.0 {
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
+        }
+
+        return MLXFast.RoPE(
+            x,
+            dimensions: dimensions,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: self._freqs
+        )
+    }
+
 }
+
+public typealias RoPELayer = OffsetLayer & ArrayOffsetLayer
 
 public func initializeRope(
     dims: Int,
@@ -262,7 +413,7 @@ public func initializeRope(
     traditional: Bool,
     scalingConfig: [String: StringOrNumber]?,
     maxPositionEmbeddings: Int?
-) -> OffsetLayer {
+) -> RoPELayer {
     let ropeType: String = {
         if let config = scalingConfig,
             let typeValue = config["type"] ?? config["rope_type"],
@@ -296,7 +447,7 @@ public func initializeRope(
             base: base,
             scalingConfig: scalingConfig
         )
-    } else if ropeType == "yarn" {
+    } else if yarnTypes.contains(ropeType) {
         let factor = scalingConfig?["factor"]?.asFloat() ?? 32.0
         let origMax = scalingConfig?["original_max_position_embeddings"]?.asInt() ?? 4096
         let betaFast = scalingConfig?["beta_fast"]?.asFloat() ?? 32.0

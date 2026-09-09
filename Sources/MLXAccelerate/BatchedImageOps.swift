@@ -192,8 +192,11 @@ public func buildBicubicWarpTapsHost(
     // Flat [16 · count] buffers filled row-parallel (each (t, y) writes a disjoint
     // range), then split into the 16 per-tap arrays. Full-image tables (CLR v2.6
     // directional probes, 512²) made the sequential build the pipeline bottleneck.
-    let iBuf = UnsafeMutablePointer<Int32>.allocate(capacity: 16 * count)
-    let wBuf = UnsafeMutablePointer<Float>.allocate(capacity: 16 * count)
+    // `nonisolated(unsafe)`: on Linux, libdispatch's concurrentPerform takes a @Sendable
+    // closure, so capturing a raw pointer is diagnosed. The disjoint-range invariant above
+    // is what makes it safe; Darwin's overload simply does not diagnose it.
+    nonisolated(unsafe) let iBuf = UnsafeMutablePointer<Int32>.allocate(capacity: 16 * count)
+    nonisolated(unsafe) let wBuf = UnsafeMutablePointer<Float>.allocate(capacity: 16 * count)
     defer { iBuf.deallocate(); wBuf.deallocate() }
 
     DispatchQueue.concurrentPerform(iterations: T * height) { r in

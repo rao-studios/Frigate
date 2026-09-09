@@ -124,7 +124,7 @@ class GraniteMoeHybridMamba2Mixer: Module {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            cache[0] = contiguous(padded[0..., start ..< end, 0...])
         }
 
         let convOutput = conv1d(padded)
@@ -181,6 +181,7 @@ class GraniteMoeHybridMamba2Mixer: Module {
 
         if let cache {
             cache[1] = nextState
+            cache.advance(hiddenStates.dim(1))
         }
 
         let flattenedY = y.flattened(start: 2)
@@ -197,7 +198,7 @@ class GraniteMoeHybridAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: RoPE?
+    let rope: RoPELayer?
 
     init(_ args: GraniteMoeHybridConfiguration) {
         self.args = args
@@ -218,12 +219,10 @@ class GraniteMoeHybridAttention: Module {
         if args.positionEmbeddingType == "nope" {
             self.rope = nil
         } else {
-            self.rope = RoPE(
-                dimensions: headDim,
-                traditional: false,
-                base: args.ropeTheta,
-                scale: 1
-            )
+            self.rope = initializeRope(
+                dims: headDim, base: args.ropeTheta,
+                traditional: false, scalingConfig: nil,
+                maxPositionEmbeddings: args.maxPositionEmbeddings)
         }
 
         super.init()
@@ -247,13 +246,9 @@ class GraniteMoeHybridAttention: Module {
         values = values.reshaped(B, L, args.kvHeads, headDim).transposed(0, 2, 1, 3)
 
         if let rope {
-            if let cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
-            } else {
-                queries = rope(queries)
-                keys = rope(keys)
-            }
+            let offset = cache?.ropeOffset
+            queries = applyRotaryPosition(rope, to: queries, offset: offset)
+            keys = applyRotaryPosition(rope, to: keys, offset: offset)
         }
 
         let output = attentionWithCacheUpdate(
@@ -321,7 +316,7 @@ class GraniteMoeHybridMoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, gates) = router(x)
         let expertOutputs = switchMLP(x, indices)
-        return (expertOutputs * gates[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(expertOutputs, gates)
     }
 }
 

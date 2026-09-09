@@ -61,7 +61,9 @@ public final class BertTokenizer: Sendable {
         doLowerCase: Bool = true
     ) {
         self.vocab = vocab
-        ids_to_tokens = Utils.invert(vocab)
+        ids_to_tokens = vocab.reduce(into: [Int: String]()) { result, element in
+            result[element.value] = element.key
+        }
         basicTokenizer = BasicTokenizer(doLowerCase: doLowerCase)
         wordpieceTokenizer = WordpieceTokenizer(vocab: self.vocab)
         self.tokenizeChineseChars = tokenizeChineseChars
@@ -185,7 +187,7 @@ public final class BertTokenizer: Sendable {
         }
 
         return text.map { c in
-            if let scalar = c.unicodeScalars.first, Utils.isChineseChar(scalar) {
+            if let scalar = c.unicodeScalars.first, scalar.isCJKUnifiedIdeograph {
                 " \(c) "
             } else {
                 "\(c)"
@@ -238,7 +240,19 @@ final class BasicTokenizer: Sendable {
 
     func maybeStripAccents(_ text: String) -> String {
         guard doLowerCase else { return text }
-        return text.folding(options: .diacriticInsensitive, locale: nil)
+        // Equivalent of HF Python's `_run_strip_accents`: NFD-decompose then drop every
+        // nonspacing-mark scalar (Unicode general category Mn). The standard Foundation
+        // API `.folding(options: .diacriticInsensitive, locale: nil)` strips Latin
+        // diacritics but does NOT strip Japanese voiced-kana combining marks.
+        // Conceptual reference:
+        // https://github.com/huggingface/transformers/blob/542e65fae2fe9cc7ddeb816e540162bc5a8bff77/src/transformers/models/bert/tokenization_bert.py#L382
+        return String(
+            String.UnicodeScalarView(
+                text.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
+                    $0.properties.generalCategory != .nonspacingMark
+                }
+            )
+        )
     }
 
     func maybeLowercase(_ text: String) -> String {
@@ -301,21 +315,23 @@ final class WordpieceTokenizer: Sendable {
     }
 
     /// `word`: A single token.
-    /// Warning: this differs from the `pytorch-transformers` implementation.
-    /// This should have already been passed through `BasicTokenizer`.
     func tokenize(word: String) -> [String] {
-        if word.count > maxInputCharsPerWord {
+        // Iterate Unicode scalars so we NFD-decompose syllables rather than follow Characters.
+        // Conceptual reference:
+        // https://github.com/huggingface/transformers/blob/542e65fae2fe9cc7ddeb816e540162bc5a8bff77/src/transformers/models/bert/tokenization_bert.py#L341
+        let scalars = Array(word.unicodeScalars)
+        if scalars.count > maxInputCharsPerWord {
             return [unkToken]
         }
         var outputTokens: [String] = []
         var isBad = false
         var start = 0
         var subTokens: [String] = []
-        while start < word.count {
-            var end = word.count
+        while start < scalars.count {
+            var end = scalars.count
             var cur_substr: String?
             while start < end {
-                var substr = Utils.substr(word, start..<end)!
+                var substr = String(String.UnicodeScalarView(scalars[start..<end]))
                 if start > 0 {
                     substr = "##\(substr)"
                 }

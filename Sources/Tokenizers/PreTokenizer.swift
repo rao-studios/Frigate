@@ -8,6 +8,56 @@
 import Foundation
 import Hub
 
+/// Character class used by punctuation-based pre-tokenizers.
+private let punctuationRegex = #"\p{P}\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E"#
+
+/// Pre-compiled regex shared by ``BertPreTokenizer``.
+private let bertPreTokenizeRegex: NSRegularExpression = {
+    let pattern = "[^\\s\(punctuationRegex)]+|[\(punctuationRegex)]"
+    return try! NSRegularExpression(pattern: pattern)
+}()
+
+/// Pre-compiled regex shared by ``WhitespacePreTokenizer``, ``PreTokenizerType/WhitespaceSplit``.
+private let whitespacePreTokenizeRegex: NSRegularExpression = {
+    try! NSRegularExpression(pattern: #"\S+"#)
+}()
+
+/// Pre-compiled regex shared by ``PunctuationPreTokenizer``.
+private let punctuationPreTokenizeRegex: NSRegularExpression = {
+    let pattern = "[^\(punctuationRegex)]+|[\(punctuationRegex)]+"
+    return try! NSRegularExpression(pattern: pattern)
+}()
+
+/// Pre-compiled regex used by ``DigitsPreTokenizer`` when each digit should be
+/// emitted as its own token (`individualDigits == true`).
+private let digitsPreTokenizeIndividualRegex: NSRegularExpression = {
+    try! NSRegularExpression(pattern: "[^\\d]+|\\d")
+}()
+
+/// Pre-compiled regex used by ``DigitsPreTokenizer`` when consecutive digits
+/// should be grouped into a single token (`individualDigits == false`).
+private let digitsPreTokenizeGroupedRegex: NSRegularExpression = {
+    try! NSRegularExpression(pattern: "[^\\d]+|\\d+")
+}()
+
+/// Apply `regex` to `text` and return the substring of every match.
+///
+/// Equivalent to `text.ranges(of: pattern).map { String(text[$0]) }`, but
+/// uses `enumerateMatches` against an already-compiled regex and avoids the
+/// intermediate `[Range<String.Index>]` allocation. The bridge to `NSString`
+/// is cheap on `String` instances and lets `substring(with:)` slice on the
+/// UTF-16 ranges that `NSRegularExpression` returns.
+private func splitMatches(in text: String, with regex: NSRegularExpression) -> [String] {
+    let nsText = text as NSString
+    let fullRange = NSRange(location: 0, length: nsText.length)
+    var result: [String] = []
+    regex.enumerateMatches(in: text, range: fullRange) { match, _, _ in
+        guard let match else { return }
+        result.append(nsText.substring(with: match.range))
+    }
+    return result
+}
+
 /// Options that can be passed to pre-tokenization operations.
 public enum PreTokenizerOption: String {
     /// Indicates this is the first section of text being processed.
@@ -109,15 +159,10 @@ struct PreTokenizerFactory {
 }
 
 class BertPreTokenizer: PreTokenizer {
-    let re: String
-
-    required init(config: Config) {
-        // Ref: https://github.com/huggingface/transformers.js/blob/27920d84831e323275b38f0b5186644b7936e1a2/src/tokenizers.js#L1002
-        re = "[^\\s\(Constants.PUNCTUATION_REGEX)]+|[\(Constants.PUNCTUATION_REGEX)]"
-    }
+    required init(config: Config) {}
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        text.ranges(of: re).map { String(text[$0]) }
+        splitMatches(in: text, with: bertPreTokenizeRegex)
     }
 }
 
@@ -137,14 +182,10 @@ class PreTokenizerSequence: PreTokenizer {
 }
 
 class WhitespacePreTokenizer: PreTokenizer {
-    let re: String
-
-    required init(config: Config) {
-        re = #"\S+"#
-    }
+    required init(config: Config) {}
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        text.ranges(of: re).map { String(text[$0]) }
+        splitMatches(in: text, with: whitespacePreTokenizeRegex)
     }
 }
 
@@ -178,7 +219,16 @@ class MetaspacePreTokenizer: PreTokenizer {
         addPrefixSpace = config.addPrefixSpace.boolean(or: false)
         replacement = config.replacement.string(or: " ")
         stringReplacement = config.strRep.string(or: replacement)
-        prependScheme = PrependScheme.from(rawValue: config.prependScheme.string())
+
+        // prepend_scheme supersedes add_prefix_space per tokenizers PR #1357.
+        // When prepend_scheme is explicit, use it directly.
+        // Otherwise, derive from add_prefix_space for backward compatibility
+        // (defaulting to .always when both are absent, matching canonical behavior).
+        if let schemeStr = config.prependScheme.string() {
+            prependScheme = PrependScheme(rawValue: schemeStr) ?? .always
+        } else {
+            prependScheme = config.addPrefixSpace.boolean(or: true) ? .always : .never
+        }
     }
 
     /// https://github.com/huggingface/tokenizers/blob/accd0650b802f2180df40ef1def3bce32156688e/tokenizers/src/pre_tokenizers/metaspace.rs#L114
@@ -186,21 +236,19 @@ class MetaspacePreTokenizer: PreTokenizer {
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
         let normalized = text.replacingOccurrences(of: " ", with: stringReplacement)
 
-        // We add a prefix space if:
-        //  (1) The addPrefixSpace option is enabled and the normalized
-        //      token does not already start with the replacement character.
-        //  and (2) either:
-        //  (a) prependScheme is 'always'
-        //  (b) prependScheme is 'first' and this is the first section
-        // FIXME: (2b) always prepends, we are not passing section info
-
+        // Prepend the replacement character based on the prepend scheme.
+        // prepend_scheme is the sole authority (add_prefix_space is resolved in init).
         var prepend = ""
-        if addPrefixSpace, !normalized.hasPrefix(replacement) {
-            if prependScheme == .always {
+        if !normalized.hasPrefix(replacement) {
+            switch prependScheme {
+            case .always:
                 prepend = stringReplacement
-            }
-            if prependScheme == .first, options.contains(.firstSection) {
-                prepend = stringReplacement
+            case .first:
+                if options.contains(.firstSection) {
+                    prepend = stringReplacement
+                }
+            case .never:
+                break
             }
         }
 
@@ -210,11 +258,44 @@ class MetaspacePreTokenizer: PreTokenizer {
     }
 }
 
+/// Pre-compiled GPT-2 / Llama / Qwen / Gemma byte-level pre-tokenization regex.
+///
+/// The same pattern is used by ``BPETokenizer/byteEncode(text:)``,
+/// ``BPETokenizer/hexaEncode(text:)`` and ``ByteLevelPreTokenizer/preTokenize(text:options:)``.
+/// Foundation's `String.range(of:options:.regularExpression)` re-parses the pattern on every
+/// call, so caching a single `NSRegularExpression` removes the dominant cost of
+/// short-input `encode` and lets us iterate matches via `enumerateMatches` without
+/// allocating an intermediate range array.
+let byteLevelPreTokenizeRegex: NSRegularExpression = {
+    let pattern = #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#
+    // The pattern is a compile-time constant and has been used in production for
+    // years; treating compilation failure as a programmer error matches every
+    // other in-tree regex.
+    return try! NSRegularExpression(pattern: pattern)
+}()
+
+/// Apply `regex` to `text` and call `body` once per match with the matched
+/// substring. Wraps the boilerplate of bridging through `NSString` /
+/// `NSRange` / `enumerateMatches` so call sites only express the per-token
+/// logic. Used by the byte-level pre-tokenizer and by `BPETokenizer`'s
+/// byte / hex encode helpers.
+func enumerateRegexTokens(
+    in text: String, with regex: NSRegularExpression, _ body: (String) -> Void
+) {
+    let nsText = text as NSString
+    let fullRange = NSRange(location: 0, length: nsText.length)
+    withoutActuallyEscaping(body) { escapableBody in
+        regex.enumerateMatches(in: text, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            escapableBody(nsText.substring(with: match.range))
+        }
+    }
+}
+
 class ByteLevelPreTokenizer: PreTokenizer {
     let addPrefixSpace: Bool
     let trimOffsets: Bool
     let useRegex: Bool
-    let RE = #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#
 
     required init(config: Config) {
         addPrefixSpace = config.addPrefixSpace.boolean(or: false)
@@ -222,43 +303,50 @@ class ByteLevelPreTokenizer: PreTokenizer {
         useRegex = config.useRegex.boolean(or: true)
     }
 
-    func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        // Split on whitespace and punctuation
-        let tokens = useRegex ? text.ranges(of: RE).map { String(text[$0]) } : [text]
-        return tokens.map { token in
-            if addPrefixSpace, !token.hasPrefix(" ") {
-                return " " + token
-            }
-            return token
-        }.map { token in
-            Array(token.utf8).map { byteEncoder[$0]! }.joined()
+    /// Byte-level encode a single token (no pre-tokenization split).
+    private func byteEncodeToken(_ token: String) -> String {
+        var encoded = ""
+        encoded.reserveCapacity(token.utf8.count)
+        for byte in token.utf8 {
+            encoded.append(byteEncoderTable[Int(byte)])
         }
+        return encoded
+    }
+
+    func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
+        guard useRegex else {
+            let token = (addPrefixSpace && !text.hasPrefix(" ")) ? " " + text : text
+            return [byteEncodeToken(token)]
+        }
+
+        var result: [String] = []
+        enumerateRegexTokens(in: text, with: byteLevelPreTokenizeRegex) { token in
+            let prefixed =
+                (self.addPrefixSpace && !token.hasPrefix(" ")) ? " " + token : token
+            result.append(self.byteEncodeToken(prefixed))
+        }
+        return result
     }
 }
 
 class PunctuationPreTokenizer: PreTokenizer {
-    let re: String
-
-    required init(config: Config) {
-        re = "[^\(Constants.PUNCTUATION_REGEX)]+|[\(Constants.PUNCTUATION_REGEX)]+"
-    }
+    required init(config: Config) {}
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        // Ref: https://github.com/xenova/transformers.js/blob/27920d84831e323275b38f0b5186644b7936e1a2/src/tokenizers.js#L1138
-        text.ranges(of: re).map { String(text[$0]) }
+        splitMatches(in: text, with: punctuationPreTokenizeRegex)
     }
 }
 
 class DigitsPreTokenizer: PreTokenizer {
-    let re: String
+    let regex: NSRegularExpression
 
     required init(config: Config) {
         let individualDigits = config.individualDigits.boolean(or: false)
-        re = "[^\\d]+|\\d\(individualDigits ? "" : "+")"
+        regex = individualDigits ? digitsPreTokenizeIndividualRegex : digitsPreTokenizeGroupedRegex
     }
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        text.ranges(of: re).map { String(text[$0]) }
+        splitMatches(in: text, with: regex)
     }
 }
 
