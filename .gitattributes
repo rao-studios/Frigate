@@ -1,0 +1,15 @@
+# WHAT: The vision runtime's trained classifier and its real-capture test fixtures.
+# PIN:  LFS, not the object store — the same rules the VisionAX repository kept before the
+#       runtime moved here. A 10-20 MB model committed directly is kept forever, once per
+#       retrain, in every clone. RegionClassifier names an un-pulled pointer file rather
+#       than handing ONNX Runtime 130 bytes of text.
+Sources/VisionAX/Resources/Models/*.onnx filter=lfs diff=lfs merge=lfs -text
+Sources/VisionAX/Resources/Models/*.safetensors filter=lfs diff=lfs merge=lfs -text
+
+# Fixture models are tiny (a few KB) and must survive a clone with no LFS at all, because
+# they are what proves the runtime works. They stay in git proper.
+Tests/VisionAXTests/Fixtures/*.onnx -filter -diff -merge binary
+
+# Real captures of real players, about a megabyte each and never edited again. The tests
+# that read them detect an un-pulled pointer and SKIP with a sentence saying so.
+Tests/VisionAXTests/Fixtures/media/*.png filter=lfs diff=lfs merge=lfs -text

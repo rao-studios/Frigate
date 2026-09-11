@@ -226,22 +226,32 @@ let noCudaCmlxExcludes = [
     ]
 #endif
 
-// ── FrigateVision — VisionAX, re-exported ────────────────────────────────────
+// ── VisionAX — the vision runtime, hosted here ──────────────────────────────
 // WHAT: Frigate hosts every ML surface its consumers take; pixel perception is one of
-//       them. VisionAX (Canny regions → ONNX role classifier → page map) keeps its own
-//       repo, bench, harvester and training; this is the door consumers walk through.
-// PIN:  macOS ONLY, AND ONLY ON A macOS HOST. VisionAX arrives with two xcframework
-//       binary targets (OpenCV, ONNX Runtime) that Linux cannot resolve, so the
-//       dependency, the target AND the product live in one `#if !os(Linux)` block —
-//       a product naming an absent target fails manifest validation, and a Linux box
-//       (Totem's CUDA build) must never learn that VisionAX exists. The guard is
-//       evaluated on the host, the same way the CUDA branches above are.
-//       MLX-FREE BY CONSTRUCTION. The wrapper depends on the VisionAX product and
-//       nothing else, so a consumer that takes FrigateVision alone links no MLX.
-//       NEVER FOLDED INTO THE `Frigate` UMBRELLA. VisionAX replicates the AX type names
+//       them, and its RUNTIME lives here: the C++ engine (CVisionAX — Canny regions, the
+//       ONNX role classifier, the media and icon glyph banks) and the Swift module
+//       `VisionAX` over it (perceive → scene → page map). The VisionAX REPOSITORY keeps
+//       what is not runtime: VisionAXCore — the AX/A11Y data structures and the dataset
+//       schema, which this module re-exports — and the training pipeline, harvester and
+//       bench that produce and tune the model shipped in Sources/VisionAX/Resources/Models.
+// NAME: The product is still `FrigateVision`; the module it vends is `VisionAX` — the
+//       FrigateHub → Hub pattern above. Consumers' manifests name the product and did not
+//       change; their sources say `import VisionAX`.
+// MLX:  The classifier's backbone runs on MLX (Metal) when a metallib sits beside the binary
+//       and the model ships MLX weights converted from its own ONNX backbone; otherwise on
+//       ONNX Runtime's CPU path, and RegionClassifier.backboneDescription says why. So this
+//       product links MLX's core — the one inference piece a vision consumer takes, and none
+//       of the transformer stack. FRIGATE_VISION_BACKBONE=onnx forces the CPU path.
+// PIN:  macOS ONLY, AND ONLY ON A macOS HOST. OpenCV and ONNX Runtime arrive as xcframework
+//       binaries that Linux cannot resolve, so the dependencies, the targets AND the product
+//       live in one `#if !os(Linux)` block — a product naming an absent target fails
+//       manifest validation, and a Linux box (Totem's CUDA build) must never learn any of
+//       this exists. The guard is evaluated on the host, the same way the CUDA branches
+//       above are.
+//       NEVER FOLDED INTO THE `Frigate` UMBRELLA. VisionAXCore replicates the AX type names
 //       (AXNodeSnapshot, AXScreenElement, AXNodeCategory) that Mary's machine layer
-//       declares; `import Frigate` must not carry them, or every consumer of the
-//       umbrella inherits an ambiguity at the use site. FrigateExports.swift stays clean;
+//       declares; `import Frigate` must not carry them, or every consumer of the umbrella
+//       inherits an ambiguity at the use site. FrigateExports.swift stays clean;
 //       ManifestPlatformTests pins it.
 //       THE FLOOR IS macOS 15 BECAUSE OF THIS. A macOS-14 library cannot depend on a
 //       macOS-15 product; every consumer (Mary, Bonnie, Fleet, Totem, Zehn) already sits
@@ -252,21 +262,84 @@ var visionProducts: [Product] = []
 var visionTestDependencies: [Target.Dependency] = []
 #if !os(Linux)
     visionDependencies = [
-        .package(path: "../VisionAX")
+        // VisionAXCore: the AX data structures, the dataset schema, the role vocabulary.
+        .package(path: "../VisionAX"),
+        // Static opencv2.xcframework built from the upstream 4.13.0 tag by
+        // platforms/apple/build_xcframework.py (macOS x86_64 + arm64).
+        .package(url: "https://github.com/yeatse/opencv-spm.git", exact: "4.13.0"),
     ]
     visionTargets = [
+        // ONNX Runtime — the inference runtime the classifier runs on.
+        // PIN: OUR OWN binaryTarget, not Microsoft's SwiftPM package, whose only library
+        //      product drags an Objective-C bindings target in behind it. This is the same
+        //      archive that package points at, so the checksum is theirs too. The zip nests
+        //      onnxruntime.xcframework one level down; SwiftPM keeps only the xcframework, so
+        //      C++ includes go through the framework (<onnxruntime/onnxruntime_c_api.h>),
+        //      the way OpenCV's do.
+        .binaryTarget(
+            name: "onnxruntime",
+            url: "https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.24.2.zip",
+            checksum: "f7100a992d2a8135168c8afd831e6a58b465349101982aa58b3e11d36e600b54"
+        ),
+        // CVisionAX — the engine. C header out, C++ + OpenCV + ORT in.
         .target(
-            name: "FrigateVision",
+            name: "CVisionAX",
             dependencies: [
-                .product(name: "VisionAX", package: "VisionAX")
+                .product(name: "OpenCV", package: "opencv-spm"),
+                "onnxruntime",
+            ],
+            path: "Sources/CVisionAX",
+            cxxSettings: [
+                .define("VISIONAX_VERSION", to: "\"0.3.0\"")
+            ],
+            linkerSettings: [
+                // The static ORT archive carries its CoreML execution provider's
+                // Objective-C objects whether or not we ever append that provider, so
+                // these two frameworks are needed to resolve them at link time.
+                .linkedFramework("CoreML"),
+                .linkedFramework("Foundation"),
+                .linkedLibrary("c++"),
+            ]
+        ),
+        // VisionAX — the Swift face of the engine, and the module the product vends.
+        .target(
+            name: "VisionAX",
+            dependencies: [
+                "CVisionAX",
+                .product(name: "VisionAXCore", package: "VisionAX"),
+                // The classifier's backbone on Metal. Chosen per model at load, and never
+                // without a metallib beside the binary — see Backbone/BackboneSelection.swift.
+                "MLX",
+                "MLXNN",
+            ],
+            path: "Sources/VisionAX",
+            exclude: ["README.md"],
+            resources: [
+                // The trained classifier (git-lfs). Present or not, the directory ships
+                // so Bundle.module exists and RegionClassifier.bundled() can look.
+                .copy("Resources/Models")
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [
+                // Text recognition is Apple's, on the ANE, with nothing to download.
+                .linkedFramework("Vision")
+            ]
+        ),
+        .testTarget(
+            name: "VisionAXTests",
+            dependencies: ["VisionAX"],
+            path: "Tests/VisionAXTests",
+            resources: [
+                // Synthetic screens AND real captures — see MediaFixtureTests.
+                .copy("Fixtures")
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
-        )
+        ),
     ]
     visionProducts = [
-        .library(name: "FrigateVision", targets: ["FrigateVision"])
+        .library(name: "FrigateVision", targets: ["VisionAX"])
     ]
-    visionTestDependencies = ["FrigateVision"]
+    visionTestDependencies = ["VisionAX"]
 #endif
 
 // FLUX.2 / Obscur are image-generation code: ObscurDinov2 decodes a `CGImage` through

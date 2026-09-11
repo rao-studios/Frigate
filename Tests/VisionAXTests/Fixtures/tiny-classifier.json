@@ -1,0 +1,71 @@
+{
+  "files": {
+    "backbone": "tiny-classifier.backbone.onnx",
+    "head": "tiny-classifier.head.onnx"
+  },
+  "format": 1,
+  "head": {
+    "context_scale": 2.0,
+    "roi_size": 3,
+    "stride": 8
+  },
+  "io": {
+    "boxes": "boxes",
+    "features": "features",
+    "image": "image",
+    "probs": "probs"
+  },
+  "min_confidence": 0.5,
+  "name": "tiny-classifier",
+  "preprocess": {
+    "channel_order": "rgb",
+    "interpolation": "area",
+    "long_side": 160,
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "pad_multiple": 32,
+    "pad_value": "mean",
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "roles": [
+    "none",
+    "AXButton",
+    "AXLink",
+    "AXTextField",
+    "AXTextArea",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXComboBox",
+    "AXSlider",
+    "AXTab",
+    "AXMenuItem",
+    "AXDisclosureTriangle",
+    "AXImage",
+    "AXHeading",
+    "AXStaticText",
+    "AXGroup",
+    "AXList",
+    "AXTable",
+    "AXRow",
+    "AXCell",
+    "AXScrollArea",
+    "AXToolbar"
+  ],
+  "runtime": {
+    "intra_op_threads": 1,
+    "max_boxes_per_run": 512
+  },
+  "sha256": {
+    "backbone": "2378d5d21fc5e901315e831e288a1a2fbf4f81fb10782cda03b1f7b736bab2aa",
+    "head": "3e89ac8f64e457e07ca3cf422381a10a63a3ff0159b19c35297e717ac5a767b0"
+  },
+  "version": "fixture"
+}

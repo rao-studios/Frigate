@@ -13,7 +13,7 @@ All fork sources are vendored directly — no external URLs for patched librarie
 | `FrigateEmbedder` | `mlx-community/snowflake-arctic-embed-m-v1.5` | Returns `[[Float]]` |
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
 | `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
-| `FrigateVision` | bundled ONNX region classifier | Pixel perception, re-exported from [VisionAX](../VisionAX) — **macOS only** |
+| `FrigateVision` | bundled ONNX region classifier | Pixel perception — the `VisionAX` runtime, hosted here — **macOS only** |
 
 HuggingFace models are downloaded on first use and cached at `~/.cache/huggingface/`. `FrigateBoost` loads a model exported with `booster.save_model("model.json")` — no `libxgboost` required at runtime.
 
@@ -21,11 +21,14 @@ HuggingFace models are downloaded on first use and cached at `~/.cache/huggingfa
 
 ## FrigateVision — pixel perception
 
-`import FrigateVision` gives you VisionAX whole: the OpenCV region detector, Apple's text
-recognition, the ONNX role classifier and the page map.
+The `FrigateVision` product vends the **`VisionAX`** module — the vision runtime, hosted
+here: the OpenCV region detector (C++ `CVisionAX`), Apple's text recognition, the ONNX role
+classifier and the page map. The module re-exports `VisionAXCore` from the
+[VisionAX](../VisionAX) repository — the AX/A11Y data structures, the dataset schema and
+the role vocabulary — so one import carries both.
 
 ```swift
-import FrigateVision
+import VisionAX
 
 let engine = try VisionEngine()
 let scene = try engine.perceive(
@@ -36,27 +39,43 @@ let scene = try engine.perceive(
 let map = scene.pageMap()          // rows, what each affords, where its name came from
 ```
 
-It is a **re-export**, not a copy — VisionAX keeps its own repository, bench, harvester and
-training pipeline, and this package is the door consumers walk through.
+The runtime's own documentation — how a region becomes a node, the classifier, the media
+lane, the page map, benchmarks — is [`Sources/VisionAX/README.md`](Sources/VisionAX/README.md).
+The VisionAX repository keeps what is not runtime: VisionAXCore, the training pipeline that
+exports `Sources/VisionAX/Resources/Models`, the harvester that builds its data and the
+bench that tunes the detector.
 
-Three things worth knowing:
+Things worth knowing:
 
-- **macOS only.** VisionAX brings OpenCV and ONNX Runtime as xcframeworks, which Linux
-  cannot resolve, so the dependency, the target and the product all live inside
+- **The product kept its name; the module is `VisionAX`.** The same pattern as
+  `FrigateHub` → `Hub`: a consumer's manifest names `FrigateVision`, its sources say
+  `import VisionAX`.
+- **macOS only.** OpenCV and ONNX Runtime arrive as xcframeworks, which Linux cannot
+  resolve, so the dependencies, the targets and the product all live inside
   `#if !os(Linux)` in `Package.swift`. A Linux build of Frigate never learns they exist,
   and `../VisionAX` need not be checked out on a Linux box. `ManifestPlatformTests` fails
-  on macOS the moment something escapes that guard, so the Linux box is never the first to
-  find out.
+  on macOS the moment something escapes that guard, and `scripts/check-linux-manifest.sh`
+  evaluates the manifest under Linux for real.
 - **It is not in the `Frigate` umbrella.** `import Frigate` does not carry it, deliberately:
-  VisionAX declares `AXNodeSnapshot`, `AXScreenElement` and `AXNodeCategory` under the same
-  names an accessibility layer already uses, and every consumer of the umbrella would
+  VisionAXCore declares `AXNodeSnapshot`, `AXScreenElement` and `AXNodeCategory` under the
+  same names an accessibility layer already uses, and every consumer of the umbrella would
   inherit that ambiguity at the use site.
-- **It costs no MLX.** The wrapper depends on the VisionAX product alone, so taking
-  `FrigateVision` links none of the inference stack.
+- **The classifier's backbone runs on MLX when it can.** On ONNX Runtime's CPU path it is
+  ~40% of a page read. It runs on Metal when `mlx.metallib` sits beside the binary and the
+  model ships MLX weights converted from its own ONNX backbone; otherwise it stays on the
+  CPU path and `RegionClassifier.backboneDescription` says why. `FRIGATE_VISION_BACKBONE=onnx`
+  forces the CPU path for an A/B. So taking `FrigateVision` links MLX's core — not the
+  transformer stack — and a binary that wants the GPU path needs the metallib:
+  `scripts/build-metallib.sh <config> --package <consumer>` beside a SwiftPM-built binary,
+  `--app <App.app>` inside an app bundle.
+- **The model and the real-capture fixtures are git-lfs** (see `.gitattributes`): run
+  `git lfs pull` after a clone, or `RegionClassifier.bundled()` reports a pointer file.
+- **An app bundle copies `Frigate_VisionAX.bundle`** into `Contents/Resources` — SwiftPM
+  names resource bundles `<package>_<target>`.
 
-Two consequences of the path dependency, both benign:
+Two consequences of the dependencies, both benign:
 
-- On macOS, every consumer's `Package.resolved` gains an `opencv-spm` pin and their next
+- On macOS, every consumer's `Package.resolved` carries an `opencv-spm` pin and their next
   resolve fetches the OpenCV and ONNX Runtime artifacts, whether or not they link
   `FrigateVision`.
 - Frigate's own `Package.resolved` differs by host (macOS has `opencv-spm`; Linux does not).
@@ -265,6 +284,7 @@ Record the **tag**, not a branch — the absence of that record is what made the
 | `Sources/FrigateBridge/` | This package — concrete `Downloader` / `TokenizerLoader` for mlx-swift-lm 3.x |  |  |
 | `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
 | `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |
+| `Sources/VisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/VisionAX/README.md` |  |  |
 
 **mlx C++ is deliberately held at 0.31.1.** v0.32.2 exists, but every mlx-swift release through
 0.31.6 defines `MLX_VERSION` as `"0.31.1"` (see `Package.swift`), so bumping the C++ core would

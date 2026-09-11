@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # WHAT: Compile Frigate's vendored MLX Metal shaders and install them where MLX looks.
-# IN:   [debug|release] (default debug); --package DIR to target a consumer's .build.
-# OUT:  mlx.metallib next to every binary in that .build, test bundles included.
+# IN:   [debug|release] (default debug); --package DIR to target a consumer's .build;
+#       --app APP to also install into an assembled app bundle.
+# OUT:  mlx.metallib next to every binary in that .build, test bundles included — and in
+#       APP/Contents/MacOS when --app is given.
 # PIN:  `swift build` has NO Metal step — SwiftPM does not compile Sources/Cmlx's .metal
 #       files, so a clean checkout has no metallib and MLX dies on the first GPU op with
 #       "Failed to load the default metallib". Verified against a worktree at c06a125:
@@ -10,6 +12,7 @@
 #   ./scripts/build-metallib.sh                       # Frigate's own .build/debug
 #   ./scripts/build-metallib.sh release
 #   ./scripts/build-metallib.sh release --package ../Thread
+#   ./scripts/build-metallib.sh release --package ../Mary --app ../Mary/build/Mary.app
 #
 # WHERE MLX ACTUALLY LOOKS. Sources/Cmlx/mlx/mlx/backend/metal/device.cpp,
 # load_default_library(), probes five paths in order, all but the last relative to the
@@ -30,15 +33,22 @@
 # (.build/<arch>/<config>/<Name>.xctest/Contents/MacOS/), which is why MLX-touching tests
 # are gated behind FRIGATE_MLX_TESTS rather than run by default — so every executable and
 # every .xctest bundle in the build directory gets its own copy.
+#
+# AN APP BUNDLE GETS RUNG 1 ONLY. Its binary is Contents/MacOS/<name>, so rung 1 is
+# Contents/MacOS/mlx.metallib; the Resources/ rungs would mean a Resources directory INSIDE
+# Contents/MacOS, which is not where a bundle keeps resources and is one more thing codesign
+# has to seal. Run --app after the app is assembled and before it is signed.
 set -euo pipefail
 
 CONFIG="debug"
 PACKAGE_DIR=""
+APP_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         debug|release) CONFIG="$1"; shift ;;
         --package) PACKAGE_DIR="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        --app) APP_DIR="${2:-}"; shift 2 ;;
+        -h|--help) awk 'NR > 1 && /^set -euo pipefail/ { exit } NR > 1' "$0"; exit 0 ;;
         *) echo "build-metallib: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
@@ -71,6 +81,11 @@ if [ ! -d "$PACKAGE_DIR" ]; then
     exit 1
 fi
 PACKAGE_DIR="$(cd "$PACKAGE_DIR" && pwd)"
+
+if [ -n "$APP_DIR" ] && [ ! -d "$APP_DIR/Contents/MacOS" ]; then
+    echo "build-metallib: $APP_DIR has no Contents/MacOS — assemble the app first" >&2
+    exit 1
+fi
 
 # .build/<config> is a symlink to .build/<arch>-apple-macosx/<config>; resolve it so the
 # copies land on the real directory rather than duplicating through the link.
@@ -140,5 +155,10 @@ while IFS= read -r -d '' bundle; do
     macos_dir="$bundle/Contents/MacOS"
     [ -d "$macos_dir" ] && install_beside "$macos_dir"
 done < <(find "$BUILD_DIR" -maxdepth 1 -name '*.xctest' -print0 2>/dev/null)
+
+if [ -n "$APP_DIR" ]; then
+    cp -f "$METALLIB" "$APP_DIR/Contents/MacOS/mlx.metallib"
+    echo "build-metallib: installed into $APP_DIR/Contents/MacOS (rung 1)"
+fi
 
 echo "build-metallib: done"

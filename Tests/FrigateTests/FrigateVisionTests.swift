@@ -2,10 +2,12 @@
 //  FrigateVisionTests.swift
 //  FrigateTests
 //
-//  WHAT: The vision door opens, and it opens onto VisionAX's own types.
-//  PIN:  IMPORTS `FrigateVision` AND NOTHING ELSE, deliberately. That is the whole claim
-//        a re-export makes: a consumer names one module and gets the package behind it,
-//        resources included. A test that also imported VisionAX would prove nothing.
+//  WHAT: The FrigateVision product opens onto Frigate's VisionAX module, and the AX types
+//        of VisionAXCore arrive with it.
+//  PIN:  IMPORTS `VisionAX` AND NOTHING ELSE, deliberately. The product keeps the name
+//        FrigateVision; the module it vends is VisionAX, and that module re-exports
+//        VisionAXCore — so one import must reach the engine, the AX types and the model's
+//        resources. A test that also imported VisionAXCore would prove nothing.
 //        macOS ONLY, like the target it exercises.
 //
 
@@ -15,7 +17,7 @@ import CoreGraphics
 import CoreText
 import Foundation
 import Testing
-import FrigateVision
+import VisionAX
 
 @Suite("FrigateVision")
 struct FrigateVisionTests {
@@ -28,7 +30,7 @@ struct FrigateVisionTests {
     /// lines and icon-shaped boxes, and a borderless rectangle is none of those. Asking
     /// for `.text` too is what makes this a test of the whole door rather than of the
     /// detector alone.
-    @Test func theEngineIsReachableThroughTheReExport() throws {
+    @Test func theEngineIsReachableThroughTheModule() throws {
         let engine = try VisionEngine()
         let scene = try engine.perceive(
             image: Self.drawnPage(),
@@ -44,13 +46,19 @@ struct FrigateVisionTests {
         #expect(map.elements.contains { $0.label.lowercased().contains("accept") })
     }
 
-    /// The resource bundle resolves through the indirection.
+    /// The AX vocabulary lives in VisionAXCore and must still arrive through `VisionAX`.
+    @Test func theAXTypesArriveThroughTheReExport() {
+        #expect(AXNodeCategory.category(role: "AXButton") != .other)
+        #expect(RoleVocabulary.standard.roles.first == RoleVocabulary.noneRole)
+    }
+
+    /// The resource bundle resolves.
     ///
-    /// PIN: SwiftPM names a bundle `<defining package>_<target>`, and VisionAX's target
-    /// is still defined in the VisionAX package — so it stays `VisionAX_VisionAX.bundle`
-    /// no matter who depends on it. A consumer's copy step (Mary's `make-app.sh`) keeps
-    /// working, and this is the test that says so.
-    @Test func theModelBundleIsFoundThroughTheReExport() {
+    /// PIN: SwiftPM names a bundle `<defining package>_<target>`. The runtime target is
+    /// defined in Frigate now, so the bundle is `Frigate_VisionAX.bundle` — the name a
+    /// consumer's copy step (Mary's `make-app.sh`) must use, and the one
+    /// `RegionClassifier.hostBundleModels` looks for.
+    @Test func theModelBundleResolves() {
         // A model may legitimately be absent (git-lfs not pulled); the LOCATION must not.
         #expect(RegionClassifier.resourceBundleLocation() != nil)
         if let classifier = try? RegionClassifier.bundled() {
