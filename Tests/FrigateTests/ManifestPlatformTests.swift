@@ -90,7 +90,7 @@ struct ManifestPlatformTests {
         let guarded = Self.guardedLines(lines)
         let guardedCode = guarded.map { lines[$0] }.joined(separator: "\n")
         #expect(guardedCode.contains("VisionAX"), "the Linux guard names no macOS-only package")
-        #expect(guardedCode.contains("FrigateVision"))
+        #expect(guardedCode.contains("FrigateVisionAX"))
     }
 
     /// The umbrella never re-exports the vision module.

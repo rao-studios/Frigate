@@ -226,17 +226,19 @@ let noCudaCmlxExcludes = [
     ]
 #endif
 
-// ── VisionAX — the vision runtime, hosted here ──────────────────────────────
+// ── FrigateVisionAX — the vision runtime, hosted here ───────────────────────
 // WHAT: Frigate hosts every ML surface its consumers take; pixel perception is one of
 //       them, and its RUNTIME lives here: the C++ engine (CVisionAX — Canny regions, the
 //       ONNX role classifier, the media and icon glyph banks) and the Swift module
-//       `VisionAX` over it (perceive → scene → page map). The VisionAX REPOSITORY keeps
-//       what is not runtime: VisionAXCore — the AX/A11Y data structures and the dataset
-//       schema, which this module re-exports — and the training pipeline, harvester and
-//       bench that produce and tune the model shipped in Sources/VisionAX/Resources/Models.
-// NAME: The product is still `FrigateVision`; the module it vends is `VisionAX` — the
-//       FrigateHub → Hub pattern above. Consumers' manifests name the product and did not
-//       change; their sources say `import VisionAX`.
+//       `FrigateVisionAX` over it (perceive → scene → page map). The VisionAX REPOSITORY
+//       keeps what is not runtime: VisionAXCore — the AX/A11Y data structures and the
+//       dataset schema, which this module re-exports — and the training pipeline,
+//       harvester and bench that produce and tune the model shipped in
+//       Sources/FrigateVisionAX/Resources/Models.
+// NAME: Product and module are both `FrigateVisionAX`, so a consumer's manifest names
+//       exactly what its sources import. The prefix keeps the module apart from the
+//       VisionAX repository's package and from `enum VisionAX` inside it: a module and a
+//       type of one name break module-qualified lookup (`VisionAX.X` finds the enum).
 // MLX:  The classifier's backbone runs on MLX (Metal) when a metallib sits beside the binary
 //       and the model ships MLX weights converted from its own ONNX backbone; otherwise on
 //       ONNX Runtime's CPU path, and RegionClassifier.backboneDescription says why. So this
@@ -301,9 +303,10 @@ var visionTestDependencies: [Target.Dependency] = []
                 .linkedLibrary("c++"),
             ]
         ),
-        // VisionAX — the Swift face of the engine, and the module the product vends.
+        // FrigateVisionAX — the Swift face of the engine; the product vends this module
+        // under the same name.
         .target(
-            name: "VisionAX",
+            name: "FrigateVisionAX",
             dependencies: [
                 "CVisionAX",
                 .product(name: "VisionAXCore", package: "VisionAX"),
@@ -312,7 +315,7 @@ var visionTestDependencies: [Target.Dependency] = []
                 "MLX",
                 "MLXNN",
             ],
-            path: "Sources/VisionAX",
+            path: "Sources/FrigateVisionAX",
             exclude: ["README.md"],
             resources: [
                 // The trained classifier (git-lfs). Present or not, the directory ships
@@ -326,9 +329,9 @@ var visionTestDependencies: [Target.Dependency] = []
             ]
         ),
         .testTarget(
-            name: "VisionAXTests",
-            dependencies: ["VisionAX"],
-            path: "Tests/VisionAXTests",
+            name: "FrigateVisionAXTests",
+            dependencies: ["FrigateVisionAX"],
+            path: "Tests/FrigateVisionAXTests",
             resources: [
                 // Synthetic screens AND real captures — see MediaFixtureTests.
                 .copy("Fixtures")
@@ -337,15 +340,15 @@ var visionTestDependencies: [Target.Dependency] = []
         ),
     ]
     visionProducts = [
-        .library(name: "FrigateVision", targets: ["VisionAX"])
+        .library(name: "FrigateVisionAX", targets: ["FrigateVisionAX"])
     ]
-    visionTestDependencies = ["VisionAX"]
+    visionTestDependencies = ["FrigateVisionAX"]
 #endif
 
 // FLUX.2 / Obscur are image-generation code: ObscurDinov2 decodes a `CGImage` through
 // CGContext/CGColorSpace, and FluxKit + the flux2-cli harness follow it in. They are
 // Apple-only in practice (flux2-cli is even labelled a macOS verification harness) and no
-// consumer takes them, so they leave the Linux graph entirely — the FrigateVision treatment.
+// consumer takes them, so they leave the Linux graph entirely — the FrigateVisionAX treatment.
 var imageGenTargets: [Target] = []
 var imageGenProducts: [Product] = []
 #if !os(Linux)
@@ -472,9 +475,9 @@ let package = Package(
     name: "Frigate",
 
     platforms: [
-        // 15, not 14: FrigateVision depends on VisionAX, whose floor is 15, and a target
-        // cannot require less than the product it depends on. Every consumer is at or
-        // above 15 already.
+        // 15, not 14: FrigateVisionAX depends on VisionAXCore, whose floor is 15, and a
+        // target cannot require less than the product it depends on. Every consumer is at
+        // or above 15 already.
         .macOS("15.0"),
         .iOS(.v17),
         .tvOS(.v17),

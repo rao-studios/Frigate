@@ -13,22 +13,22 @@ All fork sources are vendored directly — no external URLs for patched librarie
 | `FrigateEmbedder` | `mlx-community/snowflake-arctic-embed-m-v1.5` | Returns `[[Float]]` |
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
 | `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
-| `FrigateVision` | bundled ONNX region classifier | Pixel perception — the `VisionAX` runtime, hosted here — **macOS only** |
+| `FrigateVisionAX` | bundled ONNX region classifier | Pixel perception — the VisionAX runtime, hosted here — **macOS only** |
 
 HuggingFace models are downloaded on first use and cached at `~/.cache/huggingface/`. `FrigateBoost` loads a model exported with `booster.save_model("model.json")` — no `libxgboost` required at runtime.
 
 ---
 
-## FrigateVision — pixel perception
+## FrigateVisionAX — pixel perception
 
-The `FrigateVision` product vends the **`VisionAX`** module — the vision runtime, hosted
-here: the OpenCV region detector (C++ `CVisionAX`), Apple's text recognition, the ONNX role
+The **`FrigateVisionAX`** product and module is the vision runtime, hosted here: the
+OpenCV region detector (C++ `CVisionAX`), Apple's text recognition, the ONNX role
 classifier and the page map. The module re-exports `VisionAXCore` from the
 [VisionAX](../VisionAX) repository — the AX/A11Y data structures, the dataset schema and
 the role vocabulary — so one import carries both.
 
 ```swift
-import VisionAX
+import FrigateVisionAX
 
 let engine = try VisionEngine()
 let scene = try engine.perceive(
@@ -40,16 +40,16 @@ let map = scene.pageMap()          // rows, what each affords, where its name ca
 ```
 
 The runtime's own documentation — how a region becomes a node, the classifier, the media
-lane, the page map, benchmarks — is [`Sources/VisionAX/README.md`](Sources/VisionAX/README.md).
+lane, the page map, benchmarks — is [`Sources/FrigateVisionAX/README.md`](Sources/FrigateVisionAX/README.md).
 The VisionAX repository keeps what is not runtime: VisionAXCore, the training pipeline that
-exports `Sources/VisionAX/Resources/Models`, the harvester that builds its data and the
+exports `Sources/FrigateVisionAX/Resources/Models`, the harvester that builds its data and the
 bench that tunes the detector.
 
 Things worth knowing:
 
-- **The product kept its name; the module is `VisionAX`.** The same pattern as
-  `FrigateHub` → `Hub`: a consumer's manifest names `FrigateVision`, its sources say
-  `import VisionAX`.
+- **The product and the module share one name.** A consumer's manifest names
+  `FrigateVisionAX` and its sources say `import FrigateVisionAX`. (Until 2026-09-10 the
+  product was `FrigateVision` and the module `VisionAX`.)
 - **macOS only.** OpenCV and ONNX Runtime arrive as xcframeworks, which Linux cannot
   resolve, so the dependencies, the targets and the product all live inside
   `#if !os(Linux)` in `Package.swift`. A Linux build of Frigate never learns they exist,
@@ -64,20 +64,20 @@ Things worth knowing:
   ~40% of a page read. It runs on Metal when `mlx.metallib` sits beside the binary and the
   model ships MLX weights converted from its own ONNX backbone; otherwise it stays on the
   CPU path and `RegionClassifier.backboneDescription` says why. `FRIGATE_VISION_BACKBONE=onnx`
-  forces the CPU path for an A/B. So taking `FrigateVision` links MLX's core — not the
+  forces the CPU path for an A/B. So taking `FrigateVisionAX` links MLX's core — not the
   transformer stack — and a binary that wants the GPU path needs the metallib:
   `scripts/build-metallib.sh <config> --package <consumer>` beside a SwiftPM-built binary,
   `--app <App.app>` inside an app bundle.
 - **The model and the real-capture fixtures are git-lfs** (see `.gitattributes`): run
   `git lfs pull` after a clone, or `RegionClassifier.bundled()` reports a pointer file.
-- **An app bundle copies `Frigate_VisionAX.bundle`** into `Contents/Resources` — SwiftPM
+- **An app bundle copies `Frigate_FrigateVisionAX.bundle`** into `Contents/Resources` — SwiftPM
   names resource bundles `<package>_<target>`.
 
 Two consequences of the dependencies, both benign:
 
 - On macOS, every consumer's `Package.resolved` carries an `opencv-spm` pin and their next
   resolve fetches the OpenCV and ONNX Runtime artifacts, whether or not they link
-  `FrigateVision`.
+  `FrigateVisionAX`.
 - Frigate's own `Package.resolved` differs by host (macOS has `opencv-spm`; Linux does not).
   A plain `swift build` on Linux drops the extra pin with a warning and rewrites the file —
   which is why the Linux scripts do not pass `--force-resolved-versions`.
@@ -284,7 +284,7 @@ Record the **tag**, not a branch — the absence of that record is what made the
 | `Sources/FrigateBridge/` | This package — concrete `Downloader` / `TokenizerLoader` for mlx-swift-lm 3.x |  |  |
 | `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
 | `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |
-| `Sources/VisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/VisionAX/README.md` |  |  |
+| `Sources/FrigateVisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/FrigateVisionAX/README.md` |  |  |
 
 **mlx C++ is deliberately held at 0.31.1.** v0.32.2 exists, but every mlx-swift release through
 0.31.6 defines `MLX_VERSION` as `"0.31.1"` (see `Package.swift`), so bumping the C++ core would
@@ -309,7 +309,7 @@ swift-transformers 1.3.x and mlx-swift-lm 3.x both use it for error text. Each a
 module carries an internal `LocalizedStringLinuxShim.swift` that returns the already-interpolated
 literal: `Hub`, `Tokenizers`, `Models`, `MLXLMCommon`, `MLXLLM`, `MLXVLM`.
 
-**Three targets leave the Linux graph entirely**, alongside `FrigateVision`: `ObscurKit`,
+**Three targets leave the Linux graph entirely**, alongside `FrigateVisionAX`: `ObscurKit`,
 `FluxKit` and `flux2-cli`. `ObscurDinov2` decodes a `CGImage` through CGContext/CGColorSpace and
 the other two follow it in; no consumer takes them. See `imageGenTargets` in `Package.swift`.
 

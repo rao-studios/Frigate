@@ -2,10 +2,9 @@
 //  FrigateVisionTests.swift
 //  FrigateTests
 //
-//  WHAT: The FrigateVision product opens onto Frigate's VisionAX module, and the AX types
-//        of VisionAXCore arrive with it.
-//  PIN:  IMPORTS `VisionAX` AND NOTHING ELSE, deliberately. The product keeps the name
-//        FrigateVision; the module it vends is VisionAX, and that module re-exports
+//  WHAT: The FrigateVisionAX product opens onto the module of the same name, and the AX
+//        types of VisionAXCore arrive with it.
+//  PIN:  IMPORTS `FrigateVisionAX` AND NOTHING ELSE, deliberately. That module re-exports
 //        VisionAXCore — so one import must reach the engine, the AX types and the model's
 //        resources. A test that also imported VisionAXCore would prove nothing.
 //        macOS ONLY, like the target it exercises.
@@ -17,9 +16,9 @@ import CoreGraphics
 import CoreText
 import Foundation
 import Testing
-import VisionAX
+import FrigateVisionAX
 
-@Suite("FrigateVision")
+@Suite("FrigateVisionAX")
 struct FrigateVisionTests {
 
     /// The engine builds and perceives — the C++ core, OpenCV, Apple's Vision framework
@@ -55,7 +54,7 @@ struct FrigateVisionTests {
     /// The resource bundle resolves.
     ///
     /// PIN: SwiftPM names a bundle `<defining package>_<target>`. The runtime target is
-    /// defined in Frigate now, so the bundle is `Frigate_VisionAX.bundle` — the name a
+    /// defined in Frigate now, so the bundle is `Frigate_FrigateVisionAX.bundle` — the name a
     /// consumer's copy step (Mary's `make-app.sh`) must use, and the one
     /// `RegionClassifier.hostBundleModels` looks for.
     @Test func theModelBundleResolves() {
