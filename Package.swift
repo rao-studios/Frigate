@@ -265,7 +265,9 @@ var visionTestDependencies: [Target.Dependency] = []
 #if !os(Linux)
     visionDependencies = [
         // VisionAXCore: the AX data structures, the dataset schema, the role vocabulary.
-        .package(path: "../VisionAX"),
+        // A URL, not a path: a local dependency here makes this whole package
+        // unusable as a revision-based dependency for anything downstream.
+        .package(url: "https://github.com/rao-studios/VisionAX.git", branch: "main"),
         // Static opencv2.xcframework built from the upstream 4.13.0 tag by
         // platforms/apple/build_xcframework.py (macOS x86_64 + arm64).
         .package(url: "https://github.com/yeatse/opencv-spm.git", exact: "4.13.0"),

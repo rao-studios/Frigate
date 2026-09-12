@@ -1,5 +1,5 @@
 {
-  "originHash" : "0425b3df7b855b9a2db09c17ead15b8af2facdb8feb1fb3ffb82b49eba6a860d",
+  "originHash" : "cd955310e39170bb05bcfbc3546a86d723e698f018d374c68356328244955136",
   "pins" : [
     {
       "identity" : "opencv-spm",
@@ -53,6 +53,15 @@
       "state" : {
         "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
         "version" : "1.1.1"
+      }
+    },
+    {
+      "identity" : "visionax",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/rao-studios/VisionAX.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "a5655415206d16eb45f380f428338b8abb4d3107"
       }
     },
     {
