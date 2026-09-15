@@ -58,7 +58,7 @@ struct Flux2CLI: AsyncParsableCommand {
     var trainSteps: Int = 400
 
     @Option(name: .long, help: "DINOv2 weights (dinov2_small.safetensors).")
-    var dinoWeights: String = "/Users/ritesh/Documents/projects/seer/Ra/applications/CLR/Sources/CLRCore/Resources/dinov2_small.safetensors"
+    var dinoWeights: String = "/Users/ritesh/Documents/repositories/Garde/Sources/CLRCore/Resources/dinov2_small.safetensors"
 
     @Flag(name: .long, help: "Production P1: train the projection on a real-image dataset (atlas layout).")
     var trainCampaign = false
@@ -104,9 +104,9 @@ struct Flux2CLI: AsyncParsableCommand {
     }()
 
     /// MLX resolves its Metal kernels from `<binary dir>/mlx.metallib` first. Frigate
-    /// ships no metallib (CLR's resource bundle carries it), so `swift build` output
+    /// ships no metallib (Garde's CLRCore resource bundle carries it), so `swift build` output
     /// lacks one and any clean wipes a hand-copied file. Self-heal at launch: copy from
-    /// `FLUX2_METALLIB` (env) or CLR's known resource path when missing.
+    /// `FLUX2_METALLIB` (env) or the Garde checkout's CLRCore resource path when missing.
     static func ensureMetallib() {
         let binaryDir = URL(fileURLWithPath: CommandLine.arguments[0])
             .resolvingSymlinksInPath().deletingLastPathComponent()
@@ -115,7 +115,7 @@ struct Flux2CLI: AsyncParsableCommand {
 
         let candidates = [
             ProcessInfo.processInfo.environment["FLUX2_METALLIB"],
-            "/Users/ritesh/Documents/projects/seer/Ra/applications/CLR/Sources/CLRCore/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+            "/Users/ritesh/Documents/repositories/Garde/Sources/CLRCore/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
         ].compactMap { $0 }
 
         for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
