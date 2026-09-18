@@ -326,7 +326,22 @@ public final class LanguageModelConfigurationFromHub: Sendable {
         // Fallback tokenizer configuration files are located in the `Sources/Hub/Resources` directory
         // On Linux, Bundle.module may not be available if resources aren't properly bundled
         #if canImport(Darwin)
-        guard let url = Bundle.module.url(forResource: fallbackTokenizerConfigBaseName, withExtension: "json") else {
+        // Never `Bundle.module` here: its generated accessor traps unless the
+        // bundle sits beside the executable or at the absolute .build path of
+        // the Mac that built it. A server shipped inside an app (Ambient's
+        // Contents/Helpers) has neither, and a missing fallback is only a nil.
+        let fileName = "\(fallbackTokenizerConfigBaseName).json"
+        let roots = [
+            Bundle.main.executableURL?.deletingLastPathComponent(),
+            Bundle.main.resourceURL,
+        ].compactMap { $0 }
+        let possiblePaths = roots.flatMap { root in
+            [
+                root.appendingPathComponent("Frigate_Hub.bundle/\(fileName)"),
+                root.appendingPathComponent("Frigate_Hub.bundle/Contents/Resources/\(fileName)"),
+            ]
+        }
+        guard let url = possiblePaths.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
             return nil
         }
         #else

@@ -14,9 +14,20 @@ import MLXLMCommon
 public struct HubDownloader: Downloader {
     let hub: HubApi
 
-    public init(hub: HubApi = .shared) {
+    public init(hub: HubApi = HubDownloader.defaultHub) {
         self.hub = hub
     }
+
+    /// `HubApi.shared` puts snapshots in ~/Documents/huggingface. When the
+    /// launcher names a home for models (`HF_HOME` — Ambient sets it beside its
+    /// data, out of Documents), snapshots go under `$HF_HOME/snapshots`; the
+    /// Hub's cache already follows `HF_HOME` on its own.
+    public static let defaultHub: HubApi = {
+        guard let home = ProcessInfo.processInfo.environment["HF_HOME"], !home.isEmpty else {
+            return .shared
+        }
+        return HubApi(downloadBase: URL(fileURLWithPath: home).appendingPathComponent("snapshots"))
+    }()
 
     public func download(
         id: String,
