@@ -744,7 +744,7 @@ let package = Package(
         // ── Tests ─────────────────────────────────────────────────────────────
         .testTarget(
             name: "FrigateTests",
-            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon"]
+            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon", "FrigateBridge", "Hub"]
                 + visionTestDependencies
         ),
     ] + visionTargets + imageGenTargets,
