@@ -10,7 +10,7 @@ All fork sources are vendored directly — no external URLs for patched librarie
 
 | API | Default model | Notes |
 |---|---|---|
-| `FrigateEmbedder` | `mlx-community/snowflake-arctic-embed-m-v1.5` | Returns `[[Float]]` |
+| `FrigateEmbedder` | `rao-studios/voyage-4-nano-mlx-8bit` (voyage-4-nano, 1024 dims) | Returns `[[Float]]`; query/document roles |
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
 | `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
 | `FrigateVisionAX` | bundled ONNX region classifier | Pixel perception — the VisionAX runtime, hosted here — **macOS only** |
@@ -137,8 +137,10 @@ The script is idempotent — safe to re-run if any step failed.
 ### Step 3 — Download a model
 
 ```bash
-# Embedding model (~450 MB)
-hf download mlx-community/snowflake-arctic-embed-m-v1.5
+# Embedding model (~370 MB). FrigateEmbedder downloads it on first use into
+# $HF_HOME/snapshots (or ~/Documents/huggingface without HF_HOME).
+HF_HOME=~/.rao/models/huggingface hf download rao-studios/voyage-4-nano-mlx-8bit \
+    --local-dir ~/.rao/models/huggingface/snapshots/models/rao-studios/voyage-4-nano-mlx-8bit
 
 # LLM (~400 MB)
 hf download mlx-community/Qwen3-0.6B-4bit
@@ -166,12 +168,13 @@ let probs: [Float] = await boost.predict(features: [
 ])
 print(probs) // e.g. [0.731]
 
-// Embeddings
+// Embeddings — voyage-4-nano is asymmetric: say whether a text is a query or a document
 let embedder = FrigateEmbedder()
-let vectors: [[Float]] = try await embedder.embed([
+let passages: [[Float]] = try await embedder.embed([
     "hello world",
     "machine learning on GPU",
-])
+], role: .document)
+let query = try await embedder.embed(["what runs models on the GPU?"], role: .query)
 
 // LLM
 let llm = FrigateLLM()
@@ -229,11 +232,27 @@ both. Consumers should call it rather than keeping their own copy — `Bonnie`, 
 
 ```swift
 public actor FrigateEmbedder {
-    public init(modelId: String = "mlx-community/snowflake-arctic-embed-m-v1.5")
-    public func embed(_ texts: [String]) async throws -> [[Float]]
-    public func warmup() async throws
+    public init(profile: Profile = .voyage4Nano)
+    public init(modelId: String)            // "org/repo", "org/repo@<sha>", or a directory
+    public nonisolated var status: Status   // idle · downloading(fraction) · loading · ready · failed
+    public func embed(_ texts: [String], role: Role = .document) async throws -> [[Float]]
+    public func embedWithUsage(_ texts: [String], role: Role = .document) async throws -> (embeddings: [[Float]], promptTokens: Int)
+    public func warmup() async throws       // download, load, one short pass
 }
 ```
+
+A `Profile` names the model (a Hub repo pinned to a commit, or a directory), the prompt per
+role, the Matryoshka width, the token budget and the vector space it writes (`voyage-4@1024`),
+which hosts stamp beside an index. `Profile.resolve` maps a repo id to its known profile; an
+unknown repo takes its prompts from the snapshot's `config_sentence_transformers.json`.
+
+Snapshots load through `HubDownloader` from one local folder: a pinned commit must match the
+copy on disk, `HF_HOME` is honoured, and with it set `~/Documents` is not searched. Texts over
+the budget are cut inside the tokenizer's special-token frame, so a trailing token a model
+pools on (Qwen3-Embedding's `<|endoftext|>`) survives truncation. Non-finite output is an error.
+
+`scripts/embedders/` holds the conversion that builds the voyage-4-nano snapshot and the
+parity and speed checks it has to pass.
 
 ### FrigateLLM
 
@@ -280,7 +299,7 @@ Record the **tag**, not a branch — the absence of that record is what made the
 | `Sources/HuggingFace/` | `huggingface/swift-huggingface` | **0.10.1** | none (Xet trait off) |
 | `Sources/EventSource/` | `mattt/EventSource` | **1.5.1** | `EventSource+AsyncHTTPClient.swift` dropped (AsyncHTTPClient trait off — keeps SwiftNIO out) |
 | `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `ml-explore/mlx-swift-lm` | **3.31.4** | `LinuxCompat.swift` added; Linux `canImport` guards on `UserInput` (incl. `AudioProcessing.audioFormat`), `UserInput+Audio`, `ChatSession`, `ParoQuant/ParoQuantLoader`; `MLXEmbedders/Models/Bert.swift` sanitize chain made table-driven |
-| `Sources/mlx_embeddings/` | `mzbac/mlx.embeddings` | v0.1.3 | `Bert.swift` |
+| `Sources/mlx_embeddings/` | `mzbac/mlx.embeddings` | v0.1.3 | `Bert.swift`; `Qwen3.swift` adds `Qwen3BidirectionalModel` (voyage-4-nano: padding-only mask, `linear` head, mean pooling), chosen in the `qwen3` creator by `use_bidirectional_attention` |
 | `Sources/FrigateBridge/` | This package — concrete `Downloader` / `TokenizerLoader` for mlx-swift-lm 3.x |  |  |
 | `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
 | `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |

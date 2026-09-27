@@ -13,9 +13,12 @@ import MLXLMCommon
 /// Downloads model snapshots through `HubApi`.
 public struct HubDownloader: Downloader {
     let hub: HubApi
+    /// Where a complete copy is looked for before fetching; `nil` means `snapshotRoots()`.
+    let lookupRoots: [URL]?
 
-    public init(hub: HubApi = HubDownloader.defaultHub) {
+    public init(hub: HubApi = HubDownloader.defaultHub, lookupRoots: [URL]? = nil) {
         self.hub = hub
+        self.lookupRoots = lookupRoots
     }
 
     /// `HubApi.shared` puts snapshots in ~/Documents/huggingface. When the
@@ -42,8 +45,8 @@ public struct HubDownloader: Downloader {
     ) async throws -> URL {
         // `snapshot` revalidates every file against the Hub, so unless the caller asks for the
         // latest, a complete copy already on disk is returned without touching the network.
-        // The on-disk layout records no revision, so a pinned `revision` is not checked here.
-        if !useLatest, let local = localSnapshot(id: id, matching: patterns) {
+        // A revision pinned to a commit must match the commit the copy was fetched at.
+        if !useLatest, let local = localSnapshot(id: id, revision: revision, matching: patterns) {
             let done = Progress(totalUnitCount: 1)
             done.completedUnitCount = 1
             progressHandler(done)
@@ -58,10 +61,11 @@ public struct HubDownloader: Downloader {
 
     /// This hub's own snapshot directory — where `snapshot` would write, and for `defaultHub`
     /// the first of `snapshotRoots()` — then each of `snapshotRoots()` in order.
-    private func localSnapshot(id: String, matching patterns: [String]) -> URL? {
+    private func localSnapshot(id: String, revision: String?, matching patterns: [String]) -> URL? {
         let own = hub.localRepoLocation(HubApi.Repo(id: id))
-        if Self.isMaterialized(own, matching: patterns) { return own }
-        return Self.materializedSnapshot(id: id, matching: patterns)
+        if Self.isMaterialized(own, matching: patterns), Self.matches(own, revision: revision) { return own }
+        return Self.materializedSnapshot(
+            id: id, revision: revision, matching: patterns, roots: lookupRoots ?? Self.snapshotRoots())
     }
 }
 
@@ -72,16 +76,22 @@ extension HubDownloader {
     /// `$HF_HOME/snapshots` (where `defaultHub` downloads), `$HF_HOME`, then `documents`
     /// (`HubApi.shared`'s layout, ~/Documents/huggingface). Without `HF_HOME`, only
     /// `documents`. A root repeating an earlier one (by standardized path) is dropped.
+    /// `includeDocuments: false` leaves out ~/Documents whenever `HF_HOME` names another
+    /// home: a server a GUI app launched should not touch Documents (a privacy prompt,
+    /// attributed to the app) for a copy it can fetch into its own home instead.
     public static func snapshotRoots(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        documents: URL = HubDownloader.sharedDownloadBase
+        documents: URL = HubDownloader.sharedDownloadBase,
+        includeDocuments: Bool = true
     ) -> [URL] {
         var roots: [URL] = []
+        var hasHome = false
         if let home = environment["HF_HOME"], !home.isEmpty {
             let base = URL(fileURLWithPath: home)
             roots += [base.appending(path: "snapshots"), base]
+            hasHome = true
         }
-        roots.append(documents)
+        if includeDocuments || !hasHome { roots.append(documents) }
         var seen: Set<String> = []
         return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
@@ -96,14 +106,41 @@ extension HubDownloader {
     /// each load.
     public static func materializedSnapshot(
         id: String,
+        revision: String? = nil,
         matching patterns: [String],
         roots: [URL] = HubDownloader.snapshotRoots()
     ) -> URL? {
         for root in roots {
             let candidate = root.appending(path: "models").appending(path: id)
-            if isMaterialized(candidate, matching: patterns) { return candidate }
+            if isMaterialized(candidate, matching: patterns), matches(candidate, revision: revision) {
+                return candidate
+            }
         }
         return nil
+    }
+
+    /// The commit a snapshot's `config.json` was fetched at — the first line of the
+    /// metadata `HubApi` writes beside each file — or `nil` for a copy made another way.
+    public static func snapshotCommit(_ directory: URL) -> String? {
+        let metadata = directory.appending(path: ".cache/huggingface/download/config.json.metadata")
+        guard let contents = try? String(contentsOf: metadata, encoding: .utf8),
+            let first = contents.split(whereSeparator: \.isNewline).first
+        else { return nil }
+        let commit = first.trimmingCharacters(in: .whitespaces)
+        return commit.isEmpty ? nil : commit
+    }
+
+    /// Whether `revision` names a commit: 40 hex digits. A branch or tag is not checked
+    /// against a local copy — only the Hub knows where it points now.
+    public static func isCommit(_ revision: String?) -> Bool {
+        guard let revision, revision.count == 40 else { return false }
+        return revision.allSatisfy(\.isHexDigit)
+    }
+
+    /// A copy satisfies a pinned commit only when it was fetched at that commit.
+    static func matches(_ directory: URL, revision: String?) -> Bool {
+        guard isCommit(revision), let revision else { return true }
+        return snapshotCommit(directory)?.lowercased() == revision.lowercased()
     }
 
     /// `HubApi.shared`'s download base, ~/Documents/huggingface. `HubApi` keeps

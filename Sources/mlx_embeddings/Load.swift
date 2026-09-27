@@ -57,6 +57,11 @@ public func load(
 }
 
 func loadSynchronous(modelDirectory: URL) throws -> EmbeddingModel {
+    // A snapshot folder that is itself a symlink (a copy kept elsewhere, linked into the
+    // Hub layout) enumerates as empty — FileManager does not descend into it — and every
+    // weight would be "missing". Walk the real folder.
+    let modelDirectory = modelDirectory.resolvingSymlinksInPath()
+
     // create the model (no weights loaded)
     let configurationURL = modelDirectory.appending(component: "config.json")
     let baseConfig = try JSONDecoder().decode(

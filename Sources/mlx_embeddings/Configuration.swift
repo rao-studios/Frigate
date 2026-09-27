@@ -137,6 +137,15 @@ private class ModelTypeRegistry: @unchecked Sendable {
             url in
             let configuration = try JSONDecoder().decode(
                 Qwen3Configuration.self, from: Data(contentsOf: url))
+            // Bidirectional embedders (voyage-4-nano) share `model_type: qwen3`; the
+            // config flag tells them apart, so no second registration shadows this one.
+            if configuration.useBidirectionalAttention {
+                guard let labels = configuration.numLabels, labels > 0 else {
+                    throw EmbedderError(
+                        message: "use_bidirectional_attention without num_labels or id2label")
+                }
+                return Qwen3BidirectionalModel(configuration)
+            }
             let model = Qwen3Model(configuration)
             return model
         },

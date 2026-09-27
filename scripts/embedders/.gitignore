@@ -1,0 +1,5 @@
+data/
+build/
+embedprobe/.build/
+__pycache__/
+.venv/

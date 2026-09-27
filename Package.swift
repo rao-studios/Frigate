@@ -734,7 +734,7 @@ let package = Package(
             dependencies: [
                 "MLX", "MLXNN", "Tokenizers",
                 "MLXLMCommon", "MLXLLM", "mlx_embeddings",
-                "MLXAccelerate", "FrigateBridge",
+                "MLXAccelerate", "FrigateBridge", "Hub",
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
@@ -744,7 +744,7 @@ let package = Package(
         // ── Tests ─────────────────────────────────────────────────────────────
         .testTarget(
             name: "FrigateTests",
-            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon", "FrigateBridge", "Hub"]
+            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon", "FrigateBridge", "Hub", "mlx_embeddings"]
                 + visionTestDependencies
         ),
     ] + visionTargets + imageGenTargets,

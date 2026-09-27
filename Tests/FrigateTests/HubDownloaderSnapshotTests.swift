@@ -301,6 +301,60 @@ struct HubDownloaderSnapshotTests {
         #expect(Self.found(in: scratch) == nil)
     }
 
+    // MARK: - Pinned revisions
+
+    static let pinned = String(repeating: "0123456789", count: 4)
+
+    /// The metadata `HubApi` writes beside each file it fetched: commit, etag, time.
+    static func stamp(_ repo: URL, commit: String) throws {
+        let metadata = repo.appending(path: ".cache/huggingface/download")
+        try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: true)
+        try write("\(commit)\n\"etag\"\n1700000000\n", to: metadata.appending(path: "config.json.metadata"))
+    }
+
+    @Test func onlyFortyHexDigitsAreACommit() {
+        #expect(HubDownloader.isCommit(Self.pinned))
+        #expect(HubDownloader.isCommit(Self.pinned.uppercased()))
+        #expect(!HubDownloader.isCommit("main"))
+        #expect(!HubDownloader.isCommit(nil))
+        #expect(!HubDownloader.isCommit(String(Self.pinned.dropLast())))
+    }
+
+    @Test func theCommitIsTheMetadatasFirstLine() throws {
+        let scratch = try Self.scratch()
+        defer { Self.remove(scratch) }
+        let repo = try Self.makeRepo(under: scratch, weights: .single)
+        #expect(HubDownloader.snapshotCommit(repo) == nil)
+        try Self.stamp(repo, commit: Self.pinned)
+        #expect(HubDownloader.snapshotCommit(repo) == Self.pinned)
+    }
+
+    @Test func aPinnedCommitNeedsACopyFetchedAtIt() throws {
+        let scratch = try Self.scratch()
+        defer { Self.remove(scratch) }
+        let repo = try Self.makeRepo(under: scratch, weights: .single)
+        let lookup = { (revision: String?) in
+            HubDownloader.materializedSnapshot(
+                id: Self.repoID, revision: revision, matching: Self.modelPatterns, roots: [scratch])?.path
+        }
+        #expect(lookup(Self.pinned) == nil, "a copy made another way cannot vouch for a commit")
+        try Self.stamp(repo, commit: String(repeating: "f", count: 40))
+        #expect(lookup(Self.pinned) == nil, "fetched at another commit")
+        try Self.stamp(repo, commit: Self.pinned)
+        #expect(lookup(Self.pinned) == repo.path)
+        #expect(lookup("main") == repo.path, "a branch is not checked against a local copy")
+        #expect(lookup(nil) == repo.path)
+    }
+
+    @Test func rootsCanLeaveDocumentsOutWhenHFHomeIsSet() {
+        let documents = URL(fileURLWithPath: "/docs/huggingface")
+        let without = HubDownloader.snapshotRoots(
+            environment: ["HF_HOME": "/hf"], documents: documents, includeDocuments: false)
+        #expect(without.map(\.path) == ["/hf/snapshots", "/hf"])
+        let noHome = HubDownloader.snapshotRoots(environment: [:], documents: documents, includeDocuments: false)
+        #expect(noHome.map(\.path) == [documents.path], "with no other home, Documents is the home")
+    }
+
     // MARK: - download
 
     /// A hub whose snapshots live under `root`, offline so nothing here can reach the Hub:
@@ -340,6 +394,25 @@ struct HubDownloaderSnapshotTests {
                 id: id, revision: nil, matching: Self.modelPatterns, useLatest: false,
                 progressHandler: { _ in })
         }
+    }
+
+    @Test func downloadFetchesWhenTheCopyIsAtAnotherCommit() async throws {
+        let scratch = try Self.scratch()
+        defer { Self.remove(scratch) }
+        let id = Self.uniqueID()
+        let repo = try Self.makeRepo(under: scratch, id: id)
+        try Self.stamp(repo, commit: String(repeating: "f", count: 40))
+
+        await #expect(throws: HubApi.EnvironmentError.self) {
+            try await Self.offlineDownloader(root: scratch).download(
+                id: id, revision: Self.pinned, matching: Self.modelPatterns, useLatest: false,
+                progressHandler: { _ in })
+        }
+        try Self.stamp(repo, commit: Self.pinned)
+        let url = try await Self.offlineDownloader(root: scratch).download(
+            id: id, revision: Self.pinned, matching: Self.modelPatterns, useLatest: false,
+            progressHandler: { _ in })
+        #expect(url.path == repo.path)
     }
 
     @Test func useLatestSkipsTheLookup() async throws {

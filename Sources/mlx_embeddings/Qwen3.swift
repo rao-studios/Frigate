@@ -161,6 +161,17 @@ private class Qwen3ModelInner: Module {
 
     return norm(h)
   }
+
+  /// Bidirectional pass: every token sees every real token; only padding is hidden.
+  /// `keyMask` is bool `[B, 1, 1, L]` over keys. No cache, positions 0..<L — right
+  /// padding leaves the real tokens' positions where the checkpoint trained them.
+  public func callAsFunction(_ inputs: MLXArray, keyMask: MLXArray) -> MLXArray {
+    var h = embedTokens(inputs)
+    for layer in layers {
+      h = layer(h, mask: keyMask, cache: nil)
+    }
+    return norm(h)
+  }
 }
 
 public class Qwen3Model: Module, EmbeddingModel {
@@ -215,6 +226,57 @@ public class Qwen3Model: Module, EmbeddingModel {
   }
 }
 
+/// A Qwen3 encoder trained as a bidirectional embedder with a projection head —
+/// `voyageai/voyage-4-nano` and its conversions (`use_bidirectional_attention: true`).
+///
+/// The upstream PyTorch module is `Qwen3BidirectionalModel`: the Qwen3 stack with every
+/// layer non-causal, then `linear` (hidden → `num_labels`, no bias) on each token, then
+/// sentence-transformers mean pooling over the attention mask — prompt tokens included —
+/// and L2 normalisation. Matryoshka truncation, when a caller wants fewer dimensions,
+/// happens after this, in `FrigateEmbedder`.
+public class Qwen3BidirectionalModel: Module, EmbeddingModel {
+  public let vocabularySize: Int
+
+  @ModuleInfo(key: "model") private var model: Qwen3ModelInner
+  @ModuleInfo(key: "linear") var linear: Linear
+  let configuration: Qwen3Configuration
+
+  public init(_ args: Qwen3Configuration) {
+    precondition((args.numLabels ?? 0) > 0, "a bidirectional Qwen3 embedder needs num_labels")
+    self.configuration = args
+    self.vocabularySize = args.vocabularySize
+    self._model.wrappedValue = Qwen3ModelInner(args)
+    self._linear.wrappedValue = Linear(args.hiddenSize, args.numLabels ?? 0, bias: false)
+  }
+
+  public func callAsFunction(
+    _ inputIds: MLXArray, positionIds: MLXArray? = nil, tokenTypeIds: MLXArray? = nil,
+    attentionMask: MLXArray? = nil
+  )
+    -> EmbeddingModelOutput
+  {
+    let mask = (attentionMask ?? MLXArray.ones(like: inputIds)).asType(.bool)
+    let hidden = model(inputIds, keyMask: mask.expandedDimensions(axes: [1, 2]))
+    let projected = linear(hidden)
+    let pooled = normalizeEmbeddings(
+      meanPooling(lastHiddenState: projected, attentionMask: mask))
+    return EmbeddingModelOutput(hiddenStates: projected, poolerOutput: nil, textEmbeds: pooled)
+  }
+
+  /// The checkpoint keeps the head at the top level (`linear.weight`) beside `model.*`.
+  /// Anything half-precision is carried as bfloat16: this model overflows float16 on
+  /// real text (NaN rows), and the compute dtype is whatever the weights are.
+  public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    var sanitized = [String: MLXArray]()
+    for (key, value) in weights {
+      if key.contains("self_attn.rotary_emb.inv_freq") || key.contains("lm_head") { continue }
+      let newKey = key.hasPrefix("model.") || key.hasPrefix("linear.") ? key : "model." + key
+      sanitized[newKey] = value.dtype == .float16 ? value.asType(.bfloat16) : value
+    }
+    return sanitized
+  }
+}
+
 public struct Qwen3Configuration: Codable, Sendable {
   var hiddenSize: Int
   var hiddenLayers: Int
@@ -228,6 +290,10 @@ public struct Qwen3Configuration: Codable, Sendable {
   var ropeScaling: [String: StringOrNumber]? = nil
   var tieWordEmbeddings = false
   var maxPositionEmbeddings: Int = 32768
+  /// Set by bidirectional embedders (voyage-4-nano): no causal mask, a projection head.
+  var useBidirectionalAttention = false
+  /// The projection head's width: `num_labels`, else the size of `id2label`.
+  var numLabels: Int? = nil
 
   enum CodingKeys: String, CodingKey {
     case hiddenSize = "hidden_size"
@@ -242,6 +308,9 @@ public struct Qwen3Configuration: Codable, Sendable {
     case ropeScaling = "rope_scaling"
     case tieWordEmbeddings = "tie_word_embeddings"
     case maxPositionEmbeddings = "max_position_embeddings"
+    case useBidirectionalAttention = "use_bidirectional_attention"
+    case numLabels = "num_labels"
+    case id2label = "id2label"
   }
 
   public init(from decoder: Decoder) throws {
@@ -275,5 +344,30 @@ public struct Qwen3Configuration: Codable, Sendable {
       try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
     self.maxPositionEmbeddings =
       try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
+    self.useBidirectionalAttention =
+      try container.decodeIfPresent(Bool.self, forKey: .useBidirectionalAttention) ?? false
+    if let labels = try container.decodeIfPresent(Int.self, forKey: .numLabels) {
+      self.numLabels = labels
+    } else if let map = try container.decodeIfPresent([String: String].self, forKey: .id2label) {
+      self.numLabels = map.count
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(hiddenSize, forKey: .hiddenSize)
+    try container.encode(hiddenLayers, forKey: .hiddenLayers)
+    try container.encode(intermediateSize, forKey: .intermediateSize)
+    try container.encode(attentionHeads, forKey: .attentionHeads)
+    try container.encode(rmsNormEps, forKey: .rmsNormEps)
+    try container.encode(vocabularySize, forKey: .vocabularySize)
+    try container.encode(kvHeads, forKey: .kvHeads)
+    try container.encode(ropeTheta, forKey: .ropeTheta)
+    try container.encode(headDim, forKey: .headDim)
+    try container.encodeIfPresent(ropeScaling, forKey: .ropeScaling)
+    try container.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+    try container.encode(maxPositionEmbeddings, forKey: .maxPositionEmbeddings)
+    try container.encode(useBidirectionalAttention, forKey: .useBidirectionalAttention)
+    try container.encodeIfPresent(numLabels, forKey: .numLabels)
   }
 }
