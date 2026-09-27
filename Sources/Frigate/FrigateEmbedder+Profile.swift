@@ -90,7 +90,7 @@ extension FrigateEmbedder.Profile {
     public static let voyage4NanoRepo = "rao-studios/voyage-4-nano-mlx-8bit"
     /// The published commit. Bumping it is how a new conversion ships; the vector
     /// space stays `voyage-4@1024` as long as the weights are the same model.
-    public static let voyage4NanoRevision: String? = nil
+    public static let voyage4NanoRevision: String? = "5b5f4aff4bd03236bb957dc3b9400fa0eedc8f4c"
 
     /// voyage-4-nano, cut to 1024 dimensions (Matryoshka). Its space is shared with
     /// Voyage's hosted voyage-4 models.

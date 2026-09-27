@@ -939,9 +939,20 @@ public extension HubApi {
         }
 
         let filenames = try await getFilenames(from: repo, revision: revision, matching: globs)
-        let progress = Progress(totalUnitCount: Int64(filenames.count))
+        // Each file's share of the bar is its size: counted per file, ten small JSON
+        // files read as 90% before the weights — nearly all the bytes — have started.
+        // One HEAD per file; a size that can't be read counts as one byte.
+        var resolveBase = hostURL
+        if repo.type != .models { resolveBase = resolveBase.appending(path: repo.type.rawValue) }
+        resolveBase = resolveBase.appending(path: repo.id).appending(path: "resolve").appending(component: revision)
+        var weights: [Int64] = []
         for filename in filenames {
-            let fileProgress = Progress(totalUnitCount: 100, parent: progress, pendingUnitCount: 1)
+            let size = (try? await getFileMetadata(url: resolveBase.appending(path: filename)))?.size
+            weights.append(Int64(max(size ?? 1, 1)))
+        }
+        let progress = Progress(totalUnitCount: max(weights.reduce(0, +), 1))
+        for (filename, weight) in zip(filenames, weights) {
+            let fileProgress = Progress(totalUnitCount: 100, parent: progress, pendingUnitCount: weight)
             let downloader = HubFileDownloader(
                 hub: self,
                 repo: repo,
