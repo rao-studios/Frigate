@@ -954,8 +954,12 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         var image = MediaProcessing.inSRGBToneCurveSpace(image)
         image = MediaProcessing.apply(image, processing: processing)
 
-        let maxVisionEdge = patchSize * 24  // Pixtral vision expects 24x24 patches (336px for patchSize=14)
-        let targetEdge = min(longestEdge ?? maxVisionEdge, maxVisionEdge)
+        // Pixtral's encoder takes any size up to its `image_size` (its 2D RoPE covers that many
+        // patches per side), and the processor config says how large to show the image: 1540 px
+        // for Ministral 3. Capping every image at 24 patches (336 px) threw away the detail these
+        // models read text and people from. As in Pixtral's own processor; 336 px only when the
+        // config names no edge.
+        let targetEdge = longestEdge ?? patchSize * 24
 
         let originalSize = image.extent.size
         let scale = min(CGFloat(targetEdge) / max(originalSize.width, originalSize.height), 1.0)
