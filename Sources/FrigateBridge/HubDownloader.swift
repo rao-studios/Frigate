@@ -8,6 +8,7 @@
 
 import Foundation
 import Hub
+import HuggingFace
 import MLXLMCommon
 
 /// Downloads model snapshots through `HubApi`.
@@ -21,20 +22,44 @@ public struct HubDownloader: Downloader {
         self.lookupRoots = lookupRoots
     }
 
-    /// `HubApi.shared` puts snapshots in ~/Documents/huggingface. When the
-    /// launcher names a home for models (`HF_HOME` — Ambient sets it beside its
-    /// data, out of Documents), snapshots go under `$HF_HOME/snapshots`; the
-    /// Hub's cache already follows `HF_HOME` on its own.
+    /// Models kept in a folder the caller names — an app's own models home (Rao's apps pass
+    /// `~/.rao/models/huggingface`): snapshots under `home/snapshots`, the Hub's cache under
+    /// `home/hub`, and a copy already on disk looked for only in `snapshotRoots(home:)`. Nothing
+    /// lands in ~/.cache or ~/Documents, whatever `HF_HOME` says.
+    public init(home: URL) {
+        self.init(hub: Self.hub(home: home), lookupRoots: Self.snapshotRoots(home: home))
+    }
+
+    /// A Hub that downloads into `home/snapshots` and keeps its cache in `home/hub`.
+    public static func hub(home: URL) -> HubApi {
+        HubApi(
+            downloadBase: home.appendingPathComponent("snapshots"),
+            cache: HubCache(location: .fixed(directory: home.appendingPathComponent("hub"))))
+    }
+
+    /// Where a complete copy may sit under `home`: `home/snapshots`, then `home`.
+    public static func snapshotRoots(home: URL) -> [URL] {
+        [home.appendingPathComponent("snapshots"), home]
+    }
+
+    /// Frigate's own models home, for a caller that names none: `$HF_HOME`, else
+    /// ~/.cache/huggingface — where the Hugging Face tools keep theirs.
+    public static func defaultHome(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let home = environment["HF_HOME"], !home.isEmpty { return URL(fileURLWithPath: home) }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface")
+    }
+
+    /// Snapshots go under `defaultHome()/snapshots`; the Hub's cache follows `HF_HOME` (or
+    /// `HF_HUB_CACHE`) on its own, ~/.cache/huggingface/hub without either. An app that keeps
+    /// its models elsewhere passes `init(home:)` instead.
     ///
-    /// New downloads land there. `download` looks wider first: a complete copy
-    /// in any of `snapshotRoots()` — `$HF_HOME/snapshots`, `$HF_HOME`,
-    /// ~/Documents/huggingface — is used where it sits rather than fetched again.
-    public static let defaultHub: HubApi = {
-        guard let home = ProcessInfo.processInfo.environment["HF_HOME"], !home.isEmpty else {
-            return .shared
-        }
-        return HubApi(downloadBase: URL(fileURLWithPath: home).appendingPathComponent("snapshots"))
-    }()
+    /// New downloads land there. `download` looks wider first: a complete copy in any of
+    /// `snapshotRoots()` — the home's `snapshots`, the home, ~/Documents/huggingface — is
+    /// used where it sits rather than fetched again.
+    public static let defaultHub: HubApi = HubApi(
+        downloadBase: defaultHome().appendingPathComponent("snapshots"))
 
     public func download(
         id: String,
@@ -72,26 +97,20 @@ public struct HubDownloader: Downloader {
 // MARK: - Snapshots already on disk
 
 extension HubDownloader {
-    /// Where a complete `models/<org>/<repo>` may already sit, in lookup order:
-    /// `$HF_HOME/snapshots` (where `defaultHub` downloads), `$HF_HOME`, then `documents`
-    /// (`HubApi.shared`'s layout, ~/Documents/huggingface). Without `HF_HOME`, only
-    /// `documents`. A root repeating an earlier one (by standardized path) is dropped.
-    /// `includeDocuments: false` leaves out ~/Documents whenever `HF_HOME` names another
-    /// home: a server a GUI app launched should not touch Documents (a privacy prompt,
-    /// attributed to the app) for a copy it can fetch into its own home instead.
+    /// Where a complete `models/<org>/<repo>` may already sit for `defaultHub`, in lookup
+    /// order: `defaultHome()/snapshots` (where it downloads), `defaultHome()`, then
+    /// `documents` (`HubApi.shared`'s layout, ~/Documents/huggingface — read, never written,
+    /// for a copy fetched when that was the default). A root repeating an earlier one (by
+    /// standardized path) is dropped. `includeDocuments: false` leaves ~/Documents out: a
+    /// server a GUI app launched should not touch Documents (a privacy prompt, attributed to
+    /// the app) for a copy it can fetch into its own home instead.
     public static func snapshotRoots(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         documents: URL = HubDownloader.sharedDownloadBase,
         includeDocuments: Bool = true
     ) -> [URL] {
-        var roots: [URL] = []
-        var hasHome = false
-        if let home = environment["HF_HOME"], !home.isEmpty {
-            let base = URL(fileURLWithPath: home)
-            roots += [base.appending(path: "snapshots"), base]
-            hasHome = true
-        }
-        if includeDocuments || !hasHome { roots.append(documents) }
+        var roots = snapshotRoots(home: defaultHome(environment: environment))
+        if includeDocuments { roots.append(documents) }
         var seen: Set<String> = []
         return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }

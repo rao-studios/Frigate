@@ -706,7 +706,7 @@ let package = Package(
         // hand so nothing here needs a compiler plugin.
         .target(
             name: "FrigateBridge",
-            dependencies: ["MLXLMCommon", "Hub", "Tokenizers"]
+            dependencies: ["MLXLMCommon", "Hub", "HuggingFace", "Tokenizers"]
         ),
 
         // ── mlx_embeddings (mlx.embeddings vendored) ──────────────────────────

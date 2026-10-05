@@ -3,11 +3,11 @@
 //  FrigateTests
 //
 //  WHAT: A model already on disk loads without the network.
-//  WHY:  The Rao launcher sets HF_HOME=~/Documents/huggingface, so `defaultHub` snapshots into
-//        ~/Documents/huggingface/snapshots/models/<org>/<repo> — while a model fetched before
-//        sits at ~/Documents/huggingface/models/<org>/<repo>, `HubApi.shared`'s layout.
-//        Snapshotting again meant a 13 GB download. `HubDownloader` now takes a complete copy
-//        from `$HF_HOME/snapshots`, `$HF_HOME` or ~/Documents/huggingface first.
+//  WHY:  `defaultHub` snapshots into <home>/snapshots/models/<org>/<repo> — `$HF_HOME`, else
+//        ~/.cache/huggingface, or the folder an app names with `init(home:)` — while a model
+//        fetched before may sit at ~/Documents/huggingface/models/<org>/<repo>,
+//        `HubApi.shared`'s layout. Snapshotting again meant a 13 GB download. `HubDownloader`
+//        takes a complete copy from the home's `snapshots`, the home or Documents first.
 //  HOW:  Temporary directory trees only — no MLX, no network. The `download` tests hand the
 //        downloader an offline hub, so a lookup that misses throws instead of reaching the Hub.
 //
@@ -99,12 +99,29 @@ struct HubDownloaderSnapshotTests {
         #expect(roots.map(\.path) == ["/hf/snapshots", "/hf", "/docs/huggingface"])
     }
 
+    /// Without `HF_HOME`, the Hugging Face default home comes first; Documents is only read.
     @Test func rootsWithoutHFHome() {
         let documents = URL(fileURLWithPath: "/docs/huggingface")
-        #expect(HubDownloader.snapshotRoots(environment: [:], documents: documents).map(\.path) == [documents.path])
-        #expect(
-            HubDownloader.snapshotRoots(environment: ["HF_HOME": ""], documents: documents).map(\.path)
-                == [documents.path])
+        let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface")
+        let expected = [cache.appendingPathComponent("snapshots").path, cache.path, documents.path]
+        #expect(HubDownloader.snapshotRoots(environment: [:], documents: documents).map(\.path) == expected)
+        #expect(HubDownloader.snapshotRoots(environment: ["HF_HOME": ""], documents: documents).map(\.path) == expected)
+    }
+
+    @Test func theDefaultHomeIsHFHomeElseTheHuggingFaceCache() {
+        #expect(HubDownloader.defaultHome(environment: ["HF_HOME": "/hf"]).path == "/hf")
+        let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface")
+        #expect(HubDownloader.defaultHome(environment: [:]).standardizedFileURL == cache.standardizedFileURL)
+        #expect(HubDownloader.defaultHome(environment: ["RAO_HOME": "/r"]).standardizedFileURL == cache.standardizedFileURL,
+                "Frigate knows nothing of Rao: an app passes its own home")
+    }
+
+    /// An app's own home: downloads, the Hub's cache and the lookup all stay inside it.
+    @Test func anAppsOwnHomeHoldsEverything() {
+        let home = URL(fileURLWithPath: "/rao/models/huggingface")
+        #expect(HubDownloader.snapshotRoots(home: home).map(\.path) == ["/rao/models/huggingface/snapshots", "/rao/models/huggingface"])
+        let destination = HubDownloader.hub(home: home).localRepoLocation(HubApi.Repo(id: Self.repoID))
+        #expect(destination.path == "/rao/models/huggingface/snapshots/models/\(Self.repoID)")
     }
 
     /// The Rao launcher's case: `HF_HOME` is ~/Documents/huggingface itself.
@@ -114,11 +131,11 @@ struct HubDownloaderSnapshotTests {
         #expect(roots.map(\.path) == ["/docs/huggingface/snapshots", "/docs/huggingface"])
     }
 
-    /// Without `HF_HOME` the lookup is exactly `HubApi.shared`'s layout.
+    /// Documents, when read, is exactly `HubApi.shared`'s layout.
     @Test func documentsDefaultsToTheSharedHubBase() {
         let roots = HubDownloader.snapshotRoots(environment: [:])
         let shared = HubApi.shared.localRepoLocation(HubApi.Repo(id: Self.repoID))
-        #expect(roots.map { $0.appending(path: "models").appending(path: Self.repoID).path } == [shared.path])
+        #expect(roots.last.map { $0.appending(path: "models").appending(path: Self.repoID).path } == shared.path)
     }
 
     /// New downloads still go where `defaultHub` puts them, and that is looked in first.
@@ -351,8 +368,10 @@ struct HubDownloaderSnapshotTests {
         let without = HubDownloader.snapshotRoots(
             environment: ["HF_HOME": "/hf"], documents: documents, includeDocuments: false)
         #expect(without.map(\.path) == ["/hf/snapshots", "/hf"])
+        let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface")
         let noHome = HubDownloader.snapshotRoots(environment: [:], documents: documents, includeDocuments: false)
-        #expect(noHome.map(\.path) == [documents.path], "with no other home, Documents is the home")
+        #expect(noHome.map(\.path) == [cache.appendingPathComponent("snapshots").path, cache.path],
+                "with no HF_HOME, the Hugging Face default home is the home")
     }
 
     // MARK: - download

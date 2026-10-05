@@ -138,7 +138,8 @@ The script is idempotent — safe to re-run if any step failed.
 
 ```bash
 # Embedding model (~370 MB). FrigateEmbedder downloads it on first use into
-# $HF_HOME/snapshots (or ~/Documents/huggingface without HF_HOME).
+# $HF_HOME/snapshots (without HF_HOME, ~/.cache/huggingface/snapshots). An app with its own
+# models folder passes HubDownloader(home:) — Rao's apps pass ~/.rao/models/huggingface.
 HF_HOME=~/.rao/models/huggingface hf download rao-studios/voyage-4-nano-mlx-8bit \
     --local-dir ~/.rao/models/huggingface/snapshots/models/rao-studios/voyage-4-nano-mlx-8bit
 

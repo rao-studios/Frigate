@@ -14,6 +14,8 @@ public actor FrigateEmbedder {
 
     /// The model, its prompts, width and vector space. See `Profile`.
     public nonisolated let profile: Profile
+    /// The caller's own models folder, or nil for Frigate's default home.
+    private let modelsHome: URL?
     private let statusBox: StatusBox
     private var loadedContainer: mlx_embeddings.ModelContainer?
     private var loadingTask: Task<(mlx_embeddings.ModelContainer, URL), Error>?
@@ -47,19 +49,23 @@ public actor FrigateEmbedder {
     /// and the licence/notice text a redistributed model carries.
     static let snapshotPatterns = ["*.safetensors", "*.json", "*.txt"]
 
-    public init(profile: Profile = .voyage4Nano) {
+    /// `modelsHome`: a folder of the caller's own (Rao's apps pass ~/.rao/models/huggingface),
+    /// where the snapshot is fetched and looked for — `HubDownloader(home:)`. Nil is
+    /// Frigate's default home (`HubDownloader.defaultHome()`).
+    public init(profile: Profile = .voyage4Nano, modelsHome: URL? = nil) {
         // Raise SDPA LRU cache from 256 → 2048 so varying sequence lengths
         // across sub-batches don't trigger "Cache thrashing" fatal error.
         setenv("MLX_CUDA_SDPA_CACHE_SIZE", "2048", 0)
         self.profile = profile
+        self.modelsHome = modelsHome
         self.statusBox = StatusBox(Status(
             model: profile.model, revision: profile.revision,
             vectorSpace: profile.vectorSpace, phase: .idle))
     }
 
     /// `org/repo`, `org/repo@<revision>` or a directory path — see `Profile.resolve`.
-    public init(modelId: String) {
-        self.init(profile: .resolve(modelId))
+    public init(modelId: String, modelsHome: URL? = nil) {
+        self.init(profile: .resolve(modelId), modelsHome: modelsHome)
     }
 
     /// Where the model is: idle, downloading (with a fraction), loading, ready, failed.
@@ -154,11 +160,12 @@ public actor FrigateEmbedder {
 
         let profile = self.profile
         let statusBox = self.statusBox
+        let modelsHome = self.modelsHome
         let task = Task<(mlx_embeddings.ModelContainer, URL), Error> {
-            let directory = try await Self.snapshotDirectory(for: profile, status: statusBox)
+            let directory = try await Self.snapshotDirectory(for: profile, modelsHome: modelsHome, status: statusBox)
             statusBox.set { $0.phase = .loading; $0.fraction = nil; $0.error = nil }
             let container = try await mlx_embeddings.loadModelContainer(
-                hub: HubDownloader.defaultHub,
+                hub: modelsHome.map { HubDownloader.hub(home: $0) } ?? HubDownloader.defaultHub,
                 configuration: mlx_embeddings.ModelConfiguration(directory: directory))
             return (container, directory)
         }
@@ -180,19 +187,22 @@ public actor FrigateEmbedder {
     }
 
     /// One local folder holding the whole snapshot: fetched through `HubDownloader`
-    /// (under `$HF_HOME/snapshots`, pinned revision honoured, progress reported), or the
-    /// profile's own directory. The model and tokenizer then load from it with no
-    /// further network call.
-    private static func snapshotDirectory(for profile: Profile, status: StatusBox) async throws -> URL {
+    /// (under `modelsHome/snapshots`, else the default home's; pinned revision honoured,
+    /// progress reported), or the profile's own directory. The model and tokenizer then
+    /// load from it with no further network call.
+    private static func snapshotDirectory(
+        for profile: Profile, modelsHome: URL?, status: StatusBox
+    ) async throws -> URL {
         let directory: URL
         switch profile.source {
         case .directory(let url):
             directory = url
         case .hub(let id, let revision):
             status.set { $0.phase = .downloading; $0.fraction = 0; $0.error = nil }
-            // With HF_HOME set (a launcher chose the models' home), ~/Documents is not searched.
-            let roots = HubDownloader.snapshotRoots(includeDocuments: false)
-            directory = try await HubDownloader(hub: HubDownloader.defaultHub, lookupRoots: roots).download(
+            // A home of the caller's own, or the default one: ~/Documents is not searched.
+            let downloader = modelsHome.map(HubDownloader.init(home:))
+                ?? HubDownloader(hub: HubDownloader.defaultHub, lookupRoots: HubDownloader.snapshotRoots(includeDocuments: false))
+            directory = try await downloader.download(
                 id: id, revision: revision, matching: snapshotPatterns, useLatest: false,
                 progressHandler: { progress in
                     let fraction = progress.fractionCompleted
