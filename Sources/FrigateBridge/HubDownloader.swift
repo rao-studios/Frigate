@@ -23,23 +23,54 @@ public struct HubDownloader: Downloader {
     }
 
     /// Models kept in a folder the caller names — an app's own models home (Rao's apps pass
-    /// `~/.rao/models/huggingface`): snapshots under `home/snapshots`, the Hub's cache under
-    /// `home/hub`, and a copy already on disk looked for only in `snapshotRoots(home:)`. Nothing
-    /// lands in ~/.cache or ~/Documents, whatever `HF_HOME` says.
+    /// `~/.rao/models/huggingface`): snapshots under `home/snapshots`, one copy each. A copy
+    /// already on disk is looked for in `snapshotRoots(home:)` — the home, then the Rao
+    /// stack's folder when this Mac has one — so nothing is fetched twice. Nothing lands in
+    /// ~/.cache or ~/Documents, whatever `HF_HOME` says.
     public init(home: URL) {
         self.init(hub: Self.hub(home: home), lookupRoots: Self.snapshotRoots(home: home))
     }
 
-    /// A Hub that downloads into `home/snapshots` and keeps its cache in `home/hub`.
+    /// A Hub that downloads into `home/snapshots` and keeps no blob cache beside it: the
+    /// snapshot is the only copy (with a cache every model took twice its size on disk, and
+    /// no loader here reads the cache).
     public static func hub(home: URL) -> HubApi {
-        HubApi(
-            downloadBase: home.appendingPathComponent("snapshots"),
-            cache: HubCache(location: .fixed(directory: home.appendingPathComponent("hub"))))
+        HubApi(downloadBase: home.appendingPathComponent("snapshots"), cache: nil)
     }
 
-    /// Where a complete copy may sit under `home`: `home/snapshots`, then `home`.
-    public static func snapshotRoots(home: URL) -> [URL] {
+    /// Where a complete copy may sit for a caller keeping its models in `home`: `home/snapshots`,
+    /// `home`, then the Rao stack's models folder when one exists (`raoModelsHome`) — read,
+    /// never written, so a model any Rao app fetched is used where it sits.
+    public static func snapshotRoots(
+        home: URL, environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [URL] {
+        deduplicated(ownRoots(home: home) + (raoModelsHome(environment: environment).map(ownRoots(home:)) ?? []))
+    }
+
+    /// `home/snapshots`, then `home`: where this caller's own downloads sit, and the only
+    /// places it should ever delete from.
+    public static func ownRoots(home: URL) -> [URL] {
         [home.appendingPathComponent("snapshots"), home]
+    }
+
+    /// The Rao stack's shared models folder, when this Mac has one: `$RAO_HOME/models/huggingface`,
+    /// else ~/.rao/models/huggingface. Every lookup reads it before anything downloads.
+    public static func raoModelsHome(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        let root = environment["RAO_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rao")
+        let home = root.appendingPathComponent("models").appendingPathComponent("huggingface")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: home.path, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return nil }
+        return home
+    }
+
+    /// Each root once, by standardized path, in order.
+    static func deduplicated(_ roots: [URL]) -> [URL] {
+        var seen: Set<String> = []
+        return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 
     /// Frigate's own models home, for a caller that names none: `$HF_HOME`, else
@@ -98,18 +129,19 @@ public struct HubDownloader: Downloader {
 
 extension HubDownloader {
     /// Where a complete `models/<org>/<repo>` may already sit for `defaultHub`, in lookup
-    /// order: `defaultHome()/snapshots` (where it downloads), `defaultHome()`, then
-    /// `documents` (`HubApi.shared`'s layout, ~/Documents/huggingface — read, never written,
-    /// for a copy fetched when that was the default). A root repeating an earlier one (by
-    /// standardized path) is dropped. `includeDocuments: false` leaves ~/Documents out: a
-    /// server a GUI app launched should not touch Documents (a privacy prompt, attributed to
-    /// the app) for a copy it can fetch into its own home instead.
+    /// order: `defaultHome()/snapshots` (where it downloads), `defaultHome()`, the Rao stack's
+    /// models folder when one exists, then `documents` (`HubApi.shared`'s layout,
+    /// ~/Documents/huggingface — read, never written, for a copy fetched when that was the
+    /// default). A root repeating an earlier one (by standardized path) is dropped.
+    /// `includeDocuments: false` leaves ~/Documents out: a server a GUI app launched should not
+    /// touch Documents (a privacy prompt, attributed to the app) for a copy it can fetch into
+    /// its own home instead.
     public static func snapshotRoots(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         documents: URL = HubDownloader.sharedDownloadBase,
         includeDocuments: Bool = true
     ) -> [URL] {
-        var roots = snapshotRoots(home: defaultHome(environment: environment))
+        var roots = snapshotRoots(home: defaultHome(environment: environment), environment: environment)
         if includeDocuments { roots.append(documents) }
         var seen: Set<String> = []
         return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
