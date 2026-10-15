@@ -2,7 +2,7 @@
 //        time in chunks, a batch of rows decoded together one token a step, and a resident cache per
 //        session so the next round prefills only what is new.
 //  IN:   `insert` a StreamRequest (any thread), `remove` a stream, `forget` a slot, `stats`.
-//  OUT:  StreamEvent per stream: admitted, token…, finished. ServeStats for the agent map.
+//  OUT:  StreamEvent per stream: admitted, token…, finished. ParallelStats for the agent map.
 //  PIN:  Every MLX evaluation in this engine happens on its one thread. Arrays never cross it:
 //        tokens leave as integers, stats as values, and a stream's cache lives here between rounds.
 //        Decode and prefill interleave on the same thread — one decode step, then one prefill
@@ -16,7 +16,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-public final class ServeEngine: @unchecked Sendable {
+public final class ParallelEngine: @unchecked Sendable {
     public struct Configuration: Sendable {
         /// Rows decoded together at most; what the batch admits before a request waits.
         public var maxRows = 4
@@ -79,7 +79,7 @@ public final class ServeEngine: @unchecked Sendable {
     private var rateWindow: [(at: Date, tokens: Int)] = []
 
     private let statsLock = NSLock()
-    private var latest = ServeStats()
+    private var latest = ParallelStats()
 
     /// Takes the model: from here on, only this engine evaluates it.
     public init(model: any LanguageModel, configuration: Configuration = Configuration()) throws {
@@ -88,7 +88,7 @@ public final class ServeEngine: @unchecked Sendable {
         layout = try CacheLayout(sample: model.newCache(parameters: nil))
         batch = GenerationBatch(layout: layout)
         let runner = Thread { [self] in self.loop() }
-        runner.name = "frigate.serve"
+        runner.name = "frigate.parallel"
         runner.qualityOfService = .userInteractive
         runner.stackSize = 16 << 20
         runner.start()
@@ -117,7 +117,7 @@ public final class ServeEngine: @unchecked Sendable {
     /// Drops a session's resident cache (the session reset).
     public func forget(slot: SlotID) { post(.forget(slot)) }
 
-    public var stats: ServeStats { statsLock.withLock { latest } }
+    public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() { post(.shutdown) }
 
@@ -205,7 +205,7 @@ public final class ServeEngine: @unchecked Sendable {
             let slot = slots[slotID] ?? Slot()
             slots[slotID] = slot
             if let busy = slot.inFlight {
-                row.continuation.finish(throwing: ServeError.slotBusy("\(busy)"))
+                row.continuation.finish(throwing: ParallelError.slotBusy("\(busy)"))
                 return
             }
             if let cache = slot.cache, !slot.tokens.isEmpty, !cache.layers.isEmpty {
@@ -400,7 +400,7 @@ public final class ServeEngine: @unchecked Sendable {
     private func publishStats() {
         let now = Date()
         rateWindow.removeAll { now.timeIntervalSince($0.at) > 1.5 }
-        var stats = ServeStats()
+        var stats = ParallelStats()
         stats.at = now
         stats.batchSize = batch.count
         stats.queued = queue.count

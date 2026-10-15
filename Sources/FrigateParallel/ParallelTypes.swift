@@ -71,7 +71,7 @@ public struct StreamHandle: Sendable {
     public let events: AsyncThrowingStream<StreamEvent, Error>
 }
 
-public enum ServeError: Error, CustomStringConvertible {
+public enum ParallelError: Error, CustomStringConvertible {
     case slotBusy(String)
     case unsupportedLayer(String)
     case shutDown
@@ -79,8 +79,8 @@ public enum ServeError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .slotBusy(let label): return "the session's cache is still in use by \(label)"
-        case .unsupportedLayer(let kind): return "the serve engine cannot batch a \(kind) layer cache"
-        case .shutDown: return "the serve engine is shut down"
+        case .unsupportedLayer(let kind): return "the parallel engine cannot batch a \(kind) layer cache"
+        case .shutDown: return "the parallel engine is shut down"
         }
     }
 }
@@ -102,7 +102,7 @@ public struct StreamStat: Sendable {
     public var tokensPerSecond: Double
 }
 
-public struct ServeStats: Sendable {
+public struct ParallelStats: Sendable {
     public var streams: [StreamStat] = []
     /// Rows decoding together right now.
     public var batchSize = 0

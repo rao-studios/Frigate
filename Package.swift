@@ -513,7 +513,7 @@ let package = Package(
         .library(name: "MLXLMCommon", targets: ["MLXLMCommon"]),
         .library(name: "MLXEmbedders", targets: ["MLXEmbedders"]),
         .library(name: "FrigateBridge", targets: ["FrigateBridge"]),
-        // The serve engine: N streams on one resident weight copy (batched decode, chunked prefill).
+        // The parallel engine: N streams on one resident weight copy (batched decode, chunked prefill).
         .library(name: "FrigateParallel", targets: ["FrigateParallel"]),
         .library(name: "mlx_embeddings", targets: ["mlx_embeddings"]),
 

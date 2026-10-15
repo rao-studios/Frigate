@@ -15,7 +15,7 @@
 //  PIN:  The cache's position is the offset of a KV layer. A recurrent layer's `offset` never
 //        moves (`ArraysCache.advance` touches lengths and padding only), so reading
 //        `layers.first` on a hybrid model always says 0.
-//  PIN:  `release` and `adopt` hand the layers to the serve engine's batch and back. While they are
+//  PIN:  `release` and `adopt` hand the layers to the parallel engine's batch and back. While they are
 //        out, the snapshots stay here, and nothing here references the buffers the batch writes.
 
 import Foundation

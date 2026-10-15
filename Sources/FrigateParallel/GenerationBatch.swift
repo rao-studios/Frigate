@@ -1,6 +1,6 @@
 //  WHAT: The rows decoding together: their layer caches side by side — a `BatchKVCache` per
 //        attention layer, a batched `MambaCache` per recurrent layer — and what each row still owes.
-//  IN:   ServeEngine, on its thread only.
+//  IN:   ParallelEngine, on its thread only.
 //  PIN:  The first row's caches become the batch's own, uncopied: `ArraysCache.batchSize` answers 1
 //        for an empty cache, so extending an empty batch would zero-fill a phantom row.
 
@@ -20,7 +20,7 @@ struct CacheLayout {
         kinds = try layers.map { layer in
             if layer is ArraysCache { return .recurrent }
             if layer is KVCacheSimple { return .attention }
-            throw ServeError.unsupportedLayer(String(describing: type(of: layer)))
+            throw ParallelError.unsupportedLayer(String(describing: type(of: layer)))
         }
     }
 }
