@@ -64,6 +64,23 @@ public final class CheckpointedCache {
     /// Tokens the cache holds.
     public var position: Int { trimmable.first.map { layers[$0].offset } ?? 0 }
 
+    // MARK: - Bytes (shapes only: nothing is evaluated)
+
+    /// The attention layers' buffers as allocated, capacity included.
+    public var kvBytes: Int {
+        layers.enumerated().filter { recurrent[$0.offset] == nil }.flatMap { $0.element.innerState() }.reduce(0) { $0 + $1.nbytes }
+    }
+
+    /// The recurrent layers' live state.
+    public var recurrentBytes: Int {
+        recurrent.values.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
+    }
+
+    /// What the snapshots hold.
+    public var snapshotBytes: Int {
+        snapshots.flatMap { $0.recurrent.values.flatMap { $0 } }.reduce(0) { $0 + $1.nbytes }
+    }
+
     /// Whether `rewind` can ever succeed.
     public var canRewind: Bool { !layers.isEmpty && opaque == 0 && (!trimmable.isEmpty || recurrent.isEmpty) }
 
@@ -105,6 +122,14 @@ public final class CheckpointedCache {
         trim(by: current - snapshot.tokenCount)
         snapshots.removeAll { $0.tokenCount > snapshot.tokenCount }
         return snapshot.tokenCount
+    }
+
+    /// Drops the oldest snapshot: a rewind can then reach only the newer ones. False when none is kept.
+    @discardableResult
+    public func dropOldestSnapshot() -> Bool {
+        guard !snapshots.isEmpty else { return false }
+        snapshots.removeFirst()
+        return true
     }
 
     /// Hands the layers to whoever decodes on them next and keeps only the snapshots.

@@ -37,6 +37,9 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
     public var lengths: [Int] { leftPadding.map { cursor - $0 } }
 
     public var batchOffset: MLXArray { MLXArray(leftPadding.map { Int32(cursor - $0) }) }
+
+    /// The buffers as allocated: every row, its padding and the capacity not yet written.
+    public var bytes: Int { (keys?.nbytes ?? 0) + (values?.nbytes ?? 0) }
     public var ropeOffset: RoPEOffset { .batch(batchOffset) }
 
     public func innerState() -> [MLXArray] { [keys, values].compactMap { $0 } }

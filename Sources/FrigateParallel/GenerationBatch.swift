@@ -96,6 +96,20 @@ final class GenerationBatch {
         }
     }
 
+    /// The attention layers' batched buffers.
+    var kvBytes: Int { caches.compactMap { $0 as? BatchKVCache }.reduce(0) { $0 + $1.bytes } }
+
+    /// The recurrent layers' state, every row's.
+    var recurrentBytes: Int {
+        caches.compactMap { $0 as? ArraysCache }.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
+    }
+
+    /// The longest row's tokens, and the padding the others carry to line up with it.
+    var lengths: (longest: Int, padding: Int) {
+        guard let first = caches.lazy.compactMap({ $0 as? BatchKVCache }).first else { return (0, 0) }
+        return (first.cursor, first.leftPadding.reduce(0, +))
+    }
+
     /// Whether one sampler can serve every row at once.
     var sharesSampling: Bool {
         guard let first = rows.first else { return false }

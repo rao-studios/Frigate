@@ -3,6 +3,7 @@
 //        stats a front end shows. Values only — no array crosses the engine's thread.
 
 import Foundation
+import MLX
 import MLXLMCommon
 
 public struct StreamID: Hashable, Sendable, CustomStringConvertible {
@@ -111,6 +112,97 @@ public struct ParallelStats: Sendable {
     public var stepMs: Double = 0
     /// Tokens every row produced over the last second or so.
     public var aggregateTokensPerSecond: Double = 0
+    /// Sessions whose cache the engine holds between rounds, in flight or idle.
+    public var residentSlots = 0
+    /// What the engine holds on the GPU, and what MLX's allocator says of the process.
+    public var memory = MemoryStats()
+    /// The request at the head of the queue is held back until rows finish and free memory.
+    public var heldBack = false
+    /// Idle sessions whose caches the memory policy dropped, since the engine started.
+    public var evictions = 0
+    /// The last failure the engine contained — an MLX error on its thread — and when.
+    public var incident: String?
+    public var incidentAt: Date?
     public var at = Date()
     public init() {}
+}
+
+/// How much the engine may hold on the GPU, and what it does when that runs out.
+///
+/// PIN: refuse or wait, never crash. MLX's memory limit is soft — past it an allocation waits and
+/// then happens anyway — and an allocation that fails on the engine's thread ended the process. The
+/// engine counts what it holds and decides at admission, where a request can still be told no.
+public struct MemoryPolicy: Sendable {
+    /// What the process may hold on the GPU, all told. `Int.max` watches and holds nothing back.
+    public var budgetBytes = Int.max
+    /// The fraction of the budget past which a new request waits for rows to finish, after the engine
+    /// has given back what idle sessions keep.
+    public var highWater = 0.85
+    /// Sessions whose caches stay between rounds; past it the least recently used idle one goes.
+    public var maxResidentSlots = Int.max
+    /// What idle sessions' caches may hold together.
+    public var slotBudgetBytes = Int.max
+    /// What recurrent snapshots may hold together; the oldest go first.
+    public var snapshotBudgetBytes = Int.max
+    /// Requests that may wait; past it a request ends at once, failed, rather than queue without bound.
+    public var maxQueued = Int.max
+    /// Where the engine reads the process's memory: MLX's allocator. A test reads its own.
+    public var readMemory: @Sendable () -> (active: Int, cache: Int) = { (Memory.activeMemory, Memory.cacheMemory) }
+    /// How the engine gives MLX's buffer cache back, on its own thread between steps. A test counts the calls.
+    public var clearCache: @Sendable () -> Void = { Memory.clearCache() }
+    public init() {}
+}
+
+/// What admission decides for the request at the head of the queue.
+public enum Admission: Equatable, Sendable {
+    case admit
+    /// Wait: rows that are decoding will finish and give memory back.
+    case `defer`
+    /// Never: the reason ends the stream, failed.
+    case reject(String)
+}
+
+/// Memory as the engine counts it: bytes read off array shapes (no evaluation), and MLX's allocator.
+///
+/// PIN: KV and recurrent state are counted apart. Attention KV grows with every token a row holds;
+/// recurrent state is a fixed size per row whatever its context. A budget that read them as one number
+/// would be wrong for a hybrid model and useless for a pure recurrent one.
+public struct MemoryStats: Sendable, Equatable {
+    /// MLX's allocator, process-wide: arrays alive now, freed buffers kept for reuse, and the most that
+    /// was alive at once over the last few seconds.
+    public var activeBytes = 0
+    public var cacheBytes = 0
+    public var peakBytes = 0
+    /// Attention KV the engine holds: the batch's buffers, a prompt being prefilled, idle sessions.
+    public var kvBytes = 0
+    /// Recurrent state the engine holds, live: the batch's rows, a prefill, idle sessions.
+    public var recurrentBytes = 0
+    /// Recurrent snapshots the idle and running sessions keep to rewind to. An upper bound: a snapshot
+    /// taken at a prompt's end shares its arrays with the live state until the next step replaces them.
+    public var snapshotBytes = 0
+    /// The batch's own KV buffers, the longest row's token count, and the padding columns the shorter
+    /// rows carry so their last tokens line up with it.
+    public var batchKVBytes = 0
+    public var batchMaxTokens = 0
+    public var paddingTokens = 0
+    /// Every session the engine keeps a cache for.
+    public var slots: [SlotStat] = []
+    public init() {}
+
+    /// Everything the engine itself holds.
+    public var engineBytes: Int { kvBytes + recurrentBytes + snapshotBytes }
+}
+
+/// One session's cache in the engine.
+public struct SlotStat: Sendable, Equatable {
+    public var slot: SlotID
+    /// Tokens its cache holds.
+    public var tokens: Int
+    public var kvBytes: Int
+    public var recurrentBytes: Int
+    public var snapshots: Int
+    public var snapshotBytes: Int
+    /// A stream is running on it now: its layers are in the batch, and it cannot be evicted.
+    public var inFlight: Bool
+    public var lastUsed: Date
 }

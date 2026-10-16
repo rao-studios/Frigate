@@ -31,6 +31,8 @@ public final class ParallelEngine: @unchecked Sendable {
         public var decodeStepsPerChunk = 1
         /// How many recurrent-state snapshots a slot keeps.
         public var checkpointRing = 4
+        /// What the engine may hold, and what it does past it.
+        public var memory = MemoryPolicy()
         public init() {}
     }
 
@@ -39,6 +41,10 @@ public final class ParallelEngine: @unchecked Sendable {
         case remove(StreamID)
         case forget(SlotID)
         case forgetAll
+        case setLimits(maxRows: Int?, prefillChunk: Int?)
+        case setPolicy(MemoryPolicy)
+        case trimSlots(toBytes: Int)
+        case clearCache
         case shutdown
     }
 
@@ -48,6 +54,8 @@ public final class ParallelEngine: @unchecked Sendable {
         var inFlight: StreamID?
         /// Forgotten while a stream was using it: the slot goes when that stream settles.
         var forgotten = false
+        /// When a stream last began or ended on it: what an eviction reads, oldest first.
+        var lastUsed = Date()
     }
 
     /// A prompt being prefilled, one chunk at a time, on single-sequence layers.
@@ -87,6 +95,18 @@ public final class ParallelEngine: @unchecked Sendable {
     private var lastStepAt: Date?
     private var lastStepSeconds: TimeInterval = 0
     private var rateWindow: [(at: Date, tokens: Int)] = []
+    /// MLX's peak, read and reset at every stats: the highest of the last few seconds is what is published.
+    private var peakWindow: [(at: Date, bytes: Int)] = []
+    /// The limits as they stand now: the configuration's until `setLimits` moves them.
+    private var maxRows: Int
+    private var prefillChunkSize: Int
+    private var policy: MemoryPolicy
+    /// Learned from sessions as they settle: what a token of KV costs, and a row of recurrent state.
+    private var kvBytesPerToken = 0
+    private var recurrentBytesPerRow = 0
+    private var heldBack = false
+    private var evictions = 0
+    private var incident: (at: Date, text: String)?
 
     private let statsLock = NSLock()
     private var latest = ParallelStats()
@@ -95,6 +115,9 @@ public final class ParallelEngine: @unchecked Sendable {
     public init(model: any LanguageModel, configuration: Configuration = Configuration()) throws {
         self.model = model
         self.configuration = configuration
+        maxRows = max(1, configuration.maxRows)
+        prefillChunkSize = max(1, configuration.prefillChunk)
+        policy = configuration.memory
         layout = try CacheLayout(sample: model.newCache(parameters: nil))
         batch = GenerationBatch(layout: layout)
         let runner = Thread { [self] in self.loop() }
@@ -135,6 +158,19 @@ public final class ParallelEngine: @unchecked Sendable {
     /// Drops every session's resident cache: the model is about to be released.
     public func forgetAll() { post(.forgetAll) }
 
+    /// Moves the batch's width and the prefill chunk while the engine runs: the levers memory has. A
+    /// narrower batch admits nothing new until rows finish; it never stops a row already decoding.
+    public func setLimits(maxRows: Int? = nil, prefillChunk: Int? = nil) { post(.setLimits(maxRows: maxRows, prefillChunk: prefillChunk)) }
+
+    /// Replaces the memory policy.
+    public func setPolicy(_ policy: MemoryPolicy) { post(.setPolicy(policy)) }
+
+    /// Drops idle sessions' caches, least recently used first, until they hold at most `bytes`.
+    public func trimSlots(toBytes bytes: Int) { post(.trimSlots(toBytes: bytes)) }
+
+    /// Gives MLX's buffer cache back to the system, between two steps.
+    public func clearCache() { post(.clearCache) }
+
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() {
@@ -165,13 +201,15 @@ public final class ParallelEngine: @unchecked Sendable {
             for command in pending { apply(command) }
             if !alive { break }
 
+            // PIN: contained. An MLX error on this thread — an allocation that failed — used to end the
+            // process. Under `withError` it ends the rows it hit, failed, and the engine goes on.
             if !batch.isEmpty, prefill == nil || stepsSinceChunk < configuration.decodeStepsPerChunk {
-                decodeStep()
+                do { try withError { decodeStep() } } catch { failBatch("decoding failed: \(error)") }
                 stepsSinceChunk += 1
             }
             admit()
             if let job = prefill {
-                prefillChunk(job)
+                do { try withError { prefillChunk(job) } } catch { failPrefill(job, "prefill failed: \(error)") }
                 stepsSinceChunk = 0
             }
             publishStats()
@@ -190,6 +228,10 @@ public final class ParallelEngine: @unchecked Sendable {
     private func apply(_ command: Command) {
         switch command {
         case .insert(let row):
+            guard queue.count < policy.maxQueued else {
+                end(row, reason: .failed, layers: nil, message: "the engine already has \(queue.count) requests waiting")
+                return
+            }
             queue.append(row)
             queue.sort { a, b in a.priority > b.priority || (a.priority == b.priority && a.id.raw < b.id.raw) }
         case .remove(let id):
@@ -212,7 +254,19 @@ public final class ParallelEngine: @unchecked Sendable {
             forget(slot)
         case .forgetAll:
             for slot in Array(slots.keys) { forget(slot) }
-            Memory.clearCache()
+            policy.clearCache()
+        case .setLimits(let rows, let chunk):
+            if let rows { maxRows = max(1, rows) }
+            if let chunk { prefillChunkSize = max(1, chunk) }
+        case .setPolicy(let next):
+            policy = next
+            enforceSlotBudget()
+        case .trimSlots(let bytes):
+            var evicted = false
+            while idleSlotBytes > bytes, evictLeastRecentlyUsed() { evicted = true }
+            if evicted { policy.clearCache() }
+        case .clearCache:
+            policy.clearCache()
         case .shutdown:
             running = false
         }
@@ -233,7 +287,19 @@ public final class ParallelEngine: @unchecked Sendable {
     // MARK: - Admission and prefill
 
     private func admit() {
-        guard prefill == nil, batch.count < configuration.maxRows, !queue.isEmpty else { return }
+        guard prefill == nil, batch.count < maxRows, let next = queue.first else { return }
+        switch admission(for: next) {
+        case .defer:
+            heldBack = true
+            return
+        case .reject(let reason):
+            heldBack = false
+            queue.removeFirst()
+            end(next, reason: .failed, layers: nil, message: reason)
+            return
+        case .admit:
+            heldBack = false
+        }
         let row = queue.removeFirst()
         row.admittedAt = Date()
         var layers: [KVCache]
@@ -246,6 +312,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.continuation.finish(throwing: ParallelError.slotBusy("\(busy)"))
                 return
             }
+            slot.lastUsed = Date()
             if let cache = slot.cache, !slot.tokens.isEmpty, !cache.layers.isEmpty {
                 let common = Self.commonPrefix(slot.tokens, row.request.tokens)
                 // The model needs at least one new token.
@@ -278,7 +345,7 @@ public final class ParallelEngine: @unchecked Sendable {
             end(row, reason: .removed, layers: nil)
             return
         }
-        let upTo = min(job.done + configuration.prefillChunk, job.suffix.count)
+        let upTo = min(job.done + prefillChunkSize, job.suffix.count)
         let piece = Array(job.suffix[job.done ..< upTo])
         let last = upTo == job.suffix.count
         if !piece.isEmpty {
@@ -406,20 +473,128 @@ public final class ParallelEngine: @unchecked Sendable {
     // MARK: - Ending
 
     /// The slot takes its layers back with what was fed; the stream hears `finished`.
-    private func end(_ row: Row, reason: FinishReason, layers: [KVCache]?) {
+    private func end(_ row: Row, reason: FinishReason, layers: [KVCache]?, message: String? = nil) {
         settle(row, layers: layers, keptTokens: row.request.tokens + row.fed)
         let info = FinishInfo(reason: reason, promptTokens: row.promptCount, generated: row.emitted,
                               prefillSeconds: row.prefillSeconds,
                               decodeSeconds: row.admittedAt.map { Date().timeIntervalSince($0) - row.prefillSeconds } ?? 0,
                               meanBatchSize: row.batchSteps > 0 ? Double(row.batchRowsSeen) / Double(row.batchSteps) : 0,
-                              message: nil)
+                              message: message)
         row.continuation.yield(.finished(info))
         row.continuation.finish()
     }
 
+    // MARK: - Failure, contained
+
+    /// Every row of the batch ends failed: what they held is dropped, not settled back.
+    private func failBatch(_ message: String) {
+        for row in batch.rows.reversed() { end(row, reason: .failed, layers: nil, message: message) }
+        batch.remove(Set(batch.rows.indices))
+        pendingTokens = nil
+        record(message)
+    }
+
+    /// The prompt being prefilled ends failed, and its session's cache with it.
+    private func failPrefill(_ job: PrefillJob, _ message: String) {
+        prefill = nil
+        if let slotID = job.row.slot { slots[slotID]?.cache = nil }
+        end(job.row, reason: .failed, layers: nil, message: message)
+        record(message)
+    }
+
+    private func record(_ message: String) {
+        incident = (Date(), message)
+        policy.clearCache()
+    }
+
+    // MARK: - Memory policy
+
+    /// Whether `row` fits now: what it would add against what the process holds — idle sessions' caches
+    /// and MLX's buffer cache given back first when that is what stands in the way.
+    private func admission(for row: Row) -> Admission {
+        guard policy.budgetBytes < Int.max else { return .admit }
+        let estimate = estimatedBytes(for: row)
+        if estimate > policy.budgetBytes {
+            return .reject("this prompt would need about \(Self.gb(estimate)) on the GPU, more than the \(Self.gb(policy.budgetBytes)) budget")
+        }
+        let high = Int(Double(policy.budgetBytes) * policy.highWater)
+        var memory = policy.readMemory()
+        if memory.active + memory.cache + estimate <= high { return .admit }
+        // Idle sessions go first, least recently used: what they held moves to the buffer cache.
+        var evicted = false
+        while memory.active + estimate > high, evictLeastRecentlyUsed(except: row.slot) {
+            evicted = true
+            memory = policy.readMemory()
+        }
+        // PIN: the buffer cache goes back only after an eviction or when that alone admits the row — never
+        // on every step a row waits. Cleared each step, the batch would lose its buffers and allocate afresh
+        // for every token, exactly while memory is tight.
+        if evicted || memory.active + estimate <= high {
+            policy.clearCache()
+            memory = policy.readMemory()
+            if memory.active + memory.cache + estimate <= high { return .admit }
+        }
+        // Rows decoding now will finish and give memory back: wait for them.
+        if !batch.isEmpty { return .defer }
+        // Nothing running will free anything; what is held is the model and what cannot go.
+        if memory.active + estimate > policy.budgetBytes {
+            return .reject("the model and what it holds leave \(Self.gb(max(0, policy.budgetBytes - memory.active))) of the "
+                           + "\(Self.gb(policy.budgetBytes)) budget, and this prompt needs about \(Self.gb(estimate))")
+        }
+        return .admit
+    }
+
+    /// What admitting `row` adds: KV for the tokens its session does not hold yet, a row of recurrent state
+    /// for a session that holds none, and the padding every row takes on when it is longer than the longest.
+    private func estimatedBytes(for row: Row) -> Int {
+        let slot = row.slot.flatMap { slots[$0] }
+        let held = slot.map { Self.commonPrefix($0.tokens, row.request.tokens) } ?? 0
+        var bytes = max(0, row.request.tokens.count - held) * kvBytesPerToken
+        if slot?.cache == nil { bytes += recurrentBytesPerRow }
+        let longest = batch.lengths.longest
+        if !batch.isEmpty, row.request.tokens.count > longest {
+            bytes += (row.request.tokens.count - longest) * kvBytesPerToken * batch.count
+        }
+        return bytes
+    }
+
+    /// What idle sessions' caches hold together.
+    private var idleSlotBytes: Int {
+        slots.values.filter { $0.inFlight == nil }.compactMap(\.cache).reduce(0) { $0 + $1.kvBytes + $1.recurrentBytes + $1.snapshotBytes }
+    }
+
+    /// Drops the least recently used idle session's cache. False when every session is in use.
+    @discardableResult
+    private func evictLeastRecentlyUsed(except keep: SlotID? = nil) -> Bool {
+        let idle = slots.filter { $0.value.inFlight == nil && $0.value.cache != nil && $0.key != keep }
+        guard let victim = idle.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key else { return false }
+        slots[victim] = nil
+        evictions += 1
+        return true
+    }
+
+    /// Holds sessions to the policy: how many keep a cache, what the idle ones hold, what the snapshots hold.
+    private func enforceSlotBudget() {
+        var freed = false
+        while slots.values.filter({ $0.cache != nil }).count > policy.maxResidentSlots, evictLeastRecentlyUsed() { freed = true }
+        while idleSlotBytes > policy.slotBudgetBytes, evictLeastRecentlyUsed() { freed = true }
+        while slots.values.compactMap(\.cache).reduce(0, { $0 + $1.snapshotBytes }) > policy.snapshotBudgetBytes {
+            // The oldest snapshot of the session with the most, then of the least recently used.
+            let holders = slots.values.filter { ($0.cache?.snapshots.count ?? 0) > 0 }
+            guard let holder = holders.max(by: { a, b in
+                (a.cache?.snapshots.count ?? 0, b.lastUsed) < (b.cache?.snapshots.count ?? 0, a.lastUsed)
+            }), holder.cache?.dropOldestSnapshot() == true else { break }
+            freed = true
+        }
+        if freed { policy.clearCache() }
+    }
+
+    static func gb(_ bytes: Int) -> String { String(format: "%.1f GB", Double(bytes) / 1_073_741_824) }
+
     private func settle(_ row: Row, layers: [KVCache]?, keptTokens: [Int]) {
         guard let slotID = row.slot, let slot = slots[slotID], slot.inFlight == row.id else { return }
         slot.inFlight = nil
+        slot.lastUsed = Date()
         // Forgotten while this row ran: what it hands back is dropped, not adopted.
         if slot.forgotten {
             slots[slotID] = nil
@@ -436,6 +611,12 @@ public final class ParallelEngine: @unchecked Sendable {
             slot.cache = CheckpointedCache(layers: layers, ring: configuration.checkpointRing)
         }
         slot.tokens = keptTokens
+        // What a token and a row cost, learned from a session that just settled: what admission estimates with.
+        if let cache = slot.cache, cache.position > 0 {
+            kvBytesPerToken = max(kvBytesPerToken, cache.kvBytes / cache.position)
+            recurrentBytesPerRow = max(recurrentBytesPerRow, cache.recurrentBytes)
+        }
+        enforceSlotBudget()
     }
 
     // MARK: - Stats
@@ -447,6 +628,12 @@ public final class ParallelEngine: @unchecked Sendable {
         stats.at = now
         stats.batchSize = batch.count
         stats.queued = queue.count
+        stats.residentSlots = slots.values.filter { $0.cache != nil }.count
+        stats.memory = memory(at: now)
+        stats.heldBack = heldBack
+        stats.evictions = evictions
+        stats.incident = incident?.text
+        stats.incidentAt = incident?.at
         stats.stepMs = lastStepSeconds * 1000
         if let first = rateWindow.first, rateWindow.count > 1 {
             let span = now.timeIntervalSince(first.at)
@@ -469,6 +656,44 @@ public final class ParallelEngine: @unchecked Sendable {
         if let job = prefill { stats.streams.append(stat(job.row, phase: .prefill(done: job.done, total: job.suffix.count))) }
         stats.streams += queue.map { stat($0, phase: .queued) }
         statsLock.withLock { latest = stats }
+    }
+
+    /// What the engine holds, by kind and by session, and what MLX's allocator says. Shapes only.
+    private func memory(at now: Date) -> MemoryStats {
+        var memory = MemoryStats()
+        let snapshot = Memory.snapshot()
+        memory.activeBytes = snapshot.activeMemory
+        memory.cacheBytes = snapshot.cacheMemory
+        // MLX keeps the peak since it was last reset, process-wide: read it, reset it, and publish the
+        // highest of the last five seconds, so a reader polling every few seconds still sees a spike.
+        Memory.peakMemory = 0
+        peakWindow.append((now, snapshot.peakMemory))
+        peakWindow.removeAll { now.timeIntervalSince($0.at) > 5 }
+        memory.peakBytes = peakWindow.map(\.bytes).max() ?? snapshot.peakMemory
+        memory.batchKVBytes = batch.kvBytes
+        let lengths = batch.lengths
+        memory.batchMaxTokens = lengths.longest
+        memory.paddingTokens = lengths.padding
+        memory.kvBytes = batch.kvBytes
+        memory.recurrentBytes = batch.recurrentBytes
+        if let job = prefill, job.slotCache == nil {
+            for layer in job.layers {
+                let bytes = layer.innerState().reduce(0) { $0 + $1.nbytes }
+                if layer is ArraysCache { memory.recurrentBytes += bytes } else { memory.kvBytes += bytes }
+            }
+        }
+        for (id, slot) in slots {
+            guard let cache = slot.cache else { continue }
+            let stat = SlotStat(slot: id, tokens: slot.tokens.count, kvBytes: cache.kvBytes, recurrentBytes: cache.recurrentBytes,
+                                snapshots: cache.snapshots.count, snapshotBytes: cache.snapshotBytes,
+                                inFlight: slot.inFlight != nil, lastUsed: slot.lastUsed)
+            memory.kvBytes += stat.kvBytes
+            memory.recurrentBytes += stat.recurrentBytes
+            memory.snapshotBytes += stat.snapshotBytes
+            memory.slots.append(stat)
+        }
+        memory.slots.sort { $0.lastUsed > $1.lastUsed }
+        return memory
     }
 
     static func commonPrefix(_ a: [Int], _ b: [Int]) -> Int {
