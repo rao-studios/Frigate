@@ -1,7 +1,8 @@
 //  WHAT: One thread serving N streams on one loaded model: a queue of prompts prefilled one at a
 //        time in chunks, a batch of rows decoded together one token a step, and a resident cache per
 //        session so the next round prefills only what is new.
-//  IN:   `insert` a StreamRequest (any thread), `remove` a stream, `forget` a slot, `stats`.
+//  IN:   `insert` a StreamRequest (any thread), `remove` a stream, `forget` a slot (or all of them),
+//        `stats`.
 //  OUT:  StreamEvent per stream: admitted, token…, finished. ParallelStats for the agent map.
 //  PIN:  Every MLX evaluation in this engine happens on its one thread. Arrays never cross it:
 //        tokens leave as integers, stats as values, and a stream's cache lives here between rounds.
@@ -11,6 +12,10 @@
 //  PIN:  Rows are decoded as one forward pass: B tokens in, B logits out. That is the whole point.
 //        Independent generations only split the GPU's bandwidth (measured 2026-10-15: two streams
 //        34 + 34 tok/s against 67 alone); one batched step reads the weights once for all rows.
+//  PIN:  A forgotten slot stays forgotten. A slot's cache is the most memory a session holds here —
+//        its KV and its recurrent snapshots — and nothing else frees it. Forgetting one mid-stream
+//        used to nil the cache only for `settle` to rebuild it from the row's layers when the row
+//        ended, so a session reset during a generation kept everything it meant to drop.
 
 import Foundation
 import MLX
@@ -33,6 +38,7 @@ public final class ParallelEngine: @unchecked Sendable {
         case insert(Row)
         case remove(StreamID)
         case forget(SlotID)
+        case forgetAll
         case shutdown
     }
 
@@ -40,6 +46,8 @@ public final class ParallelEngine: @unchecked Sendable {
         var cache: CheckpointedCache?
         var tokens: [Int] = []
         var inFlight: StreamID?
+        /// Forgotten while a stream was using it: the slot goes when that stream settles.
+        var forgotten = false
     }
 
     /// A prompt being prefilled, one chunk at a time, on single-sequence layers.
@@ -63,6 +71,8 @@ public final class ParallelEngine: @unchecked Sendable {
     private let condition = NSCondition()
     private var commands: [Command] = []
     private var running = true
+    /// `shutdown` was called: a stream inserted after it ends at once rather than wait for a thread that is gone.
+    private var closed = false
     private var nextID = 0
 
     // Engine-thread state.
@@ -98,9 +108,13 @@ public final class ParallelEngine: @unchecked Sendable {
 
     public func insert(_ request: StreamRequest) -> StreamHandle {
         let (stream, continuation) = AsyncThrowingStream<StreamEvent, Error>.makeStream(bufferingPolicy: .unbounded)
-        let id: StreamID = condition.withLock {
+        let (id, open): (StreamID, Bool) = condition.withLock {
             nextID += 1
-            return StreamID(raw: nextID)
+            return (StreamID(raw: nextID), !closed)
+        }
+        guard open else {
+            continuation.finish(throwing: ParallelError.shutDown)
+            return StreamHandle(id: id, events: stream)
         }
         let row = Row(id: id, request: request, continuation: continuation)
         continuation.onTermination = { [weak self] reason in
@@ -114,12 +128,19 @@ public final class ParallelEngine: @unchecked Sendable {
     /// keeps what was prefilled or decoded so far.
     public func remove(_ id: StreamID) { post(.remove(id)) }
 
-    /// Drops a session's resident cache (the session reset).
+    /// Drops a session's resident cache (the session reset, or the session gone). A stream still
+    /// running on it finishes, and its cache is dropped when it does.
     public func forget(slot: SlotID) { post(.forget(slot)) }
+
+    /// Drops every session's resident cache: the model is about to be released.
+    public func forgetAll() { post(.forgetAll) }
 
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
-    public func shutdown() { post(.shutdown) }
+    public func shutdown() {
+        condition.withLock { closed = true }
+        post(.shutdown)
+    }
 
     private func post(_ command: Command) {
         condition.lock()
@@ -161,6 +182,9 @@ public final class ParallelEngine: @unchecked Sendable {
         for (index, row) in batch.rows.enumerated().reversed() { end(row, reason: .removed, layers: batch.extract(row: index)) }
         batch.remove(Set(batch.rows.indices))
         pendingTokens = nil
+        // Nothing serves these sessions any more: their caches go with the engine.
+        slots.removeAll()
+        publishStats()
     }
 
     private func apply(_ command: Command) {
@@ -185,11 +209,25 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.removed = true
             }
         case .forget(let slot):
-            if let s = slots[slot], s.inFlight == nil { slots[slot] = nil }
-            else if let s = slots[slot] { s.cache = nil; s.tokens = [] }
+            forget(slot)
+        case .forgetAll:
+            for slot in Array(slots.keys) { forget(slot) }
+            Memory.clearCache()
         case .shutdown:
             running = false
         }
+    }
+
+    /// An idle slot goes now; one a stream is using goes when that stream settles (`settle`).
+    private func forget(_ id: SlotID) {
+        guard let slot = slots[id] else { return }
+        guard slot.inFlight != nil else {
+            slots[id] = nil
+            return
+        }
+        slot.forgotten = true
+        slot.cache = nil
+        slot.tokens = []
     }
 
     // MARK: - Admission and prefill
@@ -382,6 +420,11 @@ public final class ParallelEngine: @unchecked Sendable {
     private func settle(_ row: Row, layers: [KVCache]?, keptTokens: [Int]) {
         guard let slotID = row.slot, let slot = slots[slotID], slot.inFlight == row.id else { return }
         slot.inFlight = nil
+        // Forgotten while this row ran: what it hands back is dropped, not adopted.
+        if slot.forgotten {
+            slots[slotID] = nil
+            return
+        }
         guard let layers else {
             // Nothing decoded on the batch: the slot keeps the layers it still holds, if any.
             if slot.cache?.layers.isEmpty == false { slot.tokens = keptTokens } else { slot.cache = nil; slot.tokens = [] }
