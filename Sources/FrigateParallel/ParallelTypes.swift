@@ -120,6 +120,9 @@ public struct ParallelStats: Sendable {
     public var heldBack = false
     /// Idle sessions whose caches the memory policy dropped, since the engine started.
     public var evictions = 0
+    /// The engine is paused at its memory ceiling: no step runs until memory comes back under it or
+    /// `resume` raises it. Nil while it runs.
+    public var held: MemoryHold?
     /// The last failure the engine contained — an MLX error on its thread — and when.
     public var incident: String?
     public var incidentAt: Date?
@@ -146,11 +149,37 @@ public struct MemoryPolicy: Sendable {
     public var snapshotBudgetBytes = Int.max
     /// Requests that may wait; past it a request ends at once, failed, rather than queue without bound.
     public var maxQueued = Int.max
+    /// Past this the engine takes no step — no decode, no prefill — until `resume` lets it go, or memory
+    /// falls back under `highWater` of it. `Int.max` never holds.
+    ///
+    /// PIN: the hold is the only limit that holds. MLX's own memory limit only decides when its cache is
+    /// reclaimed — `malloc` never refuses past it — and admission only judges a request before it runs.
+    /// Measured 2026-10-16 and 10-17: Craft grew to 147–161 GB on a 128 GB Mac within minutes of a first
+    /// turn, and macOS killed processes for want of swap.
+    public var ceilingBytes = Int.max
+    /// What the ceiling is held to. Nil reads MLX's allocator (active and cache); the host passes the
+    /// process's own footprint, which also counts what MLX never sees.
+    public var readCeilingBytes: (@Sendable () -> Int)?
     /// Where the engine reads the process's memory: MLX's allocator. A test reads its own.
     public var readMemory: @Sendable () -> (active: Int, cache: Int) = { (Memory.activeMemory, Memory.cacheMemory) }
     /// How the engine gives MLX's buffer cache back, on its own thread between steps. A test counts the calls.
     public var clearCache: @Sendable () -> Void = { Memory.clearCache() }
     public init() {}
+}
+
+/// The engine paused at its memory ceiling.
+public struct MemoryHold: Sendable, Equatable {
+    /// The most the ceiling's reading said while paused.
+    public var bytes: Int
+    public var ceiling: Int
+    /// Held because the host asked (`hold()`): only `resume` lets go. Otherwise memory falling back under
+    /// the high-water mark of the ceiling lets go too.
+    public var asked: Bool
+    public var since: Date
+
+    public init(bytes: Int, ceiling: Int, asked: Bool, since: Date = Date()) {
+        self.bytes = bytes; self.ceiling = ceiling; self.asked = asked; self.since = since
+    }
 }
 
 /// What admission decides for the request at the head of the queue.

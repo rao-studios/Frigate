@@ -45,6 +45,8 @@ public final class ParallelEngine: @unchecked Sendable {
         case setPolicy(MemoryPolicy)
         case trimSlots(toBytes: Int)
         case clearCache
+        case hold
+        case resume(ceiling: Int?)
         case shutdown
     }
 
@@ -105,6 +107,10 @@ public final class ParallelEngine: @unchecked Sendable {
     private var kvBytesPerToken = 0
     private var recurrentBytesPerRow = 0
     private var heldBack = false
+    /// Paused at the memory ceiling: no step runs (`holding()`).
+    private var held: MemoryHold?
+    /// The ceiling as the host last raised it; the policy's until then.
+    private var raisedCeiling: Int?
     private var evictions = 0
     private var incident: (at: Date, text: String)?
 
@@ -171,6 +177,14 @@ public final class ParallelEngine: @unchecked Sendable {
     /// Gives MLX's buffer cache back to the system, between two steps.
     public func clearCache() { post(.clearCache) }
 
+    /// Pauses every step, as if the ceiling were passed, until `resume`: the host saw memory run short
+    /// where the engine cannot (macOS's own pressure).
+    public func hold() { post(.hold) }
+
+    /// Lets a held engine go on. A ceiling raises the line it holds at from here on; nil keeps it, so an
+    /// engine still over it holds again at once.
+    public func resume(ceiling: Int? = nil) { post(.resume(ceiling: ceiling)) }
+
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() {
@@ -200,6 +214,14 @@ public final class ParallelEngine: @unchecked Sendable {
             condition.unlock()
             for command in pending { apply(command) }
             if !alive { break }
+            if holding() {
+                publishStats()
+                // Paused: wake for a command, or to look at memory again.
+                condition.lock()
+                if commands.isEmpty, running { _ = condition.wait(until: Date().addingTimeInterval(0.25)) }
+                condition.unlock()
+                continue
+            }
 
             // PIN: contained. An MLX error on this thread — an allocation that failed — used to end the
             // process. Under `withError` it ends the rows it hit, failed, and the engine goes on.
@@ -267,6 +289,11 @@ public final class ParallelEngine: @unchecked Sendable {
             if evicted { policy.clearCache() }
         case .clearCache:
             policy.clearCache()
+        case .hold:
+            held = MemoryHold(bytes: ceilingReading(), ceiling: ceiling, asked: true)
+        case .resume(let raised):
+            if let raised { raisedCeiling = raised }
+            held = nil
         case .shutdown:
             running = false
         }
@@ -282,6 +309,64 @@ public final class ParallelEngine: @unchecked Sendable {
         slot.forgotten = true
         slot.cache = nil
         slot.tokens = []
+    }
+
+    // MARK: - The ceiling
+
+    private var ceiling: Int { raisedCeiling ?? policy.ceilingBytes }
+
+    private func ceilingReading() -> Int {
+        if let read = policy.readCeilingBytes { return read() }
+        let memory = policy.readMemory()
+        return memory.active + memory.cache
+    }
+
+    /// Whether the engine is paused at its ceiling. Past it the buffer cache goes back first; if that is
+    /// not enough, no step runs until the host lets it go (`resume`), or memory falls back under the
+    /// high-water mark of the line — what stopping the turns gives back.
+    ///
+    /// PIN: back under the high-water mark, not back under the line. A process that sits at its line —
+    /// giving the cache back takes it a hair under, the next step a hair over — was paused and let go
+    /// every few seconds (watched in the app, 2026-10-17), so the person was asked and un-asked and no
+    /// answer ever stuck.
+    ///
+    /// PIN: a stream stopped while the engine is paused still ends. A removed row only ends at the next
+    /// decode step, and a paused engine takes none — so Stop would wait on the very hold it was meant to
+    /// relieve. Its cache is dropped, not settled: copying it out is memory the engine does not have.
+    private func holding() -> Bool {
+        if var current = held {
+            endRemovedRows()
+            let reading = ceilingReading()
+            if !current.asked, Double(reading) <= Double(current.ceiling) * policy.highWater {
+                held = nil
+                return false
+            }
+            // The most it reached while paused: what the person is told was past the line, even after the
+            // buffer cache has gone back.
+            current.bytes = max(current.bytes, reading)
+            held = current
+            return true
+        }
+        let line = ceiling
+        guard line < Int.max, ceilingReading() > line else { return false }
+        policy.clearCache()
+        let reading = ceilingReading()
+        guard reading > line else { return false }
+        held = MemoryHold(bytes: reading, ceiling: line, asked: false)
+        incident = (Date(), "paused at \(Self.gb(reading)), past the \(Self.gb(line)) ceiling")
+        endRemovedRows()
+        return true
+    }
+
+    /// Ends the batch's removed rows now, without a step; their sessions' caches go with them.
+    private func endRemovedRows() {
+        let rows = batch.rows
+        let gone = Set(rows.indices.filter { rows[$0].removed })
+        guard !gone.isEmpty else { return }
+        for index in gone.sorted() { end(rows[index], reason: .removed, layers: nil) }
+        batch.remove(gone)
+        let keep = rows.indices.filter { !gone.contains($0) }
+        pendingTokens = keep.isEmpty ? nil : pendingTokens?[MLXArray(keep.map(Int32.init))]
     }
 
     // MARK: - Admission and prefill
@@ -631,6 +716,7 @@ public final class ParallelEngine: @unchecked Sendable {
         stats.residentSlots = slots.values.filter { $0.cache != nil }.count
         stats.memory = memory(at: now)
         stats.heldBack = heldBack
+        stats.held = held
         stats.evictions = evictions
         stats.incident = incident?.text
         stats.incidentAt = incident?.at
