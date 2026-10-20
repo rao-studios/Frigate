@@ -291,7 +291,7 @@ Record the **tag**, not a branch — the absence of that record is what made the
 
 | Directory | From | Version | Local patches |
 |---|---|---|---|
-| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.31.1** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86); `io/safetensors.cpp` lays tensors out in key order, so the same tensors always save to the same bytes (`SafetensorsLayoutTests`; upstream follows the map's insertion order, which Swift seeds per process) |
+| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.31.1** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86); `io/safetensors.cpp` lays tensors out in key order, so the same tensors always save to the same bytes (`SafetensorsLayoutTests`; upstream follows the map's insertion order, which Swift seeds per process); `io/gguf.cpp` writes its metadata, tensor infos and tensor data in key order the same way. That file is not built here: `Package.swift` excludes it for `no_gguf.cpp`, gguflib is not vendored, and mlx-c has no GGUF binding. It was checked on 2026-10-19 against gguflib `8fa6eb6`, upstream's pin, in a scratch harness linked to Frigate's Cmlx objects |
 | `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | v0.6.0 | none |
 | `Sources/Cmlx/{json,fmt,metal-cpp}/` | pinned by mlx-swift | json 3.11.3, fmt 12.1.0 | none — these are mlx's own pins, **not** drift |
 | `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.31.6** | none |

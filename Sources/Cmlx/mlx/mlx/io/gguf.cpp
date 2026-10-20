@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -312,8 +313,25 @@ void save_gguf(
     memcpy(val->string, src.c_str(), src.length());
   };
 
+  // Frigate: write the metadata, the tensor infos and the tensor data in key order. The maps
+  // iterate in their insertion order, which follows the caller's (Swift seeds its dictionary order
+  // per process), so the same contents saved twice gave two different files. As in
+  // safetensors.cpp. Not built in Frigate: gguf.cpp is excluded in favour of no_gguf.cpp.
+  auto sorted_keys = [](const auto& map) {
+    std::vector<std::string> keys;
+    keys.reserve(map.size());
+    for (auto& [key, _] : map) {
+      keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+  };
+  const std::vector<std::string> metadata_keys = sorted_keys(metadata);
+  const std::vector<std::string> array_keys = sorted_keys(array_map);
+
   // Save any meta data
-  for (auto& [key, value] : metadata) {
+  for (auto& key : metadata_keys) {
+    auto& value = metadata.at(key);
     if (auto pv = std::get_if<std::string>(&value); pv) {
       const std::string& str = *pv;
       size_t size = sizeof(gguf_string) + str.length();
@@ -414,7 +432,8 @@ void save_gguf(
   uint64_t tensor_offset = 0;
 
   // First, append the tensor info
-  for (auto& [key, arr] : array_map) {
+  for (auto& key : array_keys) {
+    auto& arr = array_map.at(key);
     arr.eval();
 
     // Try to make it row contiguous
@@ -459,7 +478,8 @@ void save_gguf(
   }
 
   // Then, append the tensor weights
-  for (const auto& [key, arr] : array_map) {
+  for (auto& key : array_keys) {
+    const auto& arr = array_map.at(key);
     if (!gguf_append_tensor_data(
             ctx.get(), (void*)arr.data<void>(), arr.nbytes())) {
       throw std::runtime_error("[save_gguf] gguf_append_tensor_data failed");
