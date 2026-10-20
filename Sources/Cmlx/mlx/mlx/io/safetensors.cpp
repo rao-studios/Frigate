@@ -1,6 +1,7 @@
 // Copyright © 2023 Apple Inc.
 //
 #include <json.hpp>
+#include <algorithm>
 #include <memory>
 #include <stack>
 
@@ -193,8 +194,19 @@ void save_safetensors(
     eval(std::move(to_eval));
   }
 
-  size_t offset = 0;
+  // Frigate: lay the tensors out in key order. The map iterates in its insertion order, which
+  // follows the caller's (Swift seeds its dictionary order per process), so the same tensors
+  // saved twice gave two different files. In key order a file's bytes depend only on its contents.
+  std::vector<std::string> keys;
+  keys.reserve(a.size());
   for (auto& [key, arr] : a) {
+    keys.push_back(key);
+  }
+  std::sort(keys.begin(), keys.end());
+
+  size_t offset = 0;
+  for (auto& key : keys) {
+    auto& arr = a.at(key);
     if (arr.nbytes() == 0) {
       throw std::invalid_argument(
           "[save_safetensors] cannot serialize an empty array key: " + key);
@@ -212,7 +224,8 @@ void save_safetensors(
   uint64_t header_len = header.length();
   out_stream->write(reinterpret_cast<char*>(&header_len), 8);
   out_stream->write(header.c_str(), header_len);
-  for (auto& [key, arr] : a) {
+  for (auto& key : keys) {
+    auto& arr = a.at(key);
     out_stream->write(arr.data<char>(), arr.nbytes());
   }
 }
