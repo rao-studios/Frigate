@@ -2,15 +2,18 @@
 //  ManifestPlatformTests.swift
 //  FrigateTests
 //
-//  WHAT: Everything macOS-only in the manifest stays inside `#if !os(Linux)`.
+//  WHAT: Everything macOS-only in the manifest stays inside `#if !os(Linux)`: VisionAX and
+//        its xcframeworks, and SinatraHarness with its CLI and tests.
 //  PIN:  THE LINUX BOX MUST NOT BE THE FIRST TO FIND OUT. `#if os(Linux)` is evaluated
 //        where the manifest is compiled, so a macOS test run cannot execute the Linux
 //        branch — it can only READ it. This reads Package.swift as text (the way Mary's
 //        PackageLayeringTests does) and fails here, on a Mac, the moment VisionAX or its
-//        xcframeworks escape the guard. Totem builds this package on Ubuntu with CUDA,
-//        where an xcframework cannot be resolved at all.
+//        xcframeworks escape the guard, or SinatraHarness does (it has never been built on
+//        Linux). Totem builds this package on Ubuntu with CUDA, where an xcframework cannot
+//        be resolved at all.
 //        AND THE UMBRELLA STAYS CLEAN. VisionAX declares AXNodeSnapshot and friends under
-//        names other packages already use; `import Frigate` must never carry them.
+//        names other packages already use, and SinatraHarness declares Harness, Partition
+//        and OwnerID; `import Frigate` must never carry either.
 //
 
 import Foundation
@@ -61,15 +64,15 @@ struct ManifestPlatformTests {
         let lines = try Self.manifest()
         let guarded = Self.guardedLines(lines)
         // Comments explain the rule and must not be flagged by it.
-        let tokens = ["VisionAX", "FrigateVision", "opencv", "onnxruntime"]
+        let tokens = ["VisionAX", "FrigateVision", "opencv", "onnxruntime", "SinatraHarness", "sinatra-harness"]
         var breaches: [String] = []
         for (index, line) in lines.enumerated() {
             let code = line.components(separatedBy: "//").first ?? line
             guard tokens.contains(where: { code.contains($0) }) else { continue }
             // The `var visionX: [T] = []` declarations are the seam itself: empty on
             // Linux, filled inside the guard. They carry no macOS-only reference.
-            if code.contains("var vision") { continue }
-            if code.contains("+ vision") { continue }
+            if code.contains("var vision") || code.contains("var sinatra") { continue }
+            if code.contains("+ vision") || code.contains("+ sinatra") { continue }
             guard !guarded.contains(index) else { continue }
             breaches.append("\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
         }
@@ -91,15 +94,17 @@ struct ManifestPlatformTests {
         let guardedCode = guarded.map { lines[$0] }.joined(separator: "\n")
         #expect(guardedCode.contains("VisionAX"), "the Linux guard names no macOS-only package")
         #expect(guardedCode.contains("FrigateVisionAX"))
+        #expect(guardedCode.contains("SinatraHarness"), "the Linux guard does not hold SinatraHarness")
     }
 
-    /// The umbrella never re-exports the vision module.
-    @Test func theUmbrellaDoesNotCarryVisionAX() throws {
+    /// The umbrella never re-exports the vision module, nor SinatraHarness.
+    @Test func theUmbrellaCarriesNeitherVisionAXNorSinatraHarness() throws {
         let exports = try String(
             contentsOf: Self.packageRoot
                 .appendingPathComponent("Sources/Frigate/FrigateExports.swift"),
             encoding: .utf8)
         #expect(!exports.contains("VisionAX"))
         #expect(!exports.contains("FrigateVision"))
+        #expect(!exports.contains("SinatraHarness"))
     }
 }

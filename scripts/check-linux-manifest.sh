@@ -32,7 +32,7 @@ if ! JSON=$(docker run --rm -v "$ROOT":/pkg -w /pkg "$IMAGE" \
 fi
 
 fail=0
-for token in VisionAX FrigateVision opencv onnxruntime; do
+for token in VisionAX FrigateVision opencv onnxruntime SinatraHarness sinatra-harness; do
     if grep -qi "$token" <<< "$JSON"; then
         echo "  ✗ the Linux manifest names $token"
         fail=1

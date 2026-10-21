@@ -388,6 +388,58 @@ var imageGenProducts: [Product] = []
     ]
 #endif
 
+// SinatraHarness is the on-device LLM harness: a small time-series side model scores the
+// retrieved context and injects a bias into the logits before sampling; after the reply the
+// output is re-scored with and without its context, and that measurement trains the model.
+// It moved in from the SinatraHarness repository on 2026-10-21 so AII takes one package
+// (SwiftPM refuses two packages that both declare a target of this name).
+// LICENCE: GPL-3.0-ONLY, UNLIKE THE REST OF THIS PACKAGE (MIT). The text is
+//       Sources/SinatraHarness/LICENSE; NOTICE and README say which directories it covers.
+//       A consumer that names the `SinatraHarness` product links GPL code; nothing else here
+//       does, and the `Frigate` umbrella never re-exports it.
+// PIN:  macOS ONLY. It has never been built on Linux (the CLI leans on NSString), so the
+//       targets and the product share one `#if !os(Linux)` block, the FrigateVisionAX
+//       treatment; ManifestPlatformTests and check-linux-manifest.sh pin it. No new
+//       dependency, so no seam for those. THE MODULE KEEPS THE NAME `SinatraHarness`: Sewn
+//       has a class named `Sinatra`, and a module of that name would break its qualified
+//       lookups. `.v5` like MLXLMCommon and MLXLLM: MLXArray is not Sendable.
+var sinatraTargets: [Target] = []
+var sinatraProducts: [Product] = []
+#if !os(Linux)
+    sinatraTargets = [
+        .target(
+            name: "SinatraHarness",
+            dependencies: [
+                "MLX", "MLXNN", "MLXOptimizers", "MLXRandom", "MLXLMCommon",
+                // Links the LLM factory trampoline that MLXLMCommon.loadModel finds by name.
+                "MLXLLM",
+                // HubDownloader / HubTokenizerLoader.
+                "FrigateBridge",
+            ],
+            exclude: ["README.md", "LICENSE", "Fixtures"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The harness from the command line. An executableTarget with no product, like
+        // flux2-cli: `swift build --target sinatra-harness` → .build/debug/sinatra-harness.
+        .executableTarget(
+            name: "sinatra-harness",
+            dependencies: [
+                "SinatraHarness",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "SinatraHarnessTests",
+            dependencies: ["SinatraHarness"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+    ]
+    sinatraProducts = [
+        .library(name: "SinatraHarness", targets: ["SinatraHarness"]),
+    ]
+#endif
+
 // MLXVLM uses AVFoundation, CoreImage, CoreGraphics — macOS/iOS only.
 // On Linux exclude the model files and media processing; keep VLMModel.swift (protocol).
 #if os(Linux)
@@ -517,7 +569,7 @@ let package = Package(
         .library(name: "FrigateParallel", targets: ["FrigateParallel"]),
         .library(name: "mlx_embeddings", targets: ["mlx_embeddings"]),
 
-    ] + visionProducts + imageGenProducts,
+    ] + visionProducts + imageGenProducts + sinatraProducts,
 
     dependencies: [
         .package(url: "https://github.com/apple/swift-numerics", from: "1.0.0"),
@@ -531,7 +583,8 @@ let package = Package(
         // This does not weaken the vendoring rule in README: that rule is about *patched* fork
         // sources, and this is stock upstream C taken at the pin swift-transformers itself uses.
         .package(url: "https://github.com/ibireme/yyjson.git", exact: "0.12.0"),
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),
+        // 1.3: AsyncParsableCommand, which sinatra-harness is built on.
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
     ] + visionDependencies,
@@ -757,7 +810,7 @@ let package = Package(
             dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon", "FrigateBridge", "Hub", "mlx_embeddings"]
                 + visionTestDependencies
         ),
-    ] + visionTargets + imageGenTargets,
+    ] + visionTargets + imageGenTargets + sinatraTargets,
 
     cxxLanguageStandard: .gnucxx20
 )

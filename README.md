@@ -14,6 +14,7 @@ All fork sources are vendored directly — no external URLs for patched librarie
 | `FrigateLLM` | `mlx-community/Qwen3-0.6B-4bit` | Returns `AsyncStream<String>` |
 | `FrigateBoost` | local `.json` file | XGBoost tree-ensemble inference, zero runtime deps |
 | `FrigateVisionAX` | bundled ONNX region classifier | Pixel perception — the VisionAX runtime, hosted here — **macOS only** |
+| `SinatraHarness` | any MLXLLM chat model, e.g. `mlx-community/Mistral-Small-3.2-24B-Instruct-2506-4bit` | The on-device harness: a side model biases the logits toward the retrieved context and learns from the grounding it measures — **macOS only, GPL-3.0-only** |
 
 HuggingFace models are downloaded on first use and cached at `~/.cache/huggingface/`. `FrigateBoost` loads a model exported with `booster.save_model("model.json")` — no `libxgboost` required at runtime.
 
@@ -82,9 +83,60 @@ Two consequences of the dependencies, both benign:
   A plain `swift build` on Linux drops the extra pin with a warning and rewrites the file —
   which is why the Linux scripts do not pass `--force-resolved-versions`.
 
-Because Frigate now carries a path dependency, **a consumer must take Frigate by path too**
-(`.package(path: "../Frigate")`): SwiftPM refuses a package required by URL that itself
-depends on a local package.
+VisionAX is taken by URL (`rao-studios/VisionAX`, branch `main`), so Frigate carries no path
+dependency of its own and **a consumer may take Frigate by URL** —
+`.package(url: "https://github.com/rao-studios/Frigate.git", branch: "main")`, as AII does — or
+by path while iterating on it.
+
+---
+
+## SinatraHarness — the on-device harness (GPL-3.0-only)
+
+The **`SinatraHarness`** product and module is an on-device LLM harness for Apple silicon with an
+injection layer between the transformer and the decoder. When a turn is answered with retrieved
+context, only that context is encoded with the model's own embedding table and read by a small
+time-series side model; its weights become a bias added to the logits right before sampling.
+After each turn the output is re-scored with and without its context, and that grounding
+measurement labels the turn and trains the side model. One model stays resident and one
+generation runs at a time.
+
+```swift
+import SinatraHarness
+
+let harness = Harness(storeDirectory: storeURL)
+try await harness.load(modelID: "mlx-community/Mistral-Small-3.2-24B-Instruct-2506-4bit")
+
+let handle = try await harness.generate(GenerateRequest(
+    input: UserInput(chat: [.system(systemWithContext), .user(userText)]),
+    parameters: GenerateParameters(maxTokens: 400, temperature: 0.4, topP: 0.9),
+    turn: TurnInput(owner: OwnerID(userId), retrieved: partitions),
+    bareInput: UserInput(chat: [.system(systemWithoutContext), .user(userText)])))
+for await event in handle.stream { /* .chunk / .toolCall / .info, as MLXLMCommon.generate */ }
+let completion = await handle.completion.value
+```
+
+The theory, the integration guide (Sewn's `local` provider in AII is the reference) and the CLI
+are in [`Sources/SinatraHarness/README.md`](Sources/SinatraHarness/README.md).
+
+Things worth knowing:
+
+- **It is GPL-3.0-only, unlike the rest of this package (MIT).** The text is
+  `Sources/SinatraHarness/LICENSE`; `NOTICE` names the three directories it covers. Naming the
+  `SinatraHarness` product links GPL code, and the linking work is subject to the GPL. Nothing
+  else here depends on it.
+- **macOS only.** The targets and the product share one `#if !os(Linux)` block in
+  `Package.swift` (`sinatraTargets`), the FrigateVisionAX treatment; `ManifestPlatformTests` and
+  `scripts/check-linux-manifest.sh` pin it.
+- **Not in the `Frigate` umbrella, and the module keeps its name.** `import Frigate` never
+  carries `Harness`, `Partition` or `OwnerID`; and the module stays `SinatraHarness` because
+  Sewn has a class named `Sinatra`, and a module of that name would break its qualified lookups.
+- **It moved here from the SinatraHarness repository on 2026-10-21.** A consumer that took
+  `.product(name: "SinatraHarness", package: "SinatraHarness")` now writes
+  `.product(name: "SinatraHarness", package: "Frigate")` and drops the second package.
+- **The CLI** builds with `swift build --target sinatra-harness` (no product; like `flux2-cli`),
+  needs `./scripts/build-metallib.sh debug` once, and runs as `.build/debug/sinatra-harness …`.
+- **Tests**: `swift test --filter SinatraHarnessTests` runs the pure-Swift suites;
+  `./scripts/test-mlx.sh --filter SinatraHarnessTests` adds the MLX-gated ones.
 
 ## Requirements
 
@@ -225,6 +277,10 @@ both. Consumers should call it rather than keeping their own copy — `Bonnie`, 
 ./scripts/build-metallib.sh release --package ../Thread   # or, from Thread: ./build-metallib.sh release
 ```
 
+`scripts/test-mlx.sh` runs the tests with the MLX-gated suites on: it strips each test bundle's
+metallib (a copy made before the build breaks the bundle's signature), builds, installs a fresh
+copy beside every binary and bundle, and runs `swift test --skip-build` with `FRIGATE_MLX_TESTS=1`.
+
 ---
 
 ## API reference
@@ -305,6 +361,7 @@ Record the **tag**, not a branch — the absence of that record is what made the
 | `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
 | `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |
 | `Sources/FrigateVisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/FrigateVisionAX/README.md` |  |  |
+| `Sources/SinatraHarness/`, `Sources/sinatra-harness/` | This package — the on-device harness and its CLI (moved in from the SinatraHarness repository, 2026-10); **GPL-3.0-only**, see `Sources/SinatraHarness/LICENSE` and `NOTICE` |  |  |
 
 **mlx C++ is deliberately held at 0.31.1.** v0.32.2 exists, but every mlx-swift release through
 0.31.6 defines `MLX_VERSION` as `"0.31.1"` (see `Package.swift`), so bumping the C++ core would
@@ -332,6 +389,8 @@ literal: `Hub`, `Tokenizers`, `Models`, `MLXLMCommon`, `MLXLLM`, `MLXVLM`.
 **Three targets leave the Linux graph entirely**, alongside `FrigateVisionAX`: `ObscurKit`,
 `FluxKit` and `flux2-cli`. `ObscurDinov2` decodes a `CGImage` through CGContext/CGColorSpace and
 the other two follow it in; no consumer takes them. See `imageGenTargets` in `Package.swift`.
+`SinatraHarness`, `sinatra-harness` and `SinatraHarnessTests` leave it too (`sinatraTargets`):
+the harness has never been built on Linux.
 
 **The CPU-only Linux build (`SPM_CUDA=0`) was broken before the 2026-09 audit** and is now fixed.
 Its exclude lists had drifted: `GPU+CUDA.swift` (a portable stub that is the only definition of

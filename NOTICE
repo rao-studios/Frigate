@@ -1,0 +1,40 @@
+Frigate — the vendored MLX stack
+Copyright 2026 Rao Studios LLC
+
+This product includes software developed at Rao Studios.
+
+Frigate is licensed under the MIT License (see the LICENSE file beside this
+one), with one exception, below.
+
+--------------------------------------------------------------------------------
+The exception: SinatraHarness is GPL-3.0-only
+--------------------------------------------------------------------------------
+
+Everything under these three directories is licensed under the GNU General
+Public License, Version 3 only, not MIT:
+
+    Sources/SinatraHarness/        the on-device LLM harness (the `SinatraHarness` product)
+    Sources/sinatra-harness/       its command line (the `sinatra-harness` target)
+    Tests/SinatraHarnessTests/     its tests
+
+The licence text is Sources/SinatraHarness/LICENSE, or
+
+    https://www.gnu.org/licenses/gpl-3.0.html
+
+That code moved here from https://github.com/riteshpakala/SinatraHarness in
+October 2026, carrying its licence with it. A consumer that names the
+`SinatraHarness` product links GPL-licensed code, and the linking work is
+subject to the GPL's terms. Nothing else in this package depends on it, and the
+`Frigate` umbrella module never re-exports it, so a consumer that does not name
+that product takes only MIT-licensed code from this repository.
+
+--------------------------------------------------------------------------------
+What is vendored
+--------------------------------------------------------------------------------
+
+The sources under Sources/ copied from other projects (mlx, mlx-c, mlx-swift,
+swift-transformers, swift-huggingface, swift-jinja, EventSource, mlx-swift-lm,
+mlx.embeddings, and the json, fmt and metal-cpp pins) keep their own licences
+and copyright notices, which travel with the files. The README's "Vendored
+sources" table records where each came from, at which version, and what was
+changed.
