@@ -77,9 +77,9 @@ private class NemotronHRMSNormGated: Module {
         let unflattened = states.reshaped(newShape)
 
         // Python: x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        // Apply RMS norm per group WITHOUT scaling (pass ones as weight)
-        // Swift rmsNorm doesn't accept nil, so we use identity weight
-        let identityWeight = MLXArray.ones([groupSize])
+        // Swift rmsNorm doesn't accept nil. The identity must use the input
+        // dtype, or the result promotes to float32.
+        let identityWeight = MLXArray.ones([groupSize], dtype: unflattened.dtype)
         let normed = MLXFast.rmsNorm(unflattened, weight: identityWeight, eps: eps)
 
         // Python: return self.weight * x.flatten(-2)
@@ -503,6 +503,10 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "gate") var gate: NemotronHMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: NemotronHSwitchMLP
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
+    // LatentMoE (Nemotron 3 Super): routed experts run in a smaller latent space,
+    // projected down before them and back up after. Ported from upstream mlx-swift-lm.
+    @ModuleInfo(key: "fc1_latent_proj") var fc1LatentProj: Linear?
+    @ModuleInfo(key: "fc2_latent_proj") var fc2LatentProj: Linear?
 
     init(_ args: NemotronHConfiguration) {
         self.numExpertsPerTok = args.numExpertsPerTok
@@ -510,10 +514,15 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
         self._switchMLP.wrappedValue = NemotronHSwitchMLP(
-            inputDims: args.hiddenSize,
+            inputDims: args.moeLatentSize ?? args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.nRoutedExperts
         )
+
+        if let latent = args.moeLatentSize {
+            self._fc1LatentProj.wrappedValue = Linear(args.hiddenSize, latent, bias: args.mlpBias)
+            self._fc2LatentProj.wrappedValue = Linear(latent, args.hiddenSize, bias: args.mlpBias)
+        }
 
         if hasSharedExperts {
             self._sharedExperts.wrappedValue = NemotronHMLP(
@@ -527,8 +536,12 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
+        let expertInput = fc1LatentProj.map { $0(x) } ?? x
+        var y = switchMLP(expertInput, inds)
         y = weightedExpertSum(y, scores).asType(y.dtype)
+        if let fc2LatentProj {
+            y = fc2LatentProj(y)
+        }
 
         if let sharedExperts {
             y = y + sharedExperts(x)
@@ -757,7 +770,8 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
 
-        for (key, value) in weights {
+        // Multi-token-prediction heads are not run here.
+        for (key, value) in weights where !key.hasPrefix("mtp.") {
             var finalValue = value
 
             // Handle conv1d weight axis swap
@@ -816,6 +830,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var nRoutedExperts: Int
     public var nSharedExperts: Int?
     public var numExpertsPerTok: Int
+    public var moeLatentSize: Int?
     public var hybridOverridePattern: String
     public var layerNormEpsilon: Float
     public var mlpBias: Bool
@@ -851,6 +866,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case nRoutedExperts = "n_routed_experts"
         case nSharedExperts = "n_shared_experts"
         case numExpertsPerTok = "num_experts_per_tok"
+        case moeLatentSize = "moe_latent_size"
         case hybridOverridePattern = "hybrid_override_pattern"
         case layerNormEpsilon = "layer_norm_epsilon"
         case mlpBias = "mlp_bias"
@@ -890,6 +906,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
         numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         layerNormEpsilon =
             try container.decodeIfPresent(Float.self, forKey: .layerNormEpsilon) ?? 1e-5
         mlpBias = try container.decodeIfPresent(Bool.self, forKey: .mlpBias) ?? false
@@ -965,7 +982,8 @@ public struct NemotronHConfiguration: Codable, Sendable {
         normTopkProb: Bool = true,
         routedScalingFactor: Float = 1.0,
         timeStepLimitMin: Float = 0.0,
-        timeStepLimitMax: Float = .infinity
+        timeStepLimitMax: Float = .infinity,
+        moeLatentSize: Int? = nil
     ) {
         self.modelType = "nemotron_h"
         self.vocabSize = vocabSize
@@ -986,6 +1004,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.nRoutedExperts = nRoutedExperts
         self.nSharedExperts = nSharedExperts
         self.numExpertsPerTok = numExpertsPerTok
+        self.moeLatentSize = moeLatentSize
         self.hybridOverridePattern = hybridOverridePattern
         self.layerNormEpsilon = layerNormEpsilon
         self.mlpBias = mlpBias
