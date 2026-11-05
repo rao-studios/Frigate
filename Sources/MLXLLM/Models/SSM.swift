@@ -67,14 +67,113 @@ private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
     )
 }
 
+/// The prefill scan as one kernel: the one-token kernel above with the prompt's steps looped inside it, so each lane
+/// keeps its Ds/32 state values in registers from the first token to the last. Same recurrence as `ssmAttn`:
+///
+///     h_t = exp(dt_t * A) * h_{t-1} + dt_t * x_t * B_t        y_t = C_t . h_t + D * x_t
+///
+/// PIN: `ssmAttn` builds the chunked SSD form instead: per 256-token step and head, a 256 x 256 decay matrix and a
+/// "surrogate attention" matrix, a dozen dispatches. On Nemotron 3 Super's layer 0 at 2,048 tokens that was 17.2 ms
+/// against this kernel's 4.7 ms, with y within 0.3% and the carried state within 0.2% (bf16), and the model's greedy
+/// tokens unchanged (prototyped over mlx-lm, 2026-11-04). The scan is about a quarter of a Mamba-2 layer's prefill;
+/// the projections around it are the rest.
+private func makeSSMScanKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            auto n = thread_position_in_grid.z;          // batch * H + head
+            auto b_idx = n / H;
+            auto h_idx = n % H;
+            auto g_idx = h_idx / G;                      // G heads share one group of B and C
+            constexpr int n_per_t = Ds / 32;
+            constexpr int NG = H / G;
+            auto ds_idx = thread_position_in_threadgroup.x;
+            auto d_idx = thread_position_in_grid.y;
+
+            auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+            auto Dv = static_cast<float>(D[h_idx]);
+            float s[n_per_t];
+            auto i_state = state_in + (n * Dh + d_idx) * Ds;
+            for (int i = 0; i < n_per_t; ++i) { s[i] = static_cast<float>(i_state[n_per_t * ds_idx + i]); }
+
+            for (int t = 0; t < L; ++t) {
+                auto row = b_idx * L + t;
+                auto dt_ = static_cast<float>(dt[row * H + h_idx]);
+                auto dA = fast::exp(A * dt_);
+                auto x_ = static_cast<float>(X[(row * H + h_idx) * Dh + d_idx]);
+                auto B_ = B + (row * NG + g_idx) * Ds;
+                auto C_ = C + (row * NG + g_idx) * Ds;
+                float acc = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    s[i] = dA * s[i] + x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    acc += s[i] * static_cast<float>(C_[s_idx]);
+                }
+                acc = simd_sum(acc);
+                if (thread_index_in_simdgroup == 0) {
+                    out[(row * H + h_idx) * Dh + d_idx] = static_cast<T>(acc + x_ * Dv);
+                }
+            }
+            auto o_state = state_out + (n * Dh + d_idx) * Ds;
+            for (int i = 0; i < n_per_t; ++i) { o_state[n_per_t * ds_idx + i] = static_cast<U>(s[i]); }
+        """
+
+    return MLXFast.metalKernel(
+        name: "ssm_scan_kernel",
+        inputNames: ["X", "A_log", "B", "C", "D", "dt", "state_in"],
+        outputNames: ["out", "state_out"],
+        source: source
+    )
+}
+
 private final class SSMKernelManager: Sendable {
     static let shared = SSMKernelManager()
 
     let ssmKernel: MLXFast.MLXFastKernel?
+    /// The fused prefill scan; nil when `FRIGATE_SSM_SCAN=0` asks for `ssmAttn` everywhere (for A/B checks).
+    let scanKernel: MLXFast.MLXFastKernel?
 
     private init() {
         ssmKernel = makeSSMKernel()
+        scanKernel = ProcessInfo.processInfo.environment["FRIGATE_SSM_SCAN"] == "0" ? nil : makeSSMScanKernel()
     }
+}
+
+/// `ssmAttn`'s contract for one prompt (no padding mask, no per-row lengths) in one dispatch: y `[b, l, h, dh]` in the
+/// input's dtype, and the state after the last token. Nil when the shapes do not suit it (the state width must be a
+/// multiple of 32, the SIMD width it is spread over) or the kernel is off; the caller then takes `ssmAttn`.
+func ssmScanKernel(
+    hiddenStates: MLXArray,
+    ALog: MLXArray,
+    B: MLXArray,
+    C: MLXArray,
+    D: MLXArray,
+    dt: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray?,
+    timeStepLimit: (Float, Float)
+) -> (MLXArray, MLXArray)? {
+    guard let kernel = SSMKernelManager.shared.scanKernel else { return nil }
+    let (b, l, h, dh) = hiddenStates.shape4
+    let (g, ds) = (B.dim(-2), B.dim(-1))
+    guard ds % 32 == 0, g > 0, h % g == 0 else { return nil }
+    let dt = computeDt(dt, dtBias, timeStepLimit)
+    let state = state ?? MLXArray.zeros([b, h, dh, ds], dtype: .float32)
+    let outputs = kernel(
+        [hiddenStates, ALog, B, C, D, dt, state],
+        template: [
+            ("T", hiddenStates.dtype),
+            ("U", state.dtype),
+            ("Dh", dh),
+            ("Ds", ds),
+            ("H", h),
+            ("G", h / g),
+            ("L", l),
+        ],
+        grid: (32, dh, h * b),
+        threadGroup: (32, 8, 1),
+        outputShapes: [hiddenStates.shape, state.shape],
+        outputDTypes: [hiddenStates.dtype, state.dtype]
+    )
+    return (outputs[0], outputs[1])
 }
 
 func ssmUpdateKernel(
@@ -283,6 +382,13 @@ public func ssmUpdate(
             state: state,
             timeStepLimit: timeStepLimit
         )
+    } else if mask == nil, lengths == nil,
+        let fused = ssmScanKernel(
+            hiddenStates: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
+            state: state, timeStepLimit: timeStepLimit)
+    {
+        // One prompt: the fused scan. A padded batch keeps the chunked form, which masks.
+        return fused
     } else {
         return ssmAttn(
             x: hiddenStates,
