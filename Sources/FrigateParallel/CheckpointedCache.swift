@@ -15,6 +15,12 @@
 //  PIN:  The cache's position is the offset of a KV layer. A recurrent layer's `offset` never
 //        moves (`ArraysCache.advance` touches lengths and padding only), so reading
 //        `layers.first` on a hybrid model always says 0.
+//  PIN:  A turn boundary is PINNED, outside the ring. A chat template that drops an older turn's reasoning
+//        (Qwen3.5: `<think>` only after the last user query) re-renders the previous turn differently
+//        once the next one is asked, so the next turn shares the prompt only up to the end of the
+//        previous ask. Every round of that turn snapshots, and a four-slot ring had dropped the ask's
+//        point by round five: each follow-up prefilled 30–40k tokens from zero (Craft, 2026-11-05).
+//        One pinned snapshot per cache, replaced by the next pin, invalidated like any other.
 //  PIN:  `release` and `adopt` hand the layers to the parallel engine's batch and back. While they are
 //        out, the snapshots stay here, and nothing here references the buffers the batch writes.
 
@@ -32,6 +38,10 @@ public final class CheckpointedCache {
     public private(set) var layers: [KVCache]
     /// Newest last; at most `ring`.
     public private(set) var snapshots: [Snapshot] = []
+    /// The last turn boundary, kept outside the ring (`snapshot(at:pinned:)`).
+    public private(set) var pinned: Snapshot?
+    /// Every snapshot held, the pinned one included: what memory pressure can drop.
+    public var snapshotCount: Int { snapshots.count + (pinned == nil ? 0 : 1) }
     public let ring: Int
     /// Recurrent layers, by index: snapshot-able, never trimmable.
     private var recurrent: [Int: ArraysCache] = [:]
@@ -78,7 +88,7 @@ public final class CheckpointedCache {
 
     /// What the snapshots hold.
     public var snapshotBytes: Int {
-        snapshots.flatMap { $0.recurrent.values.flatMap { $0 } }.reduce(0) { $0 + $1.nbytes }
+        (snapshots + (pinned.map { [$0] } ?? [])).flatMap { $0.recurrent.values.flatMap { $0 } }.reduce(0) { $0 + $1.nbytes }
     }
 
     /// Whether `rewind` can ever succeed.
@@ -88,8 +98,9 @@ public final class CheckpointedCache {
     public var isFullyTrimmable: Bool { opaque == 0 && recurrent.isEmpty }
 
     /// Remembers the recurrent layers as they stand with `tokenCount` tokens in the cache.
-    /// Taken right after a prompt has been prefilled, before the first generated token.
-    public func snapshot(at tokenCount: Int) {
+    /// Taken right after a prompt has been prefilled, before the first generated token — or, `pinned`,
+    /// where a turn's ask ends, kept outside the ring until the next pin replaces it.
+    public func snapshot(at tokenCount: Int, pinned pin: Bool = false) {
         guard !recurrent.isEmpty, canRewind else { return }
         var state: [Int: [MLXArray]] = [:]
         for (index, layer) in recurrent {
@@ -99,8 +110,14 @@ public final class CheckpointedCache {
             state[index] = arrays
         }
         snapshots.removeAll { $0.tokenCount >= tokenCount }
-        snapshots.append(Snapshot(tokenCount: tokenCount, recurrent: state))
-        if snapshots.count > ring { snapshots.removeFirst(snapshots.count - ring) }
+        if let kept = pinned, kept.tokenCount >= tokenCount { pinned = nil }
+        let taken = Snapshot(tokenCount: tokenCount, recurrent: state)
+        if pin {
+            pinned = taken
+        } else {
+            snapshots.append(taken)
+            if snapshots.count > ring { snapshots.removeFirst(snapshots.count - ring) }
+        }
     }
 
     /// Rewinds to exactly `target` when every layer trims by position, otherwise to the newest
@@ -115,18 +132,26 @@ public final class CheckpointedCache {
             trim(by: current - count)
             return count
         }
-        guard let snapshot = snapshots.last(where: { $0.tokenCount <= target }), snapshot.tokenCount <= current else { return nil }
+        let candidates = (pinned.map { [$0] } ?? []) + snapshots
+        guard let snapshot = candidates.filter({ $0.tokenCount <= target }).max(by: { $0.tokenCount < $1.tokenCount }),
+              snapshot.tokenCount <= current else { return nil }
         for (index, arrays) in snapshot.recurrent {
             recurrent[index]?.state = arrays
         }
         trim(by: current - snapshot.tokenCount)
         snapshots.removeAll { $0.tokenCount > snapshot.tokenCount }
+        if let kept = pinned, kept.tokenCount > snapshot.tokenCount { pinned = nil }
         return snapshot.tokenCount
     }
 
-    /// Drops the oldest snapshot: a rewind can then reach only the newer ones. False when none is kept.
+    /// Drops the oldest snapshot, the pinned one included: a rewind can then reach only the newer ones. False when
+    /// none is kept.
     @discardableResult
     public func dropOldestSnapshot() -> Bool {
+        if let kept = pinned, snapshots.first.map({ kept.tokenCount <= $0.tokenCount }) ?? true {
+            pinned = nil
+            return true
+        }
         guard !snapshots.isEmpty else { return false }
         snapshots.removeFirst()
         return true
@@ -148,6 +173,7 @@ public final class CheckpointedCache {
         classify()
         let now = position
         snapshots.removeAll { $0.tokenCount > now }
+        if let kept = pinned, kept.tokenCount > now { pinned = nil }
     }
 
     private func trim(by n: Int) {

@@ -66,11 +66,13 @@ public final class ParallelEngine: @unchecked Sendable {
         let layers: [KVCache]
         let slotCache: CheckpointedCache?
         let suffix: [Int]
+        /// Where in `suffix` the turn boundary ends, when it is inside it and a slot keeps the cache.
+        let pin: Int?
         var done = 0
         let startedAt = Date()
 
-        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int]) {
-            self.row = row; self.layers = layers; self.slotCache = slotCache; self.suffix = suffix
+        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int], pin: Int? = nil) {
+            self.row = row; self.layers = layers; self.slotCache = slotCache; self.suffix = suffix; self.pin = pin
         }
         var isDone: Bool { done >= suffix.count }
     }
@@ -420,7 +422,9 @@ public final class ParallelEngine: @unchecked Sendable {
         }
         row.reused = prefix
         row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init)))
-        prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]))
+        // A boundary the cache already holds, or the prompt's very end, needs no pin of its own.
+        let pin = row.request.pinAt.flatMap { at in slotCache != nil && at > prefix && at < row.request.tokens.count ? at - prefix : nil }
+        prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]), pin: pin)
     }
 
     private func prefillChunk(_ job: PrefillJob) {
@@ -430,7 +434,9 @@ public final class ParallelEngine: @unchecked Sendable {
             end(row, reason: .removed, layers: nil)
             return
         }
-        let upTo = min(job.done + prefillChunkSize, job.suffix.count)
+        var upTo = min(job.done + prefillChunkSize, job.suffix.count)
+        // A chunk ends at the turn boundary, so the cache stands exactly there once.
+        if let pin = job.pin, job.done < pin, upTo > pin { upTo = pin }
         let piece = Array(job.suffix[job.done ..< upTo])
         let last = upTo == job.suffix.count
         if !piece.isEmpty {
@@ -440,6 +446,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.pending = sample(logits: logits[0..., -1, 0...], row: row)
             } else {
                 eval(job.layers.flatMap { $0.innerState() })
+                if let pin = job.pin, upTo == pin { job.slotCache?.snapshot(at: row.reused + pin, pinned: true) }
             }
         } else if last {
             // Nothing to prefill (an exact repeat): the last prompt token is fed as the first step.
@@ -665,9 +672,9 @@ public final class ParallelEngine: @unchecked Sendable {
         while idleSlotBytes > policy.slotBudgetBytes, evictLeastRecentlyUsed() { freed = true }
         while slots.values.compactMap(\.cache).reduce(0, { $0 + $1.snapshotBytes }) > policy.snapshotBudgetBytes {
             // The oldest snapshot of the session with the most, then of the least recently used.
-            let holders = slots.values.filter { ($0.cache?.snapshots.count ?? 0) > 0 }
+            let holders = slots.values.filter { ($0.cache?.snapshotCount ?? 0) > 0 }
             guard let holder = holders.max(by: { a, b in
-                (a.cache?.snapshots.count ?? 0, b.lastUsed) < (b.cache?.snapshots.count ?? 0, a.lastUsed)
+                (a.cache?.snapshotCount ?? 0, b.lastUsed) < (b.cache?.snapshotCount ?? 0, a.lastUsed)
             }), holder.cache?.dropOldestSnapshot() == true else { break }
             freed = true
         }
@@ -771,7 +778,7 @@ public final class ParallelEngine: @unchecked Sendable {
         for (id, slot) in slots {
             guard let cache = slot.cache else { continue }
             let stat = SlotStat(slot: id, tokens: slot.tokens.count, kvBytes: cache.kvBytes, recurrentBytes: cache.recurrentBytes,
-                                snapshots: cache.snapshots.count, snapshotBytes: cache.snapshotBytes,
+                                snapshots: cache.snapshotCount, snapshotBytes: cache.snapshotBytes,
                                 inFlight: slot.inFlight != nil, lastUsed: slot.lastUsed)
             memory.kvBytes += stat.kvBytes
             memory.recurrentBytes += stat.recurrentBytes

@@ -36,11 +36,14 @@ public struct StreamRequest: Sendable {
     public var label: String
     /// The session's cache to continue and leave for the next round; nil runs on a cache of its own.
     public var slot: SlotID?
+    /// Where the prompt's turn boundary ends (the end of the person's message): prefill stops there once and pins a
+    /// snapshot the next turn can rewind to (`CheckpointedCache.snapshot(at:pinned:)`). Nil pins nothing.
+    public var pinAt: Int?
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
-                priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil) {
+                priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
-        self.priority = priority; self.label = label; self.slot = slot
+        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt
     }
 }
 
