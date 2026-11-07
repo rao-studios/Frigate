@@ -1,0 +1,14 @@
+# WHAT: Where git-lfs fetches this repository's models and fixtures (see .gitattributes).
+# PIN:  NAMED, NOT DERIVED. SwiftPM and Xcode check Frigate out from a bare mirror of their own, so git-lfs would
+#       derive the mirror as the endpoint, and a mirror holds no LFS objects: an Xcode resolve of Craft failed on
+#       "remote missing object", with 2,184 files staged as deleted (2026-11-07). Frigate is public, so this is read
+#       anonymously.
+# PIN:  ":443" ON PURPOSE. A machine that rewrites https://github.com/rao-studios/ to SSH (url.*.insteadOf, for the
+#       private repositories) would turn the usual form into an SSH path ending in /info/lfs, which GitHub refuses; the
+#       explicit port is the same HTTPS endpoint and no such rewrite matches it. Verified both ways with a bare mirror
+#       that holds no objects.
+# PIN:  PUSHES GO OVER SSH. Uploading a model needs credentials the anonymous HTTPS endpoint has none of; a maintainer's
+#       SSH key answers git-lfs-authenticate.
+[lfs]
+	url = https://github.com:443/rao-studios/Frigate.git/info/lfs
+	pushurl = git@github.com:rao-studios/Frigate.git
