@@ -6,9 +6,14 @@
 //  OUT:  StreamEvent per stream: admitted, token…, finished. ParallelStats for the agent map.
 //  PIN:  Every MLX evaluation in this engine happens on its one thread. Arrays never cross it:
 //        tokens leave as integers, stats as values, and a stream's cache lives here between rounds.
-//        Decode and prefill interleave on the same thread — one decode step, then one prefill
-//        chunk — so a long prompt joining never stalls the rows already decoding for more than a
-//        chunk, and the rows never starve the prompt.
+//        Decode and prefill share that thread by time, not by turns: each pass `InterleavePolicy`
+//        says whether the rows take a step or the prompt a chunk, and how big, from what the last
+//        ones took. A prompt joining stalls the rows for one chunk sized to a few of their steps at
+//        most, and the rows never starve the prompt.
+//  PIN:  A prompt someone waits on is never held behind one no one does. A request of higher
+//        priority sets the prompt being read aside, as it stands, layers and progress kept, and that
+//        prompt reads on once nothing above it waits (`admit`). Before, a worker's prompt or a warm
+//        held every request behind it until its last chunk.
 //  PIN:  Rows are decoded as one forward pass: B tokens in, B logits out. That is the whole point.
 //        Independent generations only split the GPU's bandwidth (measured 2026-10-15: two streams
 //        34 + 34 tok/s against 67 alone); one batched step reads the weights once for all rows.
@@ -25,10 +30,14 @@ public final class ParallelEngine: @unchecked Sendable {
     public struct Configuration: Sendable {
         /// Rows decoded together at most; what the batch admits before a request waits.
         public var maxRows = 4
-        /// Prompt tokens prefilled per chunk between decode steps.
+        /// Prompt tokens read in one chunk at most, and the chunk a prompt is read in when no row decodes.
         public var prefillChunk = 256
-        /// Decode steps between two prefill chunks (1: strictly alternate).
-        public var decodeStepsPerChunk = 1
+        /// The share of the engine's time a prompt being read takes from rows of its own priority decoding beside it
+        /// (`InterleavePolicy.even`), and from rows someone waits on more (`yielding`).
+        public var prefillShare = 0.5
+        public var yieldingPrefillShare = 0.2
+        /// The smallest chunk a prompt beside decoding rows is read in.
+        public var minPrefillChunk = 32
         /// How many recurrent-state snapshots a slot keeps.
         public var checkpointRing = 4
         /// What the engine may hold, and what it does past it.
@@ -90,12 +99,16 @@ public final class ParallelEngine: @unchecked Sendable {
     // Engine-thread state.
     private var queue: [Row] = []
     private var prefill: PrefillJob?
+    /// Prompts set aside mid-read for a request someone waits on more, in the order they read on: priority, then age.
+    private var suspended: [PrefillJob] = []
+    /// How a pass is shared between the rows and the prompt being read, and what the engine's time went to.
+    private var interleave: InterleavePolicy
+    private var clock = InterleavePolicy.Clock()
     private var batch: GenerationBatch
     private var slots: [SlotID: Slot] = [:]
     /// The last step's samples, one per row and aligned with `batch.rows`: fed at the next step and
     /// read then, while that step runs — the pipelining `TokenIterator` does for one sequence.
     private var pendingTokens: MLXArray?
-    private var stepsSinceChunk = 0
     private var lastStepAt: Date?
     private var lastStepSeconds: TimeInterval = 0
     private var rateWindow: [(at: Date, tokens: Int)] = []
@@ -126,6 +139,8 @@ public final class ParallelEngine: @unchecked Sendable {
         maxRows = max(1, configuration.maxRows)
         prefillChunkSize = max(1, configuration.prefillChunk)
         policy = configuration.memory
+        interleave = InterleavePolicy(even: configuration.prefillShare, yielding: configuration.yieldingPrefillShare,
+                                      minChunk: configuration.minPrefillChunk, maxChunk: prefillChunkSize)
         layout = try CacheLayout(sample: model.newCache(parameters: nil))
         batch = GenerationBatch(layout: layout)
         let runner = Thread { [self] in self.loop() }
@@ -207,7 +222,7 @@ public final class ParallelEngine: @unchecked Sendable {
         while true {
             // Commands first; sleep only when there is nothing to do.
             condition.lock()
-            while commands.isEmpty && queue.isEmpty && prefill == nil && batch.isEmpty && running {
+            while commands.isEmpty && queue.isEmpty && prefill == nil && suspended.isEmpty && batch.isEmpty && running {
                 condition.wait()
             }
             let pending = commands
@@ -227,20 +242,27 @@ public final class ParallelEngine: @unchecked Sendable {
 
             // PIN: contained. An MLX error on this thread — an allocation that failed — used to end the
             // process. Under `withError` it ends the rows it hit, failed, and the engine goes on.
-            if !batch.isEmpty, prefill == nil || stepsSinceChunk < configuration.decodeStepsPerChunk {
-                do { try withError { decodeStep() } } catch { failBatch("decoding failed: \(error)") }
-                stepsSinceChunk += 1
-            }
             admit()
-            if let job = prefill {
-                do { try withError { prefillChunk(job) } } catch { failPrefill(job, "prefill failed: \(error)") }
-                stepsSinceChunk = 0
+            switch nextWork() {
+            case .step?:
+                let began = Date()
+                do { try withError { decodeStep() } } catch { failBatch("decoding failed: \(error)") }
+                clock.stepped(seconds: Date().timeIntervalSince(began))
+            case .chunk(let tokens)?:
+                guard let job = prefill else { break }
+                let began = Date(), before = job.done
+                do { try withError { prefillChunk(job, tokens: tokens) } } catch { failPrefill(job, "prefill failed: \(error)") }
+                if job.done > before { clock.read(tokens: job.done - before, seconds: Date().timeIntervalSince(began)) }
+            case nil:
+                break
             }
             publishStats()
         }
         // Shut down: every stream still here ends.
         for row in queue { end(row, reason: .removed, layers: nil) }
         if let job = prefill { end(job.row, reason: .removed, layers: nil) }
+        for job in suspended { end(job.row, reason: .removed, layers: nil) }
+        suspended.removeAll()
         for (index, row) in batch.rows.enumerated().reversed() { end(row, reason: .removed, layers: batch.extract(row: index)) }
         batch.remove(Set(batch.rows.indices))
         pendingTokens = nil
@@ -252,6 +274,10 @@ public final class ParallelEngine: @unchecked Sendable {
     private func apply(_ command: Command) {
         switch command {
         case .insert(let row):
+            guard !row.request.prefillOnly || row.slot != nil else {
+                end(row, reason: .failed, layers: nil, message: "a prompt read only to be kept needs a slot to keep it in")
+                return
+            }
             guard queue.count < policy.maxQueued else {
                 end(row, reason: .failed, layers: nil, message: "the engine already has \(queue.count) requests waiting")
                 return
@@ -264,13 +290,9 @@ public final class ParallelEngine: @unchecked Sendable {
                 end(row, reason: .removed, layers: nil)
             } else if let job = prefill, job.row.id == id {
                 prefill = nil
-                // What was prefilled stays with the slot: the next round starts from there.
-                if let cache = job.slotCache {
-                    let kept = cache.position
-                    cache.snapshot(at: kept)
-                    settle(job.row, layers: nil, keptTokens: Array(job.row.request.tokens.prefix(kept)))
-                }
-                end(job.row, reason: .removed, layers: nil)
+                stopReading(job)
+            } else if let index = suspended.firstIndex(where: { $0.row.id == id }) {
+                stopReading(suspended.remove(at: index))
             } else if let row = batch.rows.first(where: { $0.id == id }) {
                 row.removed = true
             }
@@ -281,7 +303,11 @@ public final class ParallelEngine: @unchecked Sendable {
             policy.clearCache()
         case .setLimits(let rows, let chunk):
             if let rows { maxRows = max(1, rows) }
-            if let chunk { prefillChunkSize = max(1, chunk) }
+            if let chunk {
+                prefillChunkSize = max(1, chunk)
+                interleave = InterleavePolicy(even: interleave.even, yielding: interleave.yielding,
+                                              minChunk: configuration.minPrefillChunk, maxChunk: prefillChunkSize)
+            }
         case .setPolicy(let next):
             policy = next
             enforceSlotBudget()
@@ -373,21 +399,34 @@ public final class ParallelEngine: @unchecked Sendable {
 
     // MARK: - Admission and prefill
 
+    /// Starts reading the next prompt: the first request that may start, unless a prompt set aside comes before it.
+    ///
+    /// PIN: a request someone waits on more than on the prompt being read sets that prompt aside (`suspend`) once the
+    /// memory policy has let it in; one of equal priority waits its turn, as every request always did.
     private func admit() {
-        guard prefill == nil, batch.count < maxRows, let next = queue.first else { return }
-        switch admission(for: next) {
+        let next = queue.firstIndex(where: mayStart)
+        if let job = prefill {
+            guard let index = next, queue[index].priority > job.row.priority else { return }
+        } else if let waiting = suspended.first, mayStart(waiting.row),
+                  next.map({ queue[$0].priority <= waiting.row.priority }) ?? true {
+            prefill = suspended.removeFirst()
+            return
+        }
+        guard let index = next else { return }
+        switch admission(for: queue[index]) {
         case .defer:
             heldBack = true
             return
         case .reject(let reason):
             heldBack = false
-            queue.removeFirst()
-            end(next, reason: .failed, layers: nil, message: reason)
+            let refused = queue.remove(at: index)
+            end(refused, reason: .failed, layers: nil, message: reason)
             return
         case .admit:
             heldBack = false
         }
-        let row = queue.removeFirst()
+        if let job = prefill { suspend(job) }
+        let row = queue.remove(at: index)
         row.admittedAt = Date()
         var layers: [KVCache]
         var prefix = 0
@@ -402,6 +441,16 @@ public final class ParallelEngine: @unchecked Sendable {
             slot.lastUsed = Date()
             if let cache = slot.cache, !slot.tokens.isEmpty, !cache.layers.isEmpty {
                 let common = Self.commonPrefix(slot.tokens, row.request.tokens)
+                // PIN: a prompt read only to be kept that the slot already holds, whole, reads nothing and leaves the
+                // cache as it is: the slot may hold more the next request shares (a reply a template renders again
+                // token for token), and rewinding to the prompt's end would throw that away to read it again.
+                if row.request.prefillOnly, common == row.request.tokens.count {
+                    row.reused = common
+                    row.continuation.yield(.admitted(prefixReused: common, prefilled: 0,
+                                                     queueWait: Date().timeIntervalSince(row.queuedAt), prefillSeconds: 0))
+                    end(row, reason: .prefilled, layers: nil)
+                    return
+                }
                 // The model needs at least one new token.
                 let wanted = common == row.request.tokens.count ? max(0, common - 1) : common
                 if wanted == slot.tokens.count, cache.position == wanted {
@@ -421,46 +470,88 @@ public final class ParallelEngine: @unchecked Sendable {
             layers = model.newCache(parameters: nil)
         }
         row.reused = prefix
-        row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init)))
+        if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }
         // A boundary the cache already holds, or the prompt's very end, needs no pin of its own.
         let pin = row.request.pinAt.flatMap { at in slotCache != nil && at > prefix && at < row.request.tokens.count ? at - prefix : nil }
         prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]), pin: pin)
     }
 
-    private func prefillChunk(_ job: PrefillJob) {
+    /// A request may start reading now: one that joins the batch needs a row free there; one read only to be kept
+    /// never joins it.
+    private func mayStart(_ row: Row) -> Bool { row.request.prefillOnly || batch.count < maxRows }
+
+    /// The prompt being read steps aside for a request someone waits on more, its layers and its progress kept, and
+    /// reads on from there once nothing above it waits.
+    private func suspend(_ job: PrefillJob) {
+        prefill = nil
+        suspended.append(job)
+        suspended.sort { a, b in a.row.priority > b.row.priority || (a.row.priority == b.row.priority && a.row.id.raw < b.row.id.raw) }
+    }
+
+    /// A prompt removed before it was read to the end: what was read stays with its slot, so the next round starts from
+    /// there.
+    private func stopReading(_ job: PrefillJob) {
+        if let cache = job.slotCache {
+            let kept = cache.position
+            cache.snapshot(at: kept)
+            settle(job.row, layers: nil, keptTokens: Array(job.row.request.tokens.prefix(kept)))
+        }
+        end(job.row, reason: .removed, layers: nil)
+    }
+
+    /// What this pass is for: a decode step, a chunk of the prompt being read and how many of its tokens, or nothing.
+    private func nextWork() -> InterleavePolicy.Next? {
+        guard let job = prefill else { return batch.isEmpty ? nil : .step }
+        let rows = batch.isEmpty ? nil : batch.rows.map(\.priority).max()
+        return interleave.next(prompt: job.row.priority, rows: rows, clock: clock)
+    }
+
+    private func prefillChunk(_ job: PrefillJob, tokens: Int) {
         let row = job.row
         if row.removed {
             prefill = nil
             end(row, reason: .removed, layers: nil)
             return
         }
-        var upTo = min(job.done + prefillChunkSize, job.suffix.count)
+        var upTo = min(job.done + max(1, tokens), job.suffix.count)
         // A chunk ends at the turn boundary, so the cache stands exactly there once.
         if let pin = job.pin, job.done < pin, upTo > pin { upTo = pin }
         let piece = Array(job.suffix[job.done ..< upTo])
         let last = upTo == job.suffix.count
+        // A prompt read only to be kept samples nothing: its last chunk is evaluated as any other is.
+        let keeps = row.request.prefillOnly
         if !piece.isEmpty {
             let input = MLXArray(piece.map(Int32.init)).reshaped(1, piece.count)
             let logits = model(input, cache: job.layers)
-            if last {
+            if last, !keeps {
                 row.pending = sample(logits: logits[0..., -1, 0...], row: row)
             } else {
                 eval(job.layers.flatMap { $0.innerState() })
                 if let pin = job.pin, upTo == pin { job.slotCache?.snapshot(at: row.reused + pin, pinned: true) }
             }
-        } else if last {
+        } else if last, !keeps {
             // Nothing to prefill (an exact repeat): the last prompt token is fed as the first step.
             row.pending = Int32(row.request.tokens.last ?? 0)
         }
         job.done = upTo
+        row.prefilled = upTo
         guard last else { return }
         prefill = nil
         row.prefillSeconds = Date().timeIntervalSince(job.startedAt)
         job.slotCache?.snapshot(at: row.promptCount)
+        let admitted = StreamEvent.admitted(prefixReused: row.reused, prefilled: job.suffix.count,
+                                            queueWait: row.admittedAt.map { $0.timeIntervalSince(row.queuedAt) } ?? 0,
+                                            prefillSeconds: row.prefillSeconds)
+        if keeps {
+            // Read and kept: the layers stay with the slot, nothing joins the batch, and the slot holds the prompt.
+            row.continuation.yield(admitted)
+            end(row, reason: .prefilled, layers: nil)
+            if let cache = job.slotCache { learnCosts(from: cache) }
+            enforceSlotBudget()
+            return
+        }
         let layers = job.slotCache?.release() ?? job.layers
-        row.continuation.yield(.admitted(prefixReused: row.reused, prefilled: job.suffix.count,
-                                         queueWait: row.admittedAt.map { $0.timeIntervalSince(row.queuedAt) } ?? 0,
-                                         prefillSeconds: row.prefillSeconds))
+        row.continuation.yield(admitted)
         // The first token, sampled from the prompt's last logits, is fed at the next step and
         // delivered then, like every token after it.
         batch.extend(row, layers: layers)
@@ -569,9 +660,9 @@ public final class ParallelEngine: @unchecked Sendable {
         settle(row, layers: layers, keptTokens: row.request.tokens + row.fed)
         let info = FinishInfo(reason: reason, promptTokens: row.promptCount, generated: row.emitted,
                               prefillSeconds: row.prefillSeconds,
-                              decodeSeconds: row.admittedAt.map { Date().timeIntervalSince($0) - row.prefillSeconds } ?? 0,
+                              decodeSeconds: row.admittedAt.map { max(0, Date().timeIntervalSince($0) - row.prefillSeconds) } ?? 0,
                               meanBatchSize: row.batchSteps > 0 ? Double(row.batchRowsSeen) / Double(row.batchSteps) : 0,
-                              message: message)
+                              message: message, prefilled: row.prefilled)
         row.continuation.yield(.finished(info))
         row.continuation.finish()
     }
@@ -644,7 +735,8 @@ public final class ParallelEngine: @unchecked Sendable {
         var bytes = max(0, row.request.tokens.count - held) * kvBytesPerToken
         if slot?.cache == nil { bytes += recurrentBytesPerRow }
         let longest = batch.lengths.longest
-        if !batch.isEmpty, row.request.tokens.count > longest {
+        // A prompt read only to be kept never joins the batch, so it pads no row.
+        if !row.request.prefillOnly, !batch.isEmpty, row.request.tokens.count > longest {
             bytes += (row.request.tokens.count - longest) * kvBytesPerToken * batch.count
         }
         return bytes
@@ -703,12 +795,15 @@ public final class ParallelEngine: @unchecked Sendable {
             slot.cache = CheckpointedCache(layers: layers, ring: configuration.checkpointRing)
         }
         slot.tokens = keptTokens
-        // What a token and a row cost, learned from a session that just settled: what admission estimates with.
-        if let cache = slot.cache, cache.position > 0 {
-            kvBytesPerToken = max(kvBytesPerToken, cache.kvBytes / cache.position)
-            recurrentBytesPerRow = max(recurrentBytesPerRow, cache.recurrentBytes)
-        }
+        if let cache = slot.cache { learnCosts(from: cache) }
         enforceSlotBudget()
+    }
+
+    /// What a token and a row cost, learned from a session that just settled: what admission estimates with.
+    private func learnCosts(from cache: CheckpointedCache) {
+        guard cache.position > 0 else { return }
+        kvBytesPerToken = max(kvBytesPerToken, cache.kvBytes / cache.position)
+        recurrentBytesPerRow = max(recurrentBytesPerRow, cache.recurrentBytes)
     }
 
     // MARK: - Stats
@@ -721,6 +816,11 @@ public final class ParallelEngine: @unchecked Sendable {
         stats.batchSize = batch.count
         stats.queued = queue.count
         stats.residentSlots = slots.values.filter { $0.cache != nil }.count
+        stats.suspended = suspended.count
+        stats.prefillTokensPerSecond = clock.prefillTokensPerSecond ?? 0
+        stats.prefillShare = prefill.flatMap { job in
+            batch.isEmpty ? nil : interleave.share(prompt: job.row.priority, rows: batch.rows.map(\.priority).max())
+        }
         stats.memory = memory(at: now)
         stats.heldBack = heldBack
         stats.held = held
@@ -747,6 +847,7 @@ public final class ParallelEngine: @unchecked Sendable {
         }
         stats.streams = batch.rows.map { stat($0, phase: .decode) }
         if let job = prefill { stats.streams.append(stat(job.row, phase: .prefill(done: job.done, total: job.suffix.count))) }
+        stats.streams += suspended.map { stat($0.row, phase: .prefill(done: $0.done, total: $0.suffix.count)) }
         stats.streams += queue.map { stat($0, phase: .queued) }
         statsLock.withLock { latest = stats }
     }
@@ -769,7 +870,7 @@ public final class ParallelEngine: @unchecked Sendable {
         memory.paddingTokens = lengths.padding
         memory.kvBytes = batch.kvBytes
         memory.recurrentBytes = batch.recurrentBytes
-        if let job = prefill, job.slotCache == nil {
+        for job in [prefill].compactMap({ $0 }) + suspended where job.slotCache == nil {
             for layer in job.layers {
                 let bytes = layer.innerState().reduce(0) { $0 + $1.nbytes }
                 if layer is ArraysCache { memory.recurrentBytes += bytes } else { memory.kvBytes += bytes }

@@ -136,6 +136,8 @@ final class Row {
     var admittedAt: Date?
     var prefillSeconds: TimeInterval = 0
     var reused = 0
+    /// Prompt tokens read into the cache so far: what a stream removed mid-read reports it got through.
+    var prefilled = 0
     var batchSteps = 0
     var batchRowsSeen = 0
     /// Tokens emitted at the last stats tick, and when, for a per-stream rate.

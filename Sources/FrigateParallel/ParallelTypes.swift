@@ -39,16 +39,23 @@ public struct StreamRequest: Sendable {
     /// Where the prompt's turn boundary ends (the end of the person's message): prefill stops there once and pins a
     /// snapshot the next turn can rewind to (`CheckpointedCache.snapshot(at:pinned:)`). Nil pins nothing.
     public var pinAt: Int?
+    /// Read the prompt into the slot and stop: nothing is sampled and no row joins the batch, so the next request on
+    /// the slot continues from the prompt's end. What a session reads ahead of a request it knows is coming. It needs a
+    /// slot, since nothing else would keep what it read, and it finishes `prefilled`.
+    public var prefillOnly: Bool
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
-                priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil) {
+                priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil,
+                prefillOnly: Bool = false) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
-        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt
+        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.prefillOnly = prefillOnly
     }
 }
 
 public enum FinishReason: String, Sendable {
     case stop, maxTokens, removed, failed
+    /// A prefill-only request read its prompt into its slot (`StreamRequest.prefillOnly`).
+    case prefilled
 }
 
 public struct FinishInfo: Sendable {
@@ -61,6 +68,9 @@ public struct FinishInfo: Sendable {
     /// Rows in the batch, averaged over this stream's steps.
     public var meanBatchSize: Double
     public var message: String?
+    /// Prompt tokens this stream read into its cache: the part its slot did not hold, or as far as it got when it was
+    /// removed before the end.
+    public var prefilled = 0
 }
 
 public enum StreamEvent: Sendable {
@@ -121,6 +131,15 @@ public struct ParallelStats: Sendable {
     public var memory = MemoryStats()
     /// The request at the head of the queue is held back until rows finish and free memory.
     public var heldBack = false
+    /// Prompts set aside mid-read for one someone waits on more; each reads on, where it stood, once nothing above it
+    /// waits.
+    public var suspended = 0
+    /// What a prompt reads a second, averaged over the engine's recent chunks: what chunks beside decoding rows are
+    /// sized by (`InterleavePolicy`). Zero until a chunk has been read.
+    public var prefillTokensPerSecond: Double = 0
+    /// The share of the engine's time the prompt being read takes from the rows decoding beside it; nil when no prompt
+    /// is being read beside decoding rows.
+    public var prefillShare: Double?
     /// Idle sessions whose caches the memory policy dropped, since the engine started.
     public var evictions = 0
     /// The engine is paused at its memory ceiling: no step runs until memory comes back under it or
