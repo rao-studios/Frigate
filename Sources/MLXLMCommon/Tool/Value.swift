@@ -56,10 +56,20 @@ public enum JSONValue: Hashable, Codable, Sendable {
         }
     }
 
+    /// A JSON value from what `JSONSerialization` or a tool parser made.
+    ///
+    /// A number `JSONSerialization` reads is an NSNumber, and an NSNumber 0 or 1 casts to `Bool` as readily as
+    /// `false` and `true` do. Cast to `Bool` first, every 0 and 1 inside an object or array parameter became a
+    /// boolean: a model's `{"tone": 0}` reached its tool as `{"tone": false}`, and an agent that holds `tone` as a
+    /// whole number refused the call each time the model wrote it again (Craft, Seer R13, 2026-11-16). So an NSNumber
+    /// is a `Bool` only when it is one of the booleans themselves.
     public static func from(_ value: Any) -> JSONValue {
         switch value {
         case is NSNull:
             return .null
+        case let number as NSNumber where !isBoolean(number):
+            if let int = value as? Int { return .int(int) }
+            return .double(number.doubleValue)
         case let bool as Bool:
             return .bool(bool)
         case let int as Int:
@@ -79,6 +89,16 @@ public enum JSONValue: Hashable, Codable, Sendable {
         default:
             return .string(String(describing: value))
         }
+    }
+
+    /// Whether `number` is a boolean: CoreFoundation's `true` or `false`, which is what `JSONSerialization` makes of
+    /// JSON's and Swift bridges a `Bool` to, and never a number that happens to be 0 or 1.
+    private static func isBoolean(_ number: NSNumber) -> Bool {
+        #if canImport(Darwin)
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+        #else
+        return String(cString: number.objCType) == "c"
+        #endif
     }
 
     public var anyValue: Any {
