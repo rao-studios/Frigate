@@ -89,12 +89,18 @@ public enum ParallelError: Error, CustomStringConvertible {
     case slotBusy(String)
     case unsupportedLayer(String)
     case shutDown
+    /// `keep` found no cache to write: the session never read a prompt, or its cache was forgotten.
+    case slotEmpty
+    /// `take` refused a file, and why: not a slot file, cut short, or written by another model or cache layout.
+    case slotFileRefused(String)
 
     public var description: String {
         switch self {
         case .slotBusy(let label): return "the session's cache is still in use by \(label)"
         case .unsupportedLayer(let kind): return "the parallel engine cannot batch a \(kind) layer cache"
         case .shutDown: return "the parallel engine is shut down"
+        case .slotEmpty: return "the session holds no cache to keep"
+        case .slotFileRefused(let why): return "the kept cache was not taken: \(why)"
         }
     }
 }

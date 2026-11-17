@@ -2,7 +2,7 @@
 //        time in chunks, a batch of rows decoded together one token a step, and a resident cache per
 //        session so the next round prefills only what is new.
 //  IN:   `insert` a StreamRequest (any thread), `remove` a stream, `forget` a slot (or all of them),
-//        `stats`.
+//        `keep` a slot's cache to a file and `take` one back (`SlotFile`), `stats`.
 //  OUT:  StreamEvent per stream: admitted, token…, finished. ParallelStats for the agent map.
 //  PIN:  Every MLX evaluation in this engine happens on its one thread. Arrays never cross it:
 //        tokens leave as integers, stats as values, and a stream's cache lives here between rounds.
@@ -57,6 +57,8 @@ public final class ParallelEngine: @unchecked Sendable {
         case hold
         case resume(ceiling: Int?)
         case shutdown
+        case keep(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
+        case take(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
     }
 
     private final class Slot {
@@ -202,6 +204,21 @@ public final class ParallelEngine: @unchecked Sendable {
     /// engine still over it holds again at once.
     public func resume(ceiling: Int? = nil) { post(.resume(ceiling: ceiling)) }
 
+    /// Writes a session's cache to `url` (`SlotFile`, `frigate-slot/1`): its layers, the tokens they hold and the
+    /// snapshots it can rewind to, with `metadata` beside them. The slot keeps its cache. Throws when the slot holds
+    /// nothing, a stream is using it, or the file cannot be written.
+    public func keep(slot: SlotID, to url: URL, metadata: [String: String] = [:]) async throws -> SlotFile {
+        try await answered { .keep(slot, url, metadata, $0) }
+    }
+
+    /// Reads a session's cache from `url` into `slot`, replacing what the slot held: the next request on the slot
+    /// continues it by their common prefix. Throws, leaving the slot as it was, when a stream is using the slot or the
+    /// file does not fit this engine: not a slot file, cut short, another cache layout, or a value in `expecting` that
+    /// the file's metadata does not hold.
+    public func take(slot: SlotID, from url: URL, expecting: [String: String] = [:]) async throws -> SlotFile {
+        try await answered { .take(slot, url, expecting, $0) }
+    }
+
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() {
@@ -214,6 +231,23 @@ public final class ParallelEngine: @unchecked Sendable {
         commands.append(command)
         condition.signal()
         condition.unlock()
+    }
+
+    /// Posts a command the engine's thread answers, and waits for the answer.
+    ///
+    /// PIN: checked and posted under one lock. `shutdown` closes the engine under that lock before it posts its own
+    /// command, so a command posted while open is ahead of it and answered before the loop ends; one posted after is
+    /// answered at once. Posted without the check, it would wait for a thread that is gone.
+    private func answered(_ command: (@escaping (Result<SlotFile, Error>) -> Void) -> Command) async throws -> SlotFile {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SlotFile, Error>) in
+            let posted: Bool = condition.withLock {
+                guard !closed else { return false }
+                commands.append(command { continuation.resume(with: $0) })
+                condition.signal()
+                return true
+            }
+            if !posted { continuation.resume(throwing: ParallelError.shutDown) }
+        }
     }
 
     // MARK: - The loop (engine thread)
@@ -324,7 +358,35 @@ public final class ParallelEngine: @unchecked Sendable {
             held = nil
         case .shutdown:
             running = false
+        case .keep(let id, let url, let metadata, let answer):
+            answer(Result { try withError { try keepSlot(id, to: url, metadata: metadata) } })
+        case .take(let id, let url, let expecting, let answer):
+            answer(Result { try withError { try takeSlot(id, from: url, expecting: expecting) } })
         }
+    }
+
+    /// Writes an idle slot's cache, leaving it in place (`keep(slot:to:metadata:)`).
+    private func keepSlot(_ id: SlotID, to url: URL, metadata: [String: String]) throws -> SlotFile {
+        guard let slot = slots[id] else { throw ParallelError.slotEmpty }
+        if let busy = slot.inFlight { throw ParallelError.slotBusy("\(busy)") }
+        guard let cache = slot.cache, !cache.layers.isEmpty, !slot.tokens.isEmpty else { throw ParallelError.slotEmpty }
+        return try SlotFileCodec.write(cache, tokens: slot.tokens, layout: layout, metadata: metadata, to: url)
+    }
+
+    /// Reads a kept cache into a slot that no stream is using (`take(slot:from:expecting:)`), then holds every slot to
+    /// the memory policy again, as a slot that settles is.
+    private func takeSlot(_ id: SlotID, from url: URL, expecting: [String: String]) throws -> SlotFile {
+        if let busy = slots[id]?.inFlight { throw ParallelError.slotBusy("\(busy)") }
+        let read = try SlotFileCodec.read(from: url, layout: layout, expecting: expecting, ring: configuration.checkpointRing)
+        let slot = slots[id] ?? Slot()
+        slot.cache = read.cache
+        slot.tokens = read.tokens
+        slot.forgotten = false
+        slot.lastUsed = Date()
+        slots[id] = slot
+        learnCosts(from: read.cache)
+        enforceSlotBudget()
+        return read.file
     }
 
     /// An idle slot goes now; one a stream is using goes when that stream settles (`settle`).

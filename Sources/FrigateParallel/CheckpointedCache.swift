@@ -56,6 +56,16 @@ public final class CheckpointedCache {
         classify()
     }
 
+    /// A cache read back from a file (`SlotFile`): its layers, with the snapshots it was kept with that they still
+    /// cover — the newest `ring` of the ring, and the pinned turn boundary outside it.
+    convenience init(layers: [KVCache], ring: Int, snapshots: [Snapshot], pinned: Snapshot?) {
+        self.init(layers: layers, ring: ring)
+        guard !recurrent.isEmpty, canRewind else { return }
+        let now = position
+        self.snapshots = Array(snapshots.filter { $0.tokenCount <= now }.sorted { $0.tokenCount < $1.tokenCount }.suffix(self.ring))
+        self.pinned = pinned.flatMap { $0.tokenCount <= now ? $0 : nil }
+    }
+
     private func classify() {
         recurrent = [:]
         trimmable = []

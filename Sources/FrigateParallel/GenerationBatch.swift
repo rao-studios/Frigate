@@ -23,6 +23,9 @@ struct CacheLayout {
             throw ParallelError.unsupportedLayer(String(describing: type(of: layer)))
         }
     }
+
+    /// One letter a layer, `a` attention and `r` recurrent: what a kept cache must match to be taken (`SlotFile`).
+    var signature: String { String(kinds.map { $0 == .attention ? "a" : "r" }) }
 }
 
 final class GenerationBatch {
