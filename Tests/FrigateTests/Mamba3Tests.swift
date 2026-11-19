@@ -27,7 +27,7 @@ private let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent(
 private func tinyConfig(activation: String? = "heavy_tail", chunk: Int = 8) throws -> Mamba3Configuration {
     var config = try JSONDecoder().decode(Mamba3Configuration.self, from: Data(contentsOf: fixture.appendingPathComponent("config.json")))
     config.aActivation = activation
-    config.chunkSize = chunk
+    config.readChunk = chunk
     return config
 }
 
@@ -212,5 +212,25 @@ struct Mamba3LiveTests {
                 if dtype == nil { #expect(gap < 1e-3) } else { #expect(relative(logits, want) < 5e-2) }
             }
         }
+    }
+
+    /// The state after a read holds itself and nothing of the read: its slices of k, x and the chunk states once kept
+    /// every layer's whole tensors (5.8 GB after 1,024 tokens against the state's 54 MB).
+    @Test func theStateHoldsOnlyItself() throws {
+        let model = try Mamba3Loader.load(from: livePaths!.commons, weightDType: .bfloat16)
+        eval(model)
+        Memory.clearCache()
+        let base = Memory.activeMemory
+        let cache = model.newCache(parameters: nil)
+        do {
+            let tokens = (0 ..< 1_024).map { Int32(($0 * 7_919) % 120_000 + 100) }
+            let reading = model.read(MLXArray(tokens).reshaped(1, 1_024), cache: cache, tap: 12)
+            eval(reading.tappedSum, reading.last)
+        }
+        Memory.clearCache()
+        let held = Memory.activeMemory - base
+        let state = cache.reduce(0) { sum, layer in sum + (0 ..< 4).reduce(0) { $0 + (layer as! ArraysCache)[$1]!.nbytes } }
+        print(String(format: "MAMBA3 LIVE held after a 1,024-token read: %.1f MB, the state %.1f MB", Double(held) / 1e6, Double(state) / 1e6))
+        #expect(held < 2 * state)
     }
 }

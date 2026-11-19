@@ -8,9 +8,14 @@
 //        (x times `mimo_x`) rotated by the cumulative angle:
 //            h_t = α_t h_{t−1} + β_t Σ_r k_{t−1,r} ⊗ v_{t−1,r} + γ_t Σ_r k_{t,r} ⊗ v_{t,r}
 //            y_{t,r} = h_t · q_{t,r} + D v_{t,r},  gated by silu(z_t ⊙ mimo_z_r),  summed through mimo_o.
-//        Chunked (the reference's `mamba3_MIMO_chunk_ref`): a key carries γ_s plus the next step's
-//        (1 − λ_{s+1})Δ_{s+1} under the decay from s, the diagonal subtracts that second term where it has not
-//        happened yet, and the rank is flattened into the chunk's score matrix. Plain MLX ops, no kernels.
+//        Chunked (the reference's `mamba3_MIMO_chunk_ref`, rearranged for speed): within a chunk key s weighs γ_s at
+//        its own position and γ_s + (1 − λ_{s+1})Δ_{s+1} under the decay after it, held in the chunk's mask; the rank
+//        is flattened into the chunk's score matrix; every chunk is one batched product and the hand-off of the state
+//        between chunks is one more. Plain MLX ops, two of them fused by `compile`; no kernels.
+//  PIN:  HEAD-MAJOR. The chunked pass takes q and k as [B,H,L,R,N] (the mixer writes them so, the groups spread over the
+//        heads in the same pass), so the chunks are reshapes, never transposed copies. Measured 2026-11-19 on the 1.5b,
+//        4 × 1,024 tokens at BF16: 1,229 tok/s position-major with a chunk loop and the diagonal taken back out, 2,530
+//        with all of this (Mamba3SpeedTests); the float32 read stays 3e-5 of Braid's oracle in logits.
 //  PIN:  FLOAT32 THROUGHOUT, whatever the weights are: the projections hand this file f32 and the state stays f32.
 //  PIN:  EVERY RUNNING SUM OVER A ROW-CONTIGUOUS COPY (`runningSum`). MLX's Metal scan treated a transposed (dense but
 //        permuted) input as contiguous and returned wrong values, at times over its input (Braid MAMBA3.md, AUDIT.md
@@ -53,6 +58,25 @@ public enum SSD3 {
         return concatenated(parts, axis: -1)
     }
 
+    /// `rotate` as two tables over the halves of the last axis, for t viewed as [..., 2, N/2]: C [..., 1, N/2] holds cos
+    /// for the first S dimensions of a half and 1 after, S [..., 2, N/2] holds −sin over the first half's and +sin over
+    /// the second's (0 after). Then rotate(t) = t ⊙ C + swap(t) ⊙ S, swap trading the halves: the same pairing and the
+    /// same products, element-wise only, so `compile` makes it one pass over the output.
+    public static func rotationTables(cos c: MLXArray, sin s: MLXArray, half: Int) -> (c: MLXArray, s: MLXArray) {
+        var cHalf = c, sHalf = s
+        if c.dim(-1) < half {
+            let rest = Array(c.shape.dropLast()) + [half - c.dim(-1)]
+            cHalf = concatenated([c, MLXArray.ones(rest, dtype: c.dtype)], axis: -1)
+            sHalf = concatenated([s, MLXArray.zeros(rest, dtype: s.dtype)], axis: -1)
+        }
+        return (cHalf.expandedDimensions(axis: -2), stacked([-sHalf, sHalf], axis: -2))
+    }
+
+    /// t [..., 2, N/2] with its halves traded.
+    public static func swapHalves(_ t: MLXArray) -> MLXArray {
+        concatenated([t[.ellipsis, 1 ..< 2, 0...], t[.ellipsis, 0 ..< 1, 0...]], axis: -2)
+    }
+
     /// The angle at every position: the carried angle plus the running sum of tanh(θ)·Δ·π.
     /// inc [B,L,H,S]; angle0 [B,H,S] or nil. Returns [B,L,H,S] (not reduced).
     public static func angles(increments inc: MLXArray, angle0: MLXArray?) -> MLXArray {
@@ -66,63 +90,80 @@ public enum SSD3 {
         return x - twoPi * floor(x / twoPi)
     }
 
-    /// The chunked pass. q, k [B,L,R,H,N] rotated and biased; x [B,L,H,P]; adt, dt, lam [B,L,H] (AΔ ≤ 0, Δ, σ(trap));
-    /// mimoX, mimoZ, mimoO [H,R,P]; d [H]; z [B,L,H,P]; ssm [B,H,P,N], kPrev [B,R,H,N] and xPrev [B,H,P] the state
+    /// The chunked pass, head-major. q, k [B,H,L,R,N] rotated and biased; x, z [B,L,H,P]; adt, dt, lam [B,L,H] (AΔ ≤ 0,
+    /// Δ, σ(trap)); mimoX, mimoZ, mimoO [H,R,P]; d [H]; ssm [B,H,P,N], kPrev [B,R,H,N] and xPrev [B,H,P] the state
     /// before the sequence or nil. Returns y [B,L,H,P] and the SSM state after the last position.
+    ///
+    /// Every chunk at once, the sequence padded to whole chunks with positions that neither decay nor write; only the
+    /// hand-off of the state from one chunk to the next runs in order. Within a chunk, key s weighs γ_s at its own
+    /// position and γ_s + (1 − λ_{s+1})Δ_{s+1} under the decay after it: the trapezoid lives in the mask, so the
+    /// keys are never reweighted and no diagonal is taken back out.
     public static func chunked(q: MLXArray, k: MLXArray, x: MLXArray, adt: MLXArray, dt: MLXArray, lam: MLXArray,
                                mimoX: MLXArray, mimoZ: MLXArray, mimoO: MLXArray, d: MLXArray, z: MLXArray,
                                ssm: MLXArray?, kPrev: MLXArray?, xPrev: MLXArray?, chunk: Int) -> (y: MLXArray, ssm: MLXArray) {
-        let (b, l, r, h, n) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3), q.dim(4))
+        let (b, h, l, r, n) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3), q.dim(4))
         let p = x.dim(3)
-        let mx = mimoX.transposed(1, 0, 2)                                               // [R,H,P]
-        let v = x.expandedDimensions(axis: 2) * mx                                       // [B,L,R,H,P]
-        // The trapezoid: γ_s at s, and the next step's (1 − λ)Δ on the same key after it (zero at the end).
-        let gamma = lam * dt                                                             // [B,L,H]
-        let nextTerm = concatenated([(dt * (1 - lam))[0..., 1...], MLXArray.zeros([b, 1, h], dtype: .float32)], axis: 1)
-        let factor = gamma + nextTerm                                                    // [B,L,H]
-        let kw = k * factor.reshaped([b, l, 1, h, 1])                                   // [B,L,R,H,N]
+        let v = x.transposed(0, 2, 1, 3).expandedDimensions(axis: 3) * mimoX.reshaped([1, h, 1, r, p])   // [B,H,L,R,P]
+        let dtH = dt.swappedAxes(1, 2), lamH = lam.swappedAxes(1, 2)                    // [B,H,L]
+        let gamma = lamH * dtH
+        let nextTerm = concatenated([(dtH * (1 - lamH))[0..., 0..., 1...], MLXArray.zeros([b, h, 1], dtype: .float32)], axis: 2)
+        let factor = gamma + nextTerm
 
         // The state the sequence enters with: the carried SSM state, plus the first position's β term on the
         // carried key and value (β_0 / α_0 = (1 − λ_0)Δ_0, since the carry-in decays it by α_0).
         var s = ssm?.asType(.float32) ?? MLXArray.zeros([b, h, p, n], dtype: .float32)
         if let kPrev, let xPrev {
-            let vPrev = xPrev.expandedDimensions(axis: 1) * mx                             // [B,R,H,P]
+            let vPrev = xPrev.expandedDimensions(axis: 1) * mimoX.transposed(1, 0, 2)       // [B,R,H,P]
             let outer = matmul(vPrev.transposed(0, 2, 3, 1), kPrev.transposed(0, 2, 1, 3))   // [B,H,P,N]
             let w = (dt[0..., 0] * (1 - lam[0..., 0])).reshaped([b, h, 1, 1])
             s = s + w * outer
         }
 
-        var ys: [MLXArray] = []
-        var start = 0
-        while start < l {
-            let c = min(chunk, l - start)
-            let range = start ..< start + c
-            let dtAc = adt[0..., range].swappedAxes(1, 2).contiguous()                  // [B,H,c], row-contiguous (see PIN)
-            let cs = runningSum(dtAc, axis: -1)
-            let decay = exp(segsum(dtAc))                                                // [B,H,c,c]
-            // Rows and columns run over (position, rank), position-major, as the reference flattens them.
-            let qc = q[0..., range].transposed(0, 3, 1, 2, 4).reshaped([b, h, c * r, n])
-            let kc = kw[0..., range].transposed(0, 3, 1, 2, 4).reshaped([b, h, c * r, n])
-            let vc = v[0..., range].transposed(0, 3, 1, 2, 4).reshaped([b, h, c * r, p])
-            let decayR = repeated(repeated(decay, count: r, axis: 2), count: r, axis: 3)  // [B,H,cR,cR]
-            var y = matmul(matmul(qc, kc.swappedAxes(2, 3)) * decayR, vc)              // [B,H,cR,P]
-            let decayInR = repeated(exp(cs), count: r, axis: 2).expandedDimensions(axis: 3)   // [B,H,cR,1]
-            y = y + decayInR * matmul(qc, s.swappedAxes(2, 3))                          // carry-in through each position
-            let toEnd = exp(cs[0..., 0..., (c - 1)...] - cs)                              // [B,H,c]
-            let toEndR = repeated(toEnd, count: r, axis: 2).expandedDimensions(axis: 3)  // [B,H,cR,1]
-            let through = exp(cs[0..., 0..., c - 1]).reshaped([b, h, 1, 1])
-            s = through * s + matmul((vc * toEndR).swappedAxes(2, 3), kc)               // [B,H,P,N]
-            ys.append(y.reshaped([b, h, c, r, p]).transposed(0, 2, 3, 1, 4))            // [B,c,R,H,P]
-            start += c
+        let c = min(chunk, l), nc = (l + c - 1) / c, pad = nc * c - l
+        // Along the positions (axis 2), padded with zeros to whole chunks.
+        func padded(_ t: MLXArray) -> MLXArray {
+            guard pad > 0 else { return t }
+            var shape = t.shape
+            shape[2] = pad
+            return concatenated([t, MLXArray.zeros(shape, dtype: t.dtype)], axis: 2)
         }
-        var y = concatenated(ys, axis: 1)                                                // [B,L,R,H,P]
-        // The diagonal: the next step's term on a key has not happened at its own position.
-        let qk = matmul(q.transposed(0, 1, 3, 2, 4), k.transposed(0, 1, 3, 4, 2))        // [B,L,H,R',R]
-        let own = matmul(qk, v.transposed(0, 1, 3, 2, 4)).transposed(0, 1, 3, 2, 4)      // [B,L,R',H,P]
-        y = y - nextTerm.reshaped([b, l, 1, h, 1]) * own
-        y = y + d.reshaped([1, 1, 1, h, 1]) * v
-        y = y * silu(z.expandedDimensions(axis: 2) * mimoZ.transposed(1, 0, 2))
-        return ((y * mimoO.transposed(1, 0, 2)).sum(axis: 2), s)                         // [B,L,H,P]
+        // [B,H,L,R,W] → [B,H,nc,c·R,W]: rows run over (position, rank), position-major, as the reference flattens them.
+        func blocks(_ t: MLXArray) -> MLXArray { padded(t).reshaped([b, h, nc, c * r, t.dim(4)]) }
+        func perChunk(_ t: MLXArray) -> MLXArray { padded(t).reshaped([b, h, nc, c]) }   // [B,H,L] → [B,H,nc,c]
+        let dtA = perChunk(adt.swappedAxes(1, 2))
+        let cs = runningSum(dtA, axis: -1)
+        let fc = perChunk(factor).reshaped([b, h, nc, 1, c]), gc = perChunk(gamma).reshaped([b, h, nc, 1, c])
+        let weight = MLX.where(MLXArray.eye(c, dtype: .bool), gc, exp(segsum(dtA)) * fc)   // [B,H,nc,c,c] (t, s)
+        let qc = blocks(q), kc = blocks(k), vc = blocks(v)
+        let scores = matmul(qc, kc.swappedAxes(-1, -2)).reshaped([b, h, nc, c, r, c, r])
+            * weight.reshaped([b, h, nc, c, 1, c, 1])
+        var y = matmul(scores.reshaped([b, h, nc, c * r, c * r]), vc)                    // [B,H,nc,cR,P]
+        // Each chunk's own writes, weighted and decayed to its end, then the state each chunk enters with.
+        let toEnd = exp(cs[.ellipsis, (c - 1)...] - cs) * fc.reshaped([b, h, nc, c])      // [B,H,nc,c]
+        let decayed = (vc.reshaped([b, h, nc, c, r, p]) * toEnd.reshaped([b, h, nc, c, 1, 1])).reshaped([b, h, nc, c * r, p])
+        let written = matmul(decayed.swappedAxes(-1, -2), kc)                           // [B,H,nc,P,N]
+        // The state each chunk enters with and the state after the last, in one product: the chunks' total decays
+        // (exp of running sums, as within a chunk) over the carried state and each chunk's writes.
+        let totals = concatenated([MLXArray.zeros([b, h, 1], dtype: .float32), cs[.ellipsis, c - 1]], axis: -1)   // [B,H,nc+1]
+        let states = concatenated([s.expandedDimensions(axis: 2), written], axis: 2).reshaped([b, h, nc + 1, p * n])
+        let after = matmul(exp(segsum(totals)), states).reshaped([b, h, nc + 1, p, n])  // [B,H,nc+1,P,N]
+        let carried = matmul(qc, after[0..., 0..., ..<nc].swappedAxes(-1, -2))          // [B,H,nc,cR,P]
+        y = y + (exp(cs).reshaped([b, h, nc, c, 1, 1]) * carried.reshaped([b, h, nc, c, r, p])).reshaped([b, h, nc, c * r, p])
+        var yh = y.reshaped([b, h, nc * c, r, p])                                        // [B,H,L',R,P]
+        if pad > 0 { yh = yh[0..., 0..., ..<l] }
+        let gated = gate([yh, d.reshaped([1, h, 1, 1, 1]), v, z.transposed(0, 2, 1, 3).expandedDimensions(axis: 3),
+                          mimoZ.reshaped([1, h, 1, r, p]), mimoO.reshaped([1, h, 1, r, p])])[0]
+        return (gated.sum(axis: 3).transposed(0, 2, 1, 3), after[0..., 0..., nc])        // [B,L,H,P]
+    }
+
+    /// D, the gate and the output mix, one pass: (y + D v) ⊙ silu(z ⊙ mimo_z) ⊙ mimo_o, summed over the rank after.
+    ///
+    /// PIN: PRIMITIVE OPS ONLY INSIDE A COMPILED CLOSURE, here and in the mixer's rotation. MLXNN's `silu` is itself
+    /// compiled: tracing this closure holds its lock and MLX's eval lock and would wait for `silu`'s, while a model on
+    /// another thread holds `silu`'s and waits for the eval lock. Frigate's whole suite deadlocked so (2026-11-19).
+    private static let gate: @Sendable ([MLXArray]) -> [MLXArray] = compile { a in
+        let g = a[3] * a[4]
+        return [(a[0] + a[1] * a[2]) * (g * sigmoid(g)) * a[5]]
     }
 
     /// One token. q, k [B,R,H,N] rotated and biased; x, z [B,H,P]; adt, dt, lam [B,H]; the state's ssm [B,H,P,N],

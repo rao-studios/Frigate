@@ -10,7 +10,10 @@
 //        Craft makes of it: a conversation read into a fixed-size state, and a key per span.
 //  PIN:  THE STATE PER LAYER IS ONE `ArraysCache(size: 4)`: [0] ssm [B,H,P,N], [1] angle [B,H,S] modulo 2π, [2] k
 //        [B,R,H,N] (the last position's rotated, biased keys), [3] v [B,H,P] (its x). All four are written by every
-//        forward and replaced, never written in place: a snapshot holds the arrays it was taken with.
+//        forward and replaced, never written in place: a snapshot holds the arrays it was taken with. Each is a buffer
+//        of its own (`owned`): a slice shares its source's buffer, and the state's slices of a read's k, x and chunk
+//        states kept every layer's whole tensors alive, 5.8 GB after a 1,024-token read against the state's 54 MB
+//        (Mamba3LiveTests.theStateHoldsOnlyItself, 2026-11-19).
 //  PIN:  WEIGHTS MAY BE NARROWER THAN THE ARITHMETIC. The projections run in their weights' dtype (BF16 when loaded by
 //        `Mamba3Loader` with `.bfloat16`); the residual stream, the norms and the scan run in float32
 //        (`residual_in_fp32`, and SSD3's PIN). With float32 weights every cast is a no-op and the arithmetic is Braid's.
@@ -40,8 +43,14 @@ public struct Mamba3Configuration: Codable, Sendable, ModelConfigurationValidati
     public var isOutprojNorm: Bool
     public var rmsNorm: Bool
     public var attentionLayers: [Int]
-    /// Braid: the scan's chunk in positions (64 at rank 4: 256 rows of the score matrix).
+    /// Braid: the training kernel's chunk in positions (64 at rank 4: 256 rows of the score matrix), kept as the file
+    /// says. Reading chunks by `readChunk`.
     public var chunkSize: Int
+    /// The positions the chunked scan takes at once when reading: a split of the work only, the scan is the same at
+    /// any length (Mamba3Tests hold it at 8, the live oracle at this). The score work grows with the chunk (L·c·R²·N)
+    /// while the hand-off between chunks is one product, so 32 read fastest on an M4 Max (2026-11-19, 4 × 1,024 tokens
+    /// at BF16: 2,530 tok/s against 2,350 at 64 and 2,449 at 16). Not coded: no checkpoint carries it.
+    public var readChunk = 32
     /// Braid: the first block of the commons' tail; blocks 0..<cut are a Thread's own.
     public var cut: Int
     /// Braid: the residual tap (after how many blocks) a key reads.
@@ -163,8 +172,8 @@ public struct Mamba3Configuration: Codable, Sendable, ModelConfigurationValidati
         guard let aActivation, ["heavy_tail", "softplus"].contains(aActivation) else {
             throw Refusal.unsupported("braid_a_activation is \(aActivation ?? "absent"); it is pinned per checkpoint")
         }
-        guard chunkSize >= 1, (1 ... numHiddenLayers).contains(tapAfterBlocks) else {
-            throw Refusal.unsupported("chunk \(chunkSize) or tap \(tapAfterBlocks) is out of range")
+        guard chunkSize >= 1, readChunk >= 1, (1 ... numHiddenLayers).contains(tapAfterBlocks) else {
+            throw Refusal.unsupported("chunk \(chunkSize), read chunk \(readChunk) or tap \(tapAfterBlocks) is out of range")
         }
     }
 }
@@ -216,9 +225,9 @@ final class Mamba3Mixer: Module {
                                                    2 * c.dInner + 2 * bc + hh, 2 * c.dInner + 2 * bc + 2 * hh,
                                                    2 * c.dInner + 2 * bc + 3 * hh], axis: -1)
         let z = parts[0].reshaped([b, l, hh, p]), x = parts[1].reshaped([b, l, hh, p])
-        // B and C: [B,L,R,G,N], normed over N, broadcast from the groups to the heads.
-        let bm = repeated(bNorm(parts[2].reshaped([b, l, r, g, n])), count: hh / g, axis: 3)
-        let cm = repeated(cNorm(parts[3].reshaped([b, l, r, g, n])), count: hh / g, axis: 3)
+        // B and C: [B,L,R,G,N], normed over N; each scan spreads the groups over the heads.
+        let bm = bNorm(parts[2].reshaped([b, l, r, g, n]))
+        let cm = cNorm(parts[3].reshaped([b, l, r, g, n]))
         let a = minimum(-activation(parts[5]), MLXArray(-c.aFloor))
         let dt = softplus(parts[4] + dtBias)
         let lam = sigmoid(parts[6])
@@ -232,8 +241,33 @@ final class Mamba3Mixer: Module {
         return maximum(x, MLXArray(Float(0))) + 1 / (1 - minimum(x, MLXArray(Float(0))))
     }
 
-    /// The biases [H,R,N] as [R,H,N], the layout q and k carry.
+    /// The biases [H,R,N] as [R,H,N], the layout q and k carry one token at a time.
     private var biases: (q: MLXArray, k: MLXArray) { (cBias.transposed(1, 0, 2), bBias.transposed(1, 0, 2)) }
+
+    /// B or C at one position [B,R,G,N] spread over the heads: [B,R,H,N].
+    private func heads(_ t: MLXArray) -> MLXArray { repeated(t, count: config.numHeads / config.nGroups, axis: 2) }
+
+    /// B or C [B,L,R,G,N] plus its bias [H,R,N], rotated by `tables` (`SSD3.rotationTables` over [B,H,L,1,S]), head-major:
+    /// [B,H,L,R,N]. The groups spread over the heads inside the one fused pass that writes it.
+    private func headMajor(_ t: MLXArray, bias: MLXArray, tables: (c: MLXArray, s: MLXArray)) -> MLXArray {
+        let (b, l, r, g, n) = (t.dim(0), t.dim(1), t.dim(2), t.dim(3), t.dim(4))
+        let (heads, perGroup, half) = (config.numHeads, config.numHeads / g, n / 2)
+        let grouped = t.transposed(0, 3, 1, 2, 4).reshaped([b, g, 1, l, r, 2, half])
+        let biased = bias.reshaped([1, g, perGroup, 1, r, 2, half])
+        return Self.rotation([grouped, biased, SSD3.swapHalves(grouped), SSD3.swapHalves(biased),
+                              tables.c.reshaped([b, g, perGroup, l, 1, 1, half]),
+                              tables.s.reshaped([b, g, perGroup, l, 1, 2, half])])[0]
+            .reshaped([b, heads, l, r, n])
+    }
+
+    /// (t + bias) ⊙ C + (swap(t) + swap(bias)) ⊙ S, fused; primitive ops only (SSD3.gate's PIN).
+    private static let rotation: @Sendable ([MLXArray]) -> [MLXArray] = compile { a in
+        [(a[0] + a[1]) * a[4] + (a[2] + a[3]) * a[5]]
+    }
+
+    /// `x` in a buffer of its own, for the state (see PIN): an element-wise op writes a fresh one, since MLX donates an
+    /// input's buffer only to an output about its size, and a slice's buffer is its whole source's.
+    static func owned(_ x: MLXArray) -> MLXArray { x * 1 }
 
     private func project(_ y: MLXArray) -> MLXArray { outProj(y.asType(outProj.weight.dtype)).asType(.float32) }
 
@@ -245,26 +279,27 @@ final class Mamba3Mixer: Module {
         if l == 1, let ssm, let angle0, let kPrev, let xPrev {
             let angle = SSD3.wrap(angle0 + m.increments[0..., 0])                                   // [B,H,S]
             let cosA = cos(angle).expandedDimensions(axis: 1), sinA = sin(angle).expandedDimensions(axis: 1)
-            let q = SSD3.rotate(m.cm[0..., 0] + biases.q, cos: cosA, sin: sinA)                      // [B,R,H,N]
-            let k = SSD3.rotate(m.bm[0..., 0] + biases.k, cos: cosA, sin: sinA)
+            let q = SSD3.rotate(heads(m.cm[0..., 0]) + biases.q, cos: cosA, sin: sinA)               // [B,R,H,N]
+            let k = SSD3.rotate(heads(m.bm[0..., 0]) + biases.k, cos: cosA, sin: sinA)
             let x = m.x[0..., 0]
             let (y, next) = SSD3.step(q: q, k: k, x: x, adt: m.adt[0..., 0], dt: m.dt[0..., 0], lam: m.lam[0..., 0],
                                       mimoX: mimoX, mimoZ: mimoZ, mimoO: mimoO, d: dSkip, z: m.z[0..., 0],
                                       ssm: ssm, kPrev: kPrev, xPrev: xPrev)
-            cache?[0] = next; cache?[1] = angle; cache?[2] = k; cache?[3] = x
+            cache?[0] = next; cache?[1] = angle; cache?[2] = k; cache?[3] = Self.owned(x)
             return project(y.reshaped([b, 1, config.dInner]))
         }
         let angle = SSD3.angles(increments: m.increments, angle0: angle0)                         // [B,L,H,S]
-        let cosA = cos(angle).expandedDimensions(axis: 2), sinA = sin(angle).expandedDimensions(axis: 2)
-        let q = SSD3.rotate(m.cm + biases.q, cos: cosA, sin: sinA)
-        let k = SSD3.rotate(m.bm + biases.k, cos: cosA, sin: sinA)
+        let angleH = angle.transposed(0, 2, 1, 3).expandedDimensions(axis: 3)                   // [B,H,L,1,S]
+        let tables = SSD3.rotationTables(cos: cos(angleH), sin: sin(angleH), half: config.stateSize / 2)
+        let q = headMajor(m.cm, bias: cBias, tables: tables)                                     // [B,H,L,R,N]
+        let k = headMajor(m.bm, bias: bBias, tables: tables)
         let (y, next) = SSD3.chunked(q: q, k: k, x: m.x, adt: m.adt, dt: m.dt, lam: m.lam, mimoX: mimoX, mimoZ: mimoZ,
                                      mimoO: mimoO, d: dSkip, z: m.z, ssm: ssm, kPrev: kPrev, xPrev: xPrev,
-                                     chunk: config.chunkSize)
-        cache?[0] = next
+                                     chunk: config.readChunk)
+        cache?[0] = Self.owned(next)
         cache?[1] = SSD3.wrap(angle[0..., l - 1])
-        cache?[2] = k[0..., l - 1]
-        cache?[3] = m.x[0..., l - 1]
+        cache?[2] = Self.owned(k[0..., 0..., l - 1].transposed(0, 2, 1, 3))                      // [B,R,H,N]
+        cache?[3] = Self.owned(m.x[0..., l - 1])
         return project(y.reshaped([b, l, config.dInner]))
     }
 }
