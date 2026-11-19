@@ -124,6 +124,10 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
 
+    /// `model.ignore_merges`: a word already in the vocabulary is that one token, merges unread (Llama 3's
+    /// tokenizer.json sets it). Hugging Face's `BPE::merge_word` looks the word up before it merges.
+    let ignoreMerges: Bool
+
     static func mergesFromConfig(_ config: Config?) -> [[String]]? {
         guard let config else { return nil }
 
@@ -187,6 +191,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
         bosTokenId = bosToken == nil ? nil : tokensToIds[bosToken! as NSString]
 
         fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: false)
+        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
     }
 
     /// Converts a token string to its corresponding numeric ID.
@@ -243,6 +248,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// non-spacing mark, because the mark forms a single grapheme cluster with the
     /// preceding space and the split silently swallows the boundary.
     func bpe(token: String) -> [String] {
+        if ignoreMerges, tokensToIds[token as NSString] != nil { return [token] }
         var symbols = token.unicodeScalars.map { String($0) }
         if symbols.count <= 1 {
             return symbols.isEmpty ? [] : [token]

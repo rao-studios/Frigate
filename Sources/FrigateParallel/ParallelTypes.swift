@@ -39,6 +39,10 @@ public struct StreamRequest: Sendable {
     /// Where the prompt's turn boundary ends (the end of the person's message): prefill stops there once and pins a
     /// snapshot the next turn can rewind to (`CheckpointedCache.snapshot(at:pinned:)`). Nil pins nothing.
     public var pinAt: Int?
+    /// Where the prompt's stable prefix ends (the system prompt and the tools): prefill stops there once and anchors a
+    /// snapshot that later pins never replace (`CheckpointedCache.snapshot(at:anchored:)`), so a history rewritten after
+    /// it rewinds there instead of reading from zero. Nil anchors nothing.
+    public var anchorAt: Int?
     /// Read the prompt into the slot and stop: nothing is sampled and no row joins the batch, so the next request on
     /// the slot continues from the prompt's end. What a session reads ahead of a request it knows is coming. It needs a
     /// slot, since nothing else would keep what it read, and it finishes `prefilled`.
@@ -46,9 +50,10 @@ public struct StreamRequest: Sendable {
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
                 priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil,
-                prefillOnly: Bool = false) {
+                anchorAt: Int? = nil, prefillOnly: Bool = false) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
-        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.prefillOnly = prefillOnly
+        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.anchorAt = anchorAt
+        self.prefillOnly = prefillOnly
     }
 }
 

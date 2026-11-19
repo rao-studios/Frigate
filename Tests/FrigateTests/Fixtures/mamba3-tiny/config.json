@@ -1,0 +1,30 @@
+{
+  "d_model": 32,
+  "d_intermediate": 48,
+  "n_layer": 2,
+  "vocab_size": 64,
+  "tie_embeddings": true,
+  "rms_norm": true,
+  "residual_in_fp32": true,
+  "fused_add_norm": false,
+  "pad_vocab_size_multiple": 16,
+  "attn_layer_idx": [],
+  "attn_cfg": {},
+  "ssm_cfg": {
+    "layer": "Mamba3",
+    "d_state": 16,
+    "expand": 2,
+    "headdim": 8,
+    "ngroups": 1,
+    "rope_fraction": 0.5,
+    "dt_min": 0.001,
+    "dt_max": 0.1,
+    "dt_init_floor": 0.0001,
+    "A_floor": 0.0001,
+    "chunk_size": 16,
+    "is_mimo": true,
+    "mimo_rank": 2,
+    "is_outproj_norm": false
+  },
+  "model_type": "mamba3"
+}

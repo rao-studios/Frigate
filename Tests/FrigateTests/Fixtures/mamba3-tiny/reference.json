@@ -1,0 +1,12 @@
+{
+  "source": "Scripts/mamba3-oracle.py fixture",
+  "seed": 20261110,
+  "summary": {
+    "heavy_tail": {
+      "chunkAgainstStepRelative": 1.2368144552965532e-06
+    },
+    "softplus": {
+      "chunkAgainstStepRelative": 1.0323946071366663e-06
+    }
+  }
+}

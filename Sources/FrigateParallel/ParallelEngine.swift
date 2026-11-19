@@ -79,13 +79,18 @@ public final class ParallelEngine: @unchecked Sendable {
         let suffix: [Int]
         /// Where in `suffix` the turn boundary ends, when it is inside it and a slot keeps the cache.
         let pin: Int?
+        /// Where in `suffix` the stable prefix ends, when it is inside it and a slot keeps the cache.
+        let anchor: Int?
         var done = 0
         let startedAt = Date()
 
-        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int], pin: Int? = nil) {
+        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int], pin: Int? = nil, anchor: Int? = nil) {
             self.row = row; self.layers = layers; self.slotCache = slotCache; self.suffix = suffix; self.pin = pin
+            self.anchor = anchor
         }
         var isDone: Bool { done >= suffix.count }
+        /// The next point past `done` a chunk must end at: the anchor or the pin, whichever comes first.
+        var nextStop: Int? { [anchor, pin].compactMap { $0 }.filter { $0 > done }.min() }
     }
 
     public let configuration: Configuration
@@ -534,8 +539,9 @@ public final class ParallelEngine: @unchecked Sendable {
         row.reused = prefix
         if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }
         // A boundary the cache already holds, or the prompt's very end, needs no pin of its own.
-        let pin = row.request.pinAt.flatMap { at in slotCache != nil && at > prefix && at < row.request.tokens.count ? at - prefix : nil }
-        prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]), pin: pin)
+        let inside: (Int?) -> Int? = { at in at.flatMap { slotCache != nil && $0 > prefix && $0 < row.request.tokens.count ? $0 - prefix : nil } }
+        prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]),
+                             pin: inside(row.request.pinAt), anchor: inside(row.request.anchorAt))
     }
 
     /// A request may start reading now: one that joins the batch needs a row free there; one read only to be kept
@@ -576,8 +582,8 @@ public final class ParallelEngine: @unchecked Sendable {
             return
         }
         var upTo = min(job.done + max(1, tokens), job.suffix.count)
-        // A chunk ends at the turn boundary, so the cache stands exactly there once.
-        if let pin = job.pin, job.done < pin, upTo > pin { upTo = pin }
+        // A chunk ends at the anchor and at the turn boundary, so the cache stands exactly there once.
+        if let stop = job.nextStop, upTo > stop { upTo = stop }
         let piece = Array(job.suffix[job.done ..< upTo])
         let last = upTo == job.suffix.count
         // A prompt read only to be kept samples nothing: its last chunk is evaluated as any other is.
@@ -589,6 +595,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.pending = sample(logits: logits[0..., -1, 0...], row: row)
             } else {
                 eval(job.layers.flatMap { $0.innerState() })
+                if let anchor = job.anchor, upTo == anchor { job.slotCache?.snapshot(at: row.reused + anchor, anchored: true) }
                 if let pin = job.pin, upTo == pin { job.slotCache?.snapshot(at: row.reused + pin, pinned: true) }
             }
         } else if last, !keeps {

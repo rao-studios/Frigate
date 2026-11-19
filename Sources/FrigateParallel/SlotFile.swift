@@ -35,9 +35,9 @@ public struct SlotFile: Sendable, Equatable {
 
 /// Writes and reads `frigate-slot/1`. On the engine's thread only: every array is evaluated there.
 ///
-/// Arrays: `tokens` (int32), `layers.<layer>.<n>` (each layer's state), `pinned.<layer>.<n>` and `ring.<k>.<layer>.<n>`
-/// (the snapshots' recurrent arrays). Metadata: `format`, `layout`, `tokens`, `pinned` and `ring` (the snapshots'
-/// token counts), and the caller's own keys as `meta.<key>`.
+/// Arrays: `tokens` (int32), `layers.<layer>.<n>` (each layer's state), `pinned.<layer>.<n>`, `anchor.<layer>.<n>` and
+/// `ring.<k>.<layer>.<n>` (the snapshots' recurrent arrays). Metadata: `format`, `layout`, `tokens`, `pinned`, `anchor`
+/// and `ring` (the snapshots' token counts), and the caller's own keys as `meta.<key>`.
 enum SlotFileCodec {
     static func write(_ cache: CheckpointedCache, tokens: [Int], layout: CacheLayout, metadata: [String: String],
                       to url: URL) throws -> SlotFile {
@@ -51,9 +51,11 @@ enum SlotFileCodec {
             }
         }
         if let pinned = cache.pinned { put(pinned, under: "pinned") }
+        if let anchor = cache.anchor { put(anchor, under: "anchor") }
         for (k, snapshot) in cache.snapshots.enumerated() { put(snapshot, under: "ring.\(k)") }
         var header = ["format": SlotFile.format, "layout": layout.signature, "tokens": String(tokens.count)]
         header["pinned"] = cache.pinned.map { String($0.tokenCount) }
+        header["anchor"] = cache.anchor.map { String($0.tokenCount) }
         if !cache.snapshots.isEmpty { header["ring"] = cache.snapshots.map { String($0.tokenCount) }.joined(separator: ",") }
         for (key, value) in metadata { header["meta." + key] = value }
 
@@ -118,7 +120,8 @@ enum SlotFileCodec {
         let counts = (header["ring"] ?? "").split(separator: ",").map { Int($0) }
         let snapshots = counts.enumerated().compactMap { k, count in snapshot(count, under: "ring.\(k)") }
         let cache = CheckpointedCache(layers: layers, ring: ring, snapshots: snapshots,
-                                      pinned: snapshot(header["pinned"].flatMap { Int($0) }, under: "pinned"))
+                                      pinned: snapshot(header["pinned"].flatMap { Int($0) }, under: "pinned"),
+                                      anchor: snapshot(header["anchor"].flatMap { Int($0) }, under: "anchor"))
         if layout.kinds.contains(.attention), cache.position != tokens.count {
             throw refuse("its layers hold \(cache.position) tokens, its header \(tokens.count)")
         }
