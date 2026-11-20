@@ -234,3 +234,36 @@ struct Mamba3LiveTests {
         #expect(held < 2 * state)
     }
 }
+
+/// The commons published at BF16 (FRIGATE_MAMBA3_COMMONS_BF16) beside the F32 one (FRIGATE_MAMBA3_COMMONS): the same
+/// model. The F32 checkpoint is BF16 values widened, so loading it narrowed and loading the BF16 checkpoint as it is
+/// must give the same logits and the same reading.
+private var bf16Paths: (wide: URL, narrow: URL)? {
+    let env = ProcessInfo.processInfo.environment
+    guard let w = env["FRIGATE_MAMBA3_COMMONS"], let n = env["FRIGATE_MAMBA3_COMMONS_BF16"] else { return nil }
+    return (URL(fileURLWithPath: w), URL(fileURLWithPath: n))
+}
+
+@Suite("Mamba-3, the commons at BF16", .enabled(if: mlxFunctional && bf16Paths != nil), .serialized)
+struct Mamba3BF16CheckpointTests {
+    @Test func theBF16CheckpointIsTheF32OneNarrowed() throws {
+        let (wide, narrow) = bf16Paths!
+        let tokens = MLXArray([128_000] + (0 ..< 255).map { Int32(($0 * 7_919) % 120_000 + 100) }).reshaped(1, 256)
+        let narrowed = try Mamba3Loader.load(from: wide, weightDType: .bfloat16)
+        let wideLogits = narrowed(tokens, cache: narrowed.newCache(parameters: nil)).asType(.float32)
+        let wideReading = narrowed.read(tokens, cache: narrowed.newCache(parameters: nil), tap: 12)
+        eval(wideLogits, wideReading.tappedSum, wideReading.last)
+        let published = try Mamba3Loader.load(from: narrow, weightDType: .bfloat16)
+        for (key, value) in published.parameters().flattened() where Mamba3Loader.narrows(key) {
+            #expect(value.dtype == .bfloat16, "\(key)")
+        }
+        let logits = published(tokens, cache: published.newCache(parameters: nil)).asType(.float32)
+        let reading = published.read(tokens, cache: published.newCache(parameters: nil), tap: 12)
+        let gap = abs(logits - wideLogits).max().item(Float.self)
+        let readingGap = max(abs(reading.tappedSum - wideReading.tappedSum).max().item(Float.self),
+                             abs(reading.last - wideReading.last).max().item(Float.self))
+        print(String(format: "MAMBA3 BF16 checkpoint against F32 narrowed: max |Δ logit| %.3e, max |Δ reading| %.3e", gap, readingGap))
+        #expect(gap == 0)
+        #expect(readingGap == 0)
+    }
+}
