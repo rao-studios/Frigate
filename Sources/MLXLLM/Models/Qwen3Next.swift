@@ -338,7 +338,9 @@ final class Qwen3NextSparseMoeBlock: Module {
 
         let k = topK
         let kth = gates.dim(-1) - k
-        let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
+        // The chosen experts are a choice, not a value: no gradient reaches them, as mlx-lm's `stop_gradient` has it.
+        // Without it a gradient through the layer (a bridge trained through the model) asks `gather_qmm` for one.
+        let inds = MLX.stopGradient(MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...])
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopkProb {
             scores = scores / scores.sum(axis: -1, keepDims: true)
@@ -447,7 +449,12 @@ public class Qwen3NextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        callAsFunction(embeddings: embedTokens(inputs), cache: cache)
+    }
+
+    /// The decoder after the embedding lookup, what a soft span's vectors run through (`SoftPromptModel`).
+    func callAsFunction(embeddings: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        var hiddenStates = embeddings
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -468,7 +475,7 @@ public class Qwen3NextModelInner: Module {
     }
 }
 
-public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider, SoftPromptModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -489,13 +496,24 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
-        if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
-        }
-        return out
+        logits(model(inputs, cache: cache))
+    }
+
+    public func callAsFunction(embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
+        logits(model(embeddings: embeddings, cache: cache))
+    }
+
+    public var hiddenSize: Int { configuration.hiddenSize }
+
+    /// Gated DeltaNet runs its chunked form under `GatedDeltaPath.differentiable`; attention, norms and the
+    /// (quantized) experts already carry input gradients.
+    public var takesInputGradients: Bool { true }
+
+    public func embed(_ ids: MLXArray) -> MLXArray { model.embedTokens(ids) }
+
+    private func logits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead { return lmHead(hidden) }
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

@@ -366,6 +366,18 @@ public struct Mamba3Reading {
     public let last: MLXArray
     /// Positions read.
     public let count: Int
+    /// With a stride: at every `stride`-th position of the piece and at its last, the residual after `tap` blocks and
+    /// the final normed hidden state side by side, float32 [B, ⌈count / stride⌉, 2·D]. What a bridge projects into a
+    /// core model's embeddings: each row is the stream so far, as of that position.
+    public var strided: MLXArray? = nil
+
+    /// The positions a strided read keeps out of `count`: every `stride`-th, and the last.
+    public static func stridePositions(count: Int, stride: Int) -> [Int] {
+        precondition(count > 0 && stride > 0, "a strided read keeps positions of a piece")
+        var positions = Array(Swift.stride(from: stride - 1, to: count, by: stride))
+        if positions.last != count - 1 { positions.append(count - 1) }
+        return positions
+    }
 }
 
 public final class Mamba3Model: Module, LLMModel {
@@ -390,21 +402,33 @@ public final class Mamba3Model: Module, LLMModel {
     /// Reads `tokens` [B,L] into `cache` (one `newCache` per stream, carried across reads) without the vocabulary
     /// projection, which at the 1.5b is 263M of its parameters. Each layer is evaluated as it goes, so the graph never
     /// grows with the piece.
-    public func read(_ tokens: MLXArray, cache: [KVCache], tap: Int? = nil) -> Mamba3Reading {
+    /// With `stride`, the reading also keeps `strided` (`Mamba3Reading.stridePositions`).
+    public func read(_ tokens: MLXArray, cache: [KVCache], tap: Int? = nil, stride: Int? = nil) -> Mamba3Reading {
         let tap = tap ?? config.tapAfterBlocks
         precondition((1 ... config.numHiddenLayers).contains(tap), "tap \(tap) is outside 1...\(config.numHiddenLayers)")
         precondition(cache.count == config.numHiddenLayers, "one cache per layer")
+        let positions = stride.map { MLXArray(Mamba3Reading.stridePositions(count: tokens.dim(1), stride: $0).map(Int32.init)) }
         var h = backbone.embed(tokens)
         var tapped: MLXArray?
+        var tappedRows: MLXArray?
         for (i, layer) in backbone.layers.enumerated() {
             let layerCache = cache[i] as? ArraysCache
             h = layer(h, cache: layerCache)
-            if i + 1 == tap { tapped = h.sum(axis: 1) }
-            eval([h] + (layerCache?.state ?? []) + (tapped.map { [$0] } ?? []))
+            if i + 1 == tap {
+                tapped = h.sum(axis: 1)
+                tappedRows = positions.map { h.take($0, axis: 1) }
+            }
+            eval([h] + (layerCache?.state ?? []) + [tapped, tappedRows].compactMap { $0 })
         }
         let last = backbone.normF(h[0..., (h.dim(1) - 1)...]).squeezed(axis: 1)
-        eval(last)
-        return Mamba3Reading(tappedSum: tapped!, last: last, count: tokens.dim(1))
+        var reading = Mamba3Reading(tappedSum: tapped!, last: last, count: tokens.dim(1))
+        if let positions, let tappedRows {
+            reading.strided = concatenated([tappedRows, backbone.normF(h.take(positions, axis: 1))], axis: -1)
+            eval(last, reading.strided!)
+        } else {
+            eval(last)
+        }
+        return reading
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

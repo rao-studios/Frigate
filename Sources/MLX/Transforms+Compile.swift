@@ -36,9 +36,15 @@ final class CompiledFunction: @unchecked (Sendable) {
         mlx_detail_compile_erase(id)
     }
 
+    /// PIN: `evalLock` before `lock`, the order every thread takes them in. `vjp` and `jvp` hold `evalLock` while
+    /// they trace a function, and the trace calls compiled functions (`silu`, …); a call that took its own lock first
+    /// and `evalLock` inside `innerCall` waited on a gradient trace on another thread that waited on it (Frigate,
+    /// 2026-11-19: a bridge's gradient through Qwen3.5 beside a Mamba-3 read).
     func call(_ arguments: [MLXArray]) -> [MLXArray] {
-        lock.withLock {
-            innerCall(arguments)
+        evalLock.withLock {
+            lock.withLock {
+                innerCall(arguments)
+            }
         }
     }
 

@@ -59,6 +59,13 @@ public final class ParallelEngine: @unchecked Sendable {
         case shutdown
         case keep(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
         case take(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
+        case borrow(Borrower)
+    }
+
+    /// Work that runs on the engine's thread with its model once the engine is idle (`borrow`).
+    private struct Borrower {
+        let run: (any LanguageModel) -> Void
+        let fail: (Error) -> Void
     }
 
     private final class Slot {
@@ -108,6 +115,8 @@ public final class ParallelEngine: @unchecked Sendable {
     private var prefill: PrefillJob?
     /// Prompts set aside mid-read for a request someone waits on more, in the order they read on: priority, then age.
     private var suspended: [PrefillJob] = []
+    /// `borrow` calls waiting for the engine to be idle, oldest first.
+    private var borrowers: [Borrower] = []
     /// How a pass is shared between the rows and the prompt being read, and what the engine's time went to.
     private var interleave: InterleavePolicy
     private var clock = InterleavePolicy.Clock()
@@ -224,6 +233,31 @@ public final class ParallelEngine: @unchecked Sendable {
         try await answered { .take(slot, url, expecting, $0) }
     }
 
+    /// Runs `body` on the engine's thread with its model, once no stream is queued, reading or decoding. A stream that
+    /// arrives while `body` runs waits until it returns, so a caller keeps each call short: one training step, say.
+    /// What a trainer steps through the loaded model with, since only this engine evaluates it. MLX errors inside
+    /// `body` are thrown here, as is `shutDown`.
+    ///
+    /// PIN: idle only. A borrowed call never runs beside a stream, so it neither stalls a decode mid-sequence nor
+    /// touches a cache a stream holds; streams come first whenever both are waiting.
+    public func borrow<T>(_ body: @escaping (any LanguageModel) throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            let borrower = Borrower(
+                run: { model in
+                    do { continuation.resume(returning: try withError { try body(model) }) }
+                    catch { continuation.resume(throwing: error) }
+                },
+                fail: { continuation.resume(throwing: $0) })
+            let posted: Bool = condition.withLock {
+                guard !closed else { return false }
+                commands.append(.borrow(borrower))
+                condition.signal()
+                return true
+            }
+            if !posted { continuation.resume(throwing: ParallelError.shutDown) }
+        }
+    }
+
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() {
@@ -261,7 +295,7 @@ public final class ParallelEngine: @unchecked Sendable {
         while true {
             // Commands first; sleep only when there is nothing to do.
             condition.lock()
-            while commands.isEmpty && queue.isEmpty && prefill == nil && suspended.isEmpty && batch.isEmpty && running {
+            while commands.isEmpty && queue.isEmpty && prefill == nil && suspended.isEmpty && batch.isEmpty && borrowers.isEmpty && running {
                 condition.wait()
             }
             let pending = commands
@@ -293,10 +327,14 @@ public final class ParallelEngine: @unchecked Sendable {
                 do { try withError { prefillChunk(job, tokens: tokens) } } catch { failPrefill(job, "prefill failed: \(error)") }
                 if job.done > before { clock.read(tokens: job.done - before, seconds: Date().timeIntervalSince(began)) }
             case nil:
-                break
+                if queue.isEmpty, prefill == nil, suspended.isEmpty, batch.isEmpty, !borrowers.isEmpty {
+                    borrowers.removeFirst().run(model)
+                }
             }
             publishStats()
         }
+        for borrower in borrowers { borrower.fail(ParallelError.shutDown) }
+        borrowers.removeAll()
         // Shut down: every stream still here ends.
         for row in queue { end(row, reason: .removed, layers: nil) }
         if let job = prefill { end(job.row, reason: .removed, layers: nil) }
@@ -367,6 +405,8 @@ public final class ParallelEngine: @unchecked Sendable {
             answer(Result { try withError { try keepSlot(id, to: url, metadata: metadata) } })
         case .take(let id, let url, let expecting, let answer):
             answer(Result { try withError { try takeSlot(id, from: url, expecting: expecting) } })
+        case .borrow(let borrower):
+            borrowers.append(borrower)
         }
     }
 
@@ -492,6 +532,11 @@ public final class ParallelEngine: @unchecked Sendable {
         case .admit:
             heldBack = false
         }
+        if let problem = queue[index].request.softProblem(width: (model as? any SoftPromptModel)?.hiddenSize) {
+            let refused = queue.remove(at: index)
+            end(refused, reason: .failed, layers: nil, message: problem)
+            return
+        }
         if let job = prefill { suspend(job) }
         let row = queue.remove(at: index)
         row.admittedAt = Date()
@@ -537,7 +582,8 @@ public final class ParallelEngine: @unchecked Sendable {
             layers = model.newCache(parameters: nil)
         }
         row.reused = prefix
-        if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }
+        // A logits processor sees the prompt's tokens; a soft span's placeholders are none of them.
+        if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.filter { $0 >= 0 }.map(Int32.init))) }
         // A boundary the cache already holds, or the prompt's very end, needs no pin of its own.
         let inside: (Int?) -> Int? = { at in at.flatMap { slotCache != nil && $0 > prefix && $0 < row.request.tokens.count ? $0 - prefix : nil } }
         prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]),
@@ -589,8 +635,7 @@ public final class ParallelEngine: @unchecked Sendable {
         // A prompt read only to be kept samples nothing: its last chunk is evaluated as any other is.
         let keeps = row.request.prefillOnly
         if !piece.isEmpty {
-            let input = MLXArray(piece.map(Int32.init)).reshaped(1, piece.count)
-            let logits = model(input, cache: job.layers)
+            let logits = forward(piece, at: row.reused + job.done, request: row.request, layers: job.layers)
             if last, !keeps {
                 row.pending = sample(logits: logits[0..., -1, 0...], row: row)
             } else {
@@ -626,6 +671,33 @@ public final class ParallelEngine: @unchecked Sendable {
         batch.extend(row, layers: layers)
         let first = MLXArray([row.pending])
         pendingTokens = pendingTokens.map { concatenated([$0, first], axis: 0) } ?? first
+    }
+
+    /// The model over `piece`, which begins at prompt position `start`: token ids as they are, and a soft span's
+    /// placeholders replaced by its vectors, cast to the embedding's dtype (admission checked every placeholder is a
+    /// span's, so each negative id has one).
+    private func forward(_ piece: [Int], at start: Int, request: StreamRequest, layers: [KVCache]) -> MLXArray {
+        guard !request.soft.isEmpty, piece.contains(where: { $0 < 0 }), let soft = model as? any SoftPromptModel else {
+            return model(MLXArray(piece.map(Int32.init)).reshaped(1, piece.count), cache: layers)
+        }
+        var segments: [MLXArray] = []
+        var i = 0
+        while i < piece.count {
+            let position = start + i
+            if piece[i] < 0, let span = request.soft.first(where: { position >= $0.start && position < $0.start + $0.count }) {
+                let end = min(piece.count, span.start + span.count - start)
+                let from = (position - span.start) * span.width
+                segments.append(MLXArray(Array(span.vectors[from ..< from + (end - i) * span.width])).reshaped(1, end - i, span.width))
+                i = end
+            } else {
+                var end = i + 1
+                while end < piece.count, piece[end] >= 0 { end += 1 }
+                segments.append(soft.embed(MLXArray(piece[i ..< end].map { Int32(max(0, $0)) }).reshaped(1, end - i)))
+                i = end
+            }
+        }
+        let dtype = soft.embed(MLXArray([Int32(0)]).reshaped(1, 1)).dtype
+        return soft(embeddings: concatenated(segments.map { $0.asType(dtype) }, axis: 1), cache: layers)
     }
 
     // MARK: - Decode
