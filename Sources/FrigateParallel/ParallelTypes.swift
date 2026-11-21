@@ -26,49 +26,8 @@ public enum StreamPriority: Int, Sendable, Comparable {
     public static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
 }
 
-/// Vectors a prompt carries where tokens would be (`SoftPromptModel`): a tower's reading of something, spliced in at
-/// `start`. Its place in `StreamRequest.tokens` is held by `placeholders`: negative ids no vocabulary has, made from the
-/// vectors' digest and the position, so a slot's prefix match tells two spans apart and reuses a span it already read
-/// like any tokens. Every placeholder fits in an Int32, as a slot file keeps them.
-public struct SoftSpan: Sendable, Equatable {
-    /// Where the span begins in the prompt.
-    public var start: Int
-    /// How many positions it takes.
-    public var count: Int
-    /// The width of each vector: the model's hidden size.
-    public var width: Int
-    /// `count × width` numbers, row by row.
-    public var vectors: [Float]
-    /// The vectors' digest (FNV-1a over their bit patterns), which the placeholders are made from.
-    public var digest: UInt64
-
-    public init(start: Int, vectors: [Float], width: Int) {
-        precondition(width > 0 && vectors.count % width == 0 && !vectors.isEmpty, "a span is whole rows of its width")
-        self.start = start; self.width = width; self.vectors = vectors; self.count = vectors.count / width
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for value in vectors {
-            hash ^= UInt64(value.bitPattern)
-            hash = hash &* 0x0000_0100_0000_01b3
-        }
-        self.digest = hash
-    }
-
-    /// The ids that hold the span's place in the prompt, one a position.
-    public var placeholders: [Int] { (0 ..< count).map { Self.placeholder(digest, $0) } }
-
-    /// A negative id in Int32's range, its own for each position of each digest (splitmix64 of the two).
-    static func placeholder(_ digest: UInt64, _ position: Int) -> Int {
-        var z = digest &+ UInt64(position) &* 0x9e37_79b9_7f4a_7c15
-        z = (z ^ (z >> 30)) &* 0xbf58_476d_1ce4_e5b9
-        z = (z ^ (z >> 27)) &* 0x94d0_49bb_1331_11eb
-        z ^= z >> 31
-        return -1 - Int(z & 0x7fff_fffe)
-    }
-}
-
 public struct StreamRequest: Sendable {
-    /// The whole prompt. What the slot already holds is not prefilled again. A soft span's positions hold its
-    /// placeholders (`SoftSpan.placeholders`).
+    /// The whole prompt. What the slot already holds is not prefilled again.
     public var tokens: [Int]
     public var sampling: GenerateParameters
     public var maxTokens: Int
@@ -88,32 +47,13 @@ public struct StreamRequest: Sendable {
     /// the slot continues from the prompt's end. What a session reads ahead of a request it knows is coming. It needs a
     /// slot, since nothing else would keep what it read, and it finishes `prefilled`.
     public var prefillOnly: Bool
-    /// Vectors the prompt carries where its placeholders are, read as the model reads its own embeddings. The model
-    /// must be a `SoftPromptModel`, and a span never ends the prompt: its last position is always a token.
-    public var soft: [SoftSpan]
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
                 priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil,
-                anchorAt: Int? = nil, prefillOnly: Bool = false, soft: [SoftSpan] = []) {
+                anchorAt: Int? = nil, prefillOnly: Bool = false) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
         self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.anchorAt = anchorAt
-        self.prefillOnly = prefillOnly; self.soft = soft
-    }
-
-    /// Why the engine cannot read this request's soft spans with a model of `width`, or nil when it can.
-    func softProblem(width: Int?) -> String? {
-        let held = tokens.reduce(0) { $0 + ($1 < 0 ? 1 : 0) }
-        guard !soft.isEmpty else { return held == 0 ? nil : "the prompt holds placeholders but no soft span" }
-        guard let width else { return "the model takes no soft spans" }
-        if held != soft.reduce(0, { $0 + $1.count }) { return "the prompt's placeholders are not its soft spans'" }
-        for span in soft {
-            if span.width != width { return "a soft span is \(span.width) wide; the model is \(width)" }
-            if span.start < 0 || span.start + span.count >= tokens.count { return "a soft span must end before the prompt does" }
-            if Array(tokens[span.start ..< span.start + span.count]) != span.placeholders {
-                return "a soft span's positions do not hold its placeholders"
-            }
-        }
-        return nil
+        self.prefillOnly = prefillOnly
     }
 }
 

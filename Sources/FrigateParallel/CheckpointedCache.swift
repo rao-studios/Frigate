@@ -21,11 +21,11 @@
 //        previous ask. Every round of that turn snapshots, and a four-slot ring had dropped the ask's
 //        point by round five: each follow-up prefilled 30–40k tokens from zero (Craft, 2026-11-05).
 //        One pinned snapshot per cache, replaced by the next pin, invalidated like any other.
-//  PIN:  The end of the stable prefix is ANCHORED, outside the ring and apart from the pin (Craft, 2026-11-18). When
-//        Craft's Braid folds older turns out of a session's history, the next prompt shares the last one only up to
-//        the system prompt and tools (~17k tokens); the turn pin sits past the fold and the ring is newer still, so
-//        without the anchor every fold read the system prompt again. The anchor is replaced only by the next anchor,
-//        and memory pressure drops it last.
+//  PIN:  The end of the stable prefix is ANCHORED, outside the ring and apart from the pin (Craft, 2026-11-18). When a
+//        session's history is rewritten (Craft's compaction replaces older turns with a summary), the next prompt
+//        shares the last one only up to the system prompt and tools (~17k tokens); the turn pin sits past the rewrite
+//        and the ring is newer still, so without the anchor every rewrite read the system prompt again. The anchor is
+//        replaced only by the next anchor, and memory pressure drops it last.
 //  PIN:  `release` and `adopt` hand the layers to the parallel engine's batch and back. While they are
 //        out, the snapshots stay here, and nothing here references the buffers the batch writes.
 

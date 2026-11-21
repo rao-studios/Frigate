@@ -270,94 +270,6 @@ func gatedDeltaOps(
     return (y, state)
 }
 
-// MARK: - Chunked (differentiable)
-
-/// Where the Gated DeltaNet layers run differentiably: inside `$differentiable.withValue(true)`, an unmasked update runs
-/// `gatedDeltaChunked` instead of the Metal kernel, which has no gradient. What a bridge trained through a frozen
-/// Qwen3.5 or Qwen3-Next reads its loss back through (`SoftPromptModel.takesInputGradients`).
-public enum GatedDeltaPath {
-    @TaskLocal public static var differentiable = false
-}
-
-/// `(I - n)⁻¹` for `n` strictly lower triangular in its last two axes (a power of two wide), by halves: the inverse of
-/// `[[A, 0], [B, D]]` is `[[A⁻¹, 0], [-D⁻¹BA⁻¹, D⁻¹]]`. Matmuls only, so autograd keeps a few small products rather than
-/// every row of a forward substitution.
-func unitLowerInverse(_ n: MLXArray) -> MLXArray {
-    let c = n.dim(-1)
-    if c == 1 { return MLXArray.ones(n.shape, dtype: n.dtype) }
-    let h = c / 2
-    let a = unitLowerInverse(n[.ellipsis, ..<h, ..<h])
-    let d = unitLowerInverse(n[.ellipsis, h..., h...])
-    let b = matmul(matmul(d, n[.ellipsis, h..., ..<h]), a)
-    var zeroShape = a.shape
-    zeroShape[zeroShape.count - 1] = c - h
-    let top = concatenated([a, MLXArray.zeros(zeroShape, dtype: a.dtype)], axis: -1)
-    return concatenated([top, concatenated([b, d], axis: -1)], axis: -2)
-}
-
-/// The Gated DeltaNet recurrence of `gatedDeltaOps`, 64 positions a chunk (the WY form): within a chunk the delta rule
-/// is a unit lower-triangular solve and matmuls, and only the state at each chunk's end is carried. The same y and
-/// state as the kernel to float32 rounding (GatedDeltaChunkedTests), at a cost autograd can keep: one state a chunk,
-/// not one a position. `logG` is the decay's log (`computeGatedDeltaG` before its `exp`); q and k arrive normed and
-/// scaled, as the layer passes them to the kernel. No mask: a training batch is one unpadded row.
-func gatedDeltaChunked(
-    q: MLXArray, k: MLXArray, v: MLXArray, logG: MLXArray, beta: MLXArray, state: MLXArray, chunk: Int = 64
-) -> (MLXArray, MLXArray) {
-    let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = v.dim(2), Dv = v.dim(3)
-    let outType = q.dtype
-    var q = q.asType(.float32), k = k.asType(.float32)
-    if Hv / Hk > 1 {
-        q = repeated(q, count: Hv / Hk, axis: -2)
-        k = repeated(k, count: Hv / Hk, axis: -2)
-    }
-    // [B, H, T, D], padded to whole chunks: a padded position has k = 0, β = 0 and log g = 0, so it moves nothing.
-    let pad = (chunk - T % chunk) % chunk
-    func heads(_ x: MLXArray) -> MLXArray {
-        let x = x.transposed(0, 2, 1, 3)
-        return pad == 0 ? x : padded(x, widths: [0, 0, [0, pad], 0] as [IntOrPair])
-    }
-    func gates(_ x: MLXArray) -> MLXArray {
-        let x = x.asType(.float32).transposed(0, 2, 1)
-        return pad == 0 ? x : padded(x, widths: [0, 0, [0, pad]] as [IntOrPair])
-    }
-    let n = (T + pad) / chunk
-    let qh = heads(q).reshaped(B, Hv, n, chunk, Dk)
-    let kh = heads(k).reshaped(B, Hv, n, chunk, Dk)
-    let vh = heads(v.asType(.float32)).reshaped(B, Hv, n, chunk, Dv)
-    let bh = gates(beta).reshaped(B, Hv, n, chunk)
-    let g = cumsum(gates(logG).reshaped(B, Hv, n, chunk), axis: -1)
-
-    let rows = MLXArray(0 ..< Int32(chunk)).reshaped(chunk, 1)
-    let cols = MLXArray(0 ..< Int32(chunk)).reshaped(1, chunk)
-    let lowerWithDiagonal = rows .>= cols
-    let strictlyLower = rows .> cols
-    // decay[i, j] = exp(g_i - g_j) on and below the diagonal, 0 above.
-    let decay = exp(MLX.where(lowerWithDiagonal, expandedDimensions(g, axis: -1) - expandedDimensions(g, axis: -2), MLXArray(Float(0))))
-        * lowerWithDiagonal.asType(.float32)
-    let kBeta = kh * expandedDimensions(bh, axis: -1)
-    let vBeta = vh * expandedDimensions(bh, axis: -1)
-    let lower = -(matmul(kBeta, kh.swappedAxes(-1, -2)) * decay) * strictlyLower.asType(.float32)
-    let solve = unitLowerInverse(lower)
-    let values = matmul(solve, vBeta)
-    let kCumDecay = matmul(solve, kBeta * expandedDimensions(exp(g), axis: -1))
-
-    // The state as [B, H, Dk, Dv] (kᵀv), the layer's [B, H, Dv, Dk] transposed.
-    var m = state.asType(.float32).swappedAxes(-1, -2)
-    var outs: [MLXArray] = []
-    outs.reserveCapacity(n)
-    for i in 0 ..< n {
-        let qi = qh[0..., 0..., i], ki = kh[0..., 0..., i], gi = g[0..., 0..., i]
-        let attn = matmul(qi, ki.swappedAxes(-1, -2)) * decay[0..., 0..., i]
-        let vNew = values[0..., 0..., i] - matmul(kCumDecay[0..., 0..., i], m)
-        outs.append(matmul(qi * expandedDimensions(exp(gi), axis: -1), m) + matmul(attn, vNew))
-        let last = gi[0..., 0..., (chunk - 1)...]
-        m = m * expandedDimensions(exp(last), axis: -1)
-            + matmul((ki * expandedDimensions(exp(last - gi), axis: -1)).swappedAxes(-1, -2), vNew)
-    }
-    let y = stacked(outs, axis: 2).reshaped(B, Hv, n * chunk, Dv)[0..., 0..., ..<T].transposed(0, 2, 1, 3)
-    return (y.asType(outType), m.swappedAxes(-1, -2))
-}
-
 // MARK: - Public API
 
 public func gatedDeltaUpdate(
@@ -384,11 +296,6 @@ public func gatedDeltaUpdate(
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if state.dtype != .float32 {
         state = state.asType(.float32)
-    }
-
-    if GatedDeltaPath.differentiable, mask == nil {
-        let logG = -exp(aLog.asType(.float32)) * softplus(a + dtBias)
-        return gatedDeltaChunked(q: q, k: k, v: v, logG: logG, beta: beta, state: state)
     }
 
     if GatedDeltaKernelManager.shared.kernel != nil {

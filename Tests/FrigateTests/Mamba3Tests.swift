@@ -147,23 +147,6 @@ struct Mamba3OracleTests {
         #expect(relative(reading.tappedSum, h.sum(axis: 1)) < 1e-5)
     }
 
-    @Test func aStridedReadKeepsTheTapAndTheFinalStateAtItsPositions() throws {
-        let model = try model()
-        let count = tokens.dim(1)
-        let positions = Mamba3Reading.stridePositions(count: count, stride: 4)
-        #expect(positions.last == count - 1 && positions.dropLast().allSatisfy { ($0 + 1) % 4 == 0 })
-        #expect(Mamba3Reading.stridePositions(count: 8, stride: 4) == [3, 7])
-        let reading = model.read(tokens, cache: model.newCache(parameters: nil), tap: 1, stride: 4)
-        let strided = try #require(reading.strided)
-        let width = model.config.hiddenSize
-        #expect(strided.shape == [1, positions.count, 2 * width])
-        let index = MLXArray(positions.map(Int32.init))
-        let h = model.backbone.layers[0](model.backbone.embed(tokens), cache: ArraysCache(size: 4))
-        #expect(relative(strided[0..., 0..., ..<width], h.take(index, axis: 1)) < 1e-5)
-        #expect(relative(strided[0, 0..., width...], reference["heavy_tail.final"]!.take(index, axis: 0)) < 1e-4)
-        #expect(model.read(tokens, cache: model.newCache(parameters: nil), tap: 1).strided == nil)
-    }
-
     @Test func theBF16LoaderNarrowsOnlyTheMatrices() throws {
         let narrow = try model(dtype: .bfloat16)
         let wide = try model()

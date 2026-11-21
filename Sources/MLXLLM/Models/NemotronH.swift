@@ -666,12 +666,7 @@ private class NemotronHBackbone: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        callAsFunction(embedded: embeddings(inputs), cache: cache)
-    }
-
-    /// The backbone after the embedding lookup, what a soft span's vectors run through (`SoftPromptModel`).
-    func callAsFunction(embedded: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        var hidden = embedded
+        var hidden = embeddings(inputs)
 
         // Create attention mask using the first attention layer's cache
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
@@ -713,7 +708,7 @@ private class NemotronHBackbone: Module {
 
 // MARK: - Main Model (matches Python's Model class)
 
-public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel, SoftPromptModel {
+public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -748,20 +743,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(backbone(inputs, cache: cache))
-    }
-
-    public func callAsFunction(embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(backbone(embedded: embeddings, cache: cache))
-    }
-
-    public var hiddenSize: Int { configuration.hiddenSize }
-
-    public func embed(_ ids: MLXArray) -> MLXArray { backbone.embeddings(ids) }
-
-    private func logits(_ hidden: MLXArray) -> MLXArray {
-        if let lmHead { return lmHead(hidden) }
-        return backbone.embeddings.asLinear(hidden)
+        var out = backbone(inputs, cache: cache)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = backbone.embeddings.asLinear(out)
+        }
+        return out
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
