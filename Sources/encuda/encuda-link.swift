@@ -1,3 +1,4 @@
+// Frigate: the CudaBuild plugin is cross-compiled for the iOS family by xcodebuild, where Process is absent.
 #if !os(iOS) && !os(tvOS) && !os(watchOS) && !os(visionOS)
 import ArgumentParser
 import Foundation
@@ -26,11 +27,21 @@ extension Encuda {
         @Flag(name: .customShort("v"), help: "Enable verbose output")
         var verbose: Bool = false
 
+        @Flag(name: .customLong("incremental"), help: "Skip link if output is up to date")
+        var incremental: Bool = false
+
         mutating func run() throws {
             if verbose {
                 print("CUDA Link")
                 print("Input files: \(inputFiles)")
                 print("Output file: \(output)")
+            }
+
+            if incremental && isUpToDate() {
+                if verbose {
+                    print("Output is up to date, skipping link")
+                }
+                return
             }
 
             let stdArgs = std.map { ["-std=\($0)"] } ?? []
@@ -71,27 +82,50 @@ extension Encuda {
         }
 
         func nvcc(args: [String]) throws {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: resolvedNvcc)
-            process.arguments = ["-ccbin=\(resolvedClangpp)"] + (verbose ? ["-v"] : []) + args
-            try process.run()
-            process.waitUntilExitWorkaround()
-            guard process.terminationStatus == 0 else {
-                throw EncudaError.nvccFailed(process.terminationStatus)
-            }
+            #if os(macOS) || os(Linux)
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: resolvedNvcc)
+                process.arguments = ["-ccbin=\(resolvedClangpp)"] + (verbose ? ["-v"] : []) + args
+                try process.run()
+                let status = process.waitForExitStatus()
+                guard status == 0 else {
+                    throw EncudaError.nvccFailed(status)
+                }
+            #endif
         }
 
         func clang(args: [String]) throws {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: resolvedClangpp)
-            process.arguments = (verbose ? ["-v"] : []) + args
-            try process.run()
-            process.waitUntilExitWorkaround()
-            guard process.terminationStatus == 0 else {
-                throw EncudaError.clangFailed(process.terminationStatus)
+            #if os(macOS) || os(Linux)
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: resolvedClangpp)
+                process.arguments = (verbose ? ["-v"] : []) + args
+                try process.run()
+                let status = process.waitForExitStatus()
+                guard status == 0 else {
+                    throw EncudaError.clangFailed(status)
+                }
+            #endif
+        }
+
+        private func isUpToDate() -> Bool {
+            let fm = FileManager.default
+            let outputURL = URL(fileURLWithPath: output)
+            guard fm.fileExists(atPath: output),
+                let outputMod =
+                    (try? outputURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+            else { return false }
+            for input in inputFiles {
+                guard fm.fileExists(atPath: input),
+                    let inputMod =
+                        (try? URL(fileURLWithPath: input).resourceValues(forKeys: [
+                            .contentModificationDateKey
+                        ]))?.contentModificationDate
+                else { return false }
+                if inputMod >= outputMod { return false }
             }
+            return true
         }
     }
 }
-
 #endif

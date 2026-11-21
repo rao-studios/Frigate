@@ -16,6 +16,110 @@ import Foundation
 private let xetMinimumFileSizeBytes = 16 * 1024 * 1024  // 16MiB
 private let snapshotUnknownFileWeight: Int64 = 1
 
+/// Per-file progress for a snapshot download, delivered alongside the
+/// aggregate `Progress`. The downloader already tracks a child `Progress` per
+/// file to weight the aggregate; this exposes it so a caller can render one row
+/// per file instead of a single aggregate bar.
+///
+/// Sampled by the same 100 ms task that drives `progressHandler`, plus a final
+/// emission once the download succeeds. A snapshot served entirely from cache
+/// emits one complete set of rows and nothing else; a download that throws or
+/// is cancelled emits no terminal set, matching `progressHandler`.
+///
+/// Opt-in: only the `downloadSnapshot` overloads that take a
+/// `fileProgressHandler` report it.
+public struct SnapshotFileProgress: Sendable {
+    /// Repo-relative file path (e.g. `model-00001-of-00006.safetensors`).
+    public let path: String
+    /// Size in bytes as declared by the repo's tree listing, or `nil` when the
+    /// listing does not declare one. Rows for a snapshot served from cache are
+    /// also `nil` when no snapshot metadata was saved for its commit; only a
+    /// download requested by commit hash saves it, not one by branch or tag.
+    ///
+    /// This is the tree entry's own value, not a running count: it is stable
+    /// for the whole download and is the figure to render a row's total from.
+    /// The per-file byte counters the transports maintain internally are not
+    /// published, because they are not uniformly bytes — Xet reports a file as
+    /// `100/100` on completion regardless of its size.
+    public let sizeBytes: Int64?
+    /// Fraction of this file transferred, in `0.0...1.0`.
+    ///
+    /// Read from the file's `Progress` in one access, so it is never a torn
+    /// pair of counters. Transports differ in how often they revise it: an LFS
+    /// download advances it per delegate callback, while a Xet download reports
+    /// nothing until the file completes.
+    public let fractionCompleted: Double
+}
+
+private func snapshotFileProgress(
+    _ rows: [(path: String, size: Int64?, progress: SnapshotProgressBox)]
+) -> [SnapshotFileProgress] {
+    rows.map { row in
+        SnapshotFileProgress(
+            path: row.path,
+            sizeBytes: row.size,
+            fractionCompleted: row.progress.value.fractionCompleted
+        )
+    }
+}
+
+/// Complete rows synthesized for a snapshot that was served from cache without
+/// downloading anything, so a caller that renders rows sees the same terminal
+/// state it would get from a real download.
+///
+/// `root` must be the cache snapshot directory: a caller-supplied destination
+/// isn't cleared before the copy and may hold unrelated files.
+private func cachedSnapshotFileProgress(
+    at root: URL,
+    matching globs: [String],
+    sizesByPath: [String: Int64]
+) -> [SnapshotFileProgress] {
+    let base = root.standardizedFileURL
+    guard
+        let enumerator = FileManager.default.enumerator(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        )
+    else { return [] }
+    let prefix = base.path.hasSuffix("/") ? base.path : base.path + "/"
+    return enumerator.compactMap { element in
+        guard let url = element as? URL else { return nil }
+        // Cache snapshots are trees of symlinks into the blob store, so resolve
+        // before asking whether this is a file.
+        let target = url.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard
+            FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
+            !isDirectory.boolValue
+        else { return nil }
+        let fullPath = url.standardizedFileURL.path
+        let path =
+            fullPath.hasPrefix(prefix)
+            ? String(fullPath.dropFirst(prefix.count))
+            : url.lastPathComponent
+        guard globs.isEmpty || globs.contains(where: { fnmatch($0, path, 0) == 0 }) else {
+            return nil
+        }
+        return SnapshotFileProgress(
+            path: path,
+            sizeBytes: sizesByPath[path],
+            fractionCompleted: 1.0
+        )
+    }
+}
+
+/// Declared file sizes from a cached snapshot's tree-listing metadata, keyed
+/// by repo-relative path; empty when there is no metadata or an entry has no
+/// declared size.
+private func snapshotSizesByPath(_ metadata: CachedSnapshotMetadata?) -> [String: Int64] {
+    guard let metadata else { return [:] }
+    return metadata.entries.reduce(into: [:]) { partial, entry in
+        if let size = entry.size {
+            partial[entry.path] = Int64(size)
+        }
+    }
+}
+
 private final class SnapshotProgressBox: @unchecked Sendable {
     let value: Progress
 
@@ -252,7 +356,7 @@ public extension HubClient {
 // MARK: - Download Operations
 
 /// Metadata associated with a Hub file response.
-private struct FileMetadata: Sendable {
+struct FileMetadata: Sendable {
     /// The repository commit hash from the `X-Repo-Commit` header.
     let commitHash: String?
 
@@ -262,22 +366,15 @@ private struct FileMetadata: Sendable {
     /// The normalized ETag used for cache storage.
     let normalizedEtag: String?
 
-    /// Creates file metadata from response header values.
-    ///
-    /// - Parameters:
-    ///   - commitHash: The repository commit hash, if provided.
-    ///   - etag: The normalized ETag value, if provided.
-    init(commitHash: String?, etag: String?) {
-        self.commitHash = commitHash
-        self.etag = etag
-        normalizedEtag = etag.map(Self.normalizeEtag)
-    }
+    /// Expected file size, before a redirect or a ranged response.
+    let size: Int64?
+    let url: URL?
+    let usesLinkedEtag: Bool
 
     /// Creates file metadata from an HTTP response.
     ///
     /// - Parameter response: The response to parse.
-    /// - Returns: `nil` when the response is not an HTTP response,
-    ///            or when it does not contain either metadata header.
+    /// - Returns: `nil` when the response is not an HTTP response.
     init?(response: URLResponse) {
         guard let httpResponse = response as? HTTPURLResponse else {
             return nil
@@ -286,11 +383,45 @@ private struct FileMetadata: Sendable {
         let linkedEtag = httpResponse.value(forHTTPHeaderField: "X-Linked-Etag")
         let etag = linkedEtag ?? httpResponse.value(forHTTPHeaderField: "ETag")
         let commitHash = httpResponse.value(forHTTPHeaderField: "X-Repo-Commit")
-        guard commitHash != nil || etag != nil else {
-            return nil
-        }
+        self.commitHash = commitHash
+        self.etag = etag
+        normalizedEtag = etag.map(Self.normalizeEtag)
+        let sizeHeader =
+            httpResponse.value(forHTTPHeaderField: "X-Linked-Size")
+            ?? ((200 ..< 300).contains(httpResponse.statusCode)
+                ? httpResponse.value(forHTTPHeaderField: "Content-Length") : nil)
+        size = sizeHeader.flatMap(Int64.init).flatMap { $0 >= 0 ? $0 : nil }
+        url = response.url
+        usesLinkedEtag = linkedEtag != nil
+    }
 
-        self.init(commitHash: commitHash, etag: etag)
+    /// CDN ETags can use a different identity scheme from Hub blob ETags.
+    func matches(_ response: HTTPURLResponse) -> Bool {
+        guard let other = FileMetadata(response: response) else { return true }
+        if let commitHash, let otherCommit = other.commitHash, commitHash != otherCommit {
+            return false
+        }
+        let sameOrigin =
+            url?.scheme == response.url?.scheme
+            && url?.host == response.url?.host && url?.port == response.url?.port
+        if let normalizedEtag, let otherEtag = other.normalizedEtag,
+            other.usesLinkedEtag || (sameOrigin && !usesLinkedEtag)
+        {
+            return normalizedEtag == otherEtag
+        }
+        return true
+    }
+
+    /// Resuming needs a pinned commit, a comparable response identity, or If-Range.
+    func allowsResume(from response: HTTPURLResponse) -> Bool {
+        if commitHash != nil { return true }
+        guard let other = FileMetadata(response: response) else { return false }
+        if other.usesLinkedEtag, let normalizedEtag, other.normalizedEtag == normalizedEtag {
+            return true
+        }
+        return !usesLinkedEtag && etag?.hasPrefix("W/") == false
+            && url?.scheme == response.url?.scheme
+            && url?.host == response.url?.host && url?.port == response.url?.port
     }
 
     private static func normalizeEtag(_ etag: String) -> String {
@@ -376,9 +507,7 @@ public extension HubClient {
         #endif
 
         // Fallback to existing LFS download method
-        let url = httpClient.host
-            .appending(path: repo.namespace)
-            .appending(path: repo.name)
+        let url = repositoryURL(repo, kind: kind)
             .appending(path: endpoint.rawValue)
             .appending(component: revision)
             .appending(path: repoPath)
@@ -420,6 +549,15 @@ public extension HubClient {
     }
 
     /// Download file to a destination URL using URLSession.downloadTask
+    ///
+    /// On Apple platforms, HTTP downloads report received bytes, including bytes
+    /// retained for a resumed transfer when the server honors the range request.
+    /// Successful transfers set both progress counts to the file size,
+    /// even when the response has no content length.
+    /// Cache hits also report the file size.
+    /// Empty files use one completed unit so their progress can finish.
+    /// Use a separate progress object for each concurrent download.
+    ///
     /// - Parameters:
     ///   - repoPath: Path to file in repository
     ///   - repo: Repository identifier
@@ -428,7 +566,13 @@ public extension HubClient {
     ///   - revision: Git revision
     ///   - endpoint: Select resolve or raw endpoint
     ///   - cachePolicy: Cache policy for the request
-    ///   - progress: Optional Progress object to track download progress
+    ///   - progress: Optional progress object that tracks output bytes.
+    ///     Xet counts reconstructed bytes written to the file.
+    ///     A successful empty Xet download uses one completed unit.
+    ///     Intermediate updates occur at most once per 100 milliseconds,
+    ///     except for the first update.
+    ///     Completion follows successful download and cleanup.
+    ///     A failed or canceled Xet attempt does not report completion.
     ///   - localFilesOnly: When `true`, resolve only from local cache and throw if missing.
     /// - Returns: Cached file path, or destination path when provided.
     func downloadFile(
@@ -452,10 +596,7 @@ public extension HubClient {
                 filename: repoPath
             )
         {
-            if let progress {
-                progress.completedUnitCount = progress.totalUnitCount
-            }
-            return try copyFileToDestinationIfNeeded(cachedPath, destination: destination)
+            return try copyFileToDestinationIfNeeded(cachedPath, destination: destination, progress: progress)
         }
 
         // Local-only mode cannot proceed without a cache hit
@@ -487,6 +628,8 @@ public extension HubClient {
                         return downloaded
                     }
                 } catch {
+                    try Task.checkCancellation()
+                    if error is CancellationError { throw error }
                     if transport == .xet {
                         throw error
                     }
@@ -495,9 +638,7 @@ public extension HubClient {
         #endif
 
         // Build URL and gather optional preflight metadata for cache-aware flows
-        let url = httpClient.host
-            .appending(path: repo.namespace)
-            .appending(path: repo.name)
+        let url = repositoryURL(repo, kind: kind)
             .appending(path: endpoint.rawValue)
             .appending(component: revision)
             .appending(path: repoPath)
@@ -511,9 +652,17 @@ public extension HubClient {
                 nil
             }
 
-        // GET request for the actual file bytes
-        var baseRequest = try await httpClient.createRequest(.get, url: url)
+        // Pin mutable revisions to the commit observed by the preflight.
+        let downloadURL =
+            preflightMetadata?.commitHash.map {
+                repositoryURL(repo, kind: kind)
+                    .appending(path: endpoint.rawValue)
+                    .appending(component: $0)
+                    .appending(path: repoPath)
+            } ?? url
+        var baseRequest = try await httpClient.createRequest(.get, url: downloadURL)
         baseRequest.cachePolicy = cachePolicy
+        baseRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
         // ETag-aware cache flow guarded by a file lock to serialize blob writes
         if let cache, let etag = preflightMetadata?.normalizedEtag {
@@ -528,12 +677,10 @@ public extension HubClient {
                     revision: revision,
                     filename: repoPath
                 ) {
-                    if let progress {
-                        progress.completedUnitCount = progress.totalUnitCount
-                    }
                     return try copyFileToDestinationIfNeeded(
                         cachedPath,
-                        destination: destination
+                        destination: destination,
+                        progress: progress
                     )
                 }
 
@@ -562,50 +709,69 @@ public extension HubClient {
                             revision: commitHash,
                             filename: repoPath
                         ) {
-                            if let progress {
-                                progress.completedUnitCount = progress.totalUnitCount
-                            }
                             return try copyFileToDestinationIfNeeded(
                                 cachedPath,
-                                destination: destination
+                                destination: destination,
+                                progress: progress
                             )
                         }
-                    }
-                    if let progress {
-                        progress.completedUnitCount = progress.totalUnitCount
                     }
                     if destination == nil {
                         throw HubCacheError.cachedPathResolutionFailed(repoPath)
                     }
                     return try copyFileToDestinationIfNeeded(
                         blobPath,
-                        destination: destination
+                        destination: destination,
+                        progress: progress
                     )
                 }
 
-                // Download or resume into incomplete blob until success
+                // Download or resume into incomplete blob until success.
+                var didRestart = false
                 while true {
                     var request = baseRequest
                     let resumeOffset = fileSizeIfExists(at: incompleteBlobPath)
                     if resumeOffset > 0 {
                         request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
+                        // A linked Hub ETag is not necessarily a CDN HTTP validator.
+                        if let metadata = preflightMetadata, !metadata.usesLinkedEtag,
+                            let etag = metadata.etag, !etag.hasPrefix("W/")
+                        {
+                            let validator = etag.hasPrefix("\"") ? etag : "\"\(etag)\""
+                            request.setValue(validator, forHTTPHeaderField: "If-Range")
+                        }
                     }
 
-                    let tempURL: URL
+                    // Stream into the incomplete blob as bytes arrive, so a
+                    // cancellation or a killed process leaves a resumable file.
                     let response: URLResponse
+                    let errorData: Data?
                     do {
-                        #if canImport(FoundationNetworking)
-                            (tempURL, response) = try await session.asyncDownload(for: request, progress: progress)
-                        #else
-                            (tempURL, response) = try await session.hfAsyncDownload(
-                                for: request,
-                                progress: progress,
-                                resumeOffset: resumeOffset
-                            )
-                        #endif
+                        (response, errorData) = try await session.hfStreamingDownload(
+                            for: request,
+                            progress: progress,
+                            resumeOffset: resumeOffset,
+                            targetURL: incompleteBlobPath,
+                            keepPartialFile: true,
+                            metadata: preflightMetadata
+                        )
                     } catch {
+                        if let validationError = error as? StreamingDownloadError {
+                            if FileManager.default.fileExists(atPath: incompleteBlobPath.path) {
+                                try FileManager.default.removeItem(at: incompleteBlobPath)
+                            }
+                            if resumeOffset > 0, !didRestart, validationError != .sizeMismatch {
+                                didRestart = true
+                                progress?.completedUnitCount = 0
+                                continue
+                            }
+                        }
                         if error is CancellationError {
                             throw error
+                        }
+                        // URLError.cancelled is how URLSession reports cancellation.
+                        if let urlError = error as? URLError, urlError.code == .cancelled {
+                            throw CancellationError()
                         }
                         if let fallback = cache.cachedFilePath(
                             repo: repo,
@@ -615,7 +781,8 @@ public extension HubClient {
                         ) {
                             return try copyFileToDestinationIfNeeded(
                                 fallback,
-                                destination: destination
+                                destination: destination,
+                                progress: progress
                             )
                         }
                         throw error
@@ -625,88 +792,67 @@ public extension HubClient {
                     guard let httpResponse = response as? HTTPURLResponse else {
                         throw HTTPClientError.unexpectedError("Invalid response from server: \(response)")
                     }
-                    if httpResponse.statusCode == 416, resumeOffset > 0 {
-                        try? FileManager.default.removeItem(at: tempURL)
-                        try? FileManager.default.removeItem(at: incompleteBlobPath)
+                    if httpResponse.statusCode == 416, resumeOffset > 0, !didRestart {
+                        try FileManager.default.removeItem(at: incompleteBlobPath)
+                        didRestart = true
                         if let progress {
                             progress.completedUnitCount = 0
                         }
                         continue
                     }
                     if !(200 ..< 300).contains(httpResponse.statusCode) {
-                        let errorData = try? Data(contentsOf: tempURL)
-                        try? FileManager.default.removeItem(at: tempURL)
                         _ = try httpClient.validateResponse(response, data: errorData)
                         throw HTTPClientError.responseError(response: httpResponse, detail: "Invalid response")
                     }
 
-                    let shouldMergeResume =
-                        resumeOffset > 0
-                        && httpResponse.statusCode == 206
-                    if resumeOffset > 0, httpResponse.statusCode == 200 {
-                        // Some servers ignore Range and return the full content with 200.
-                        // Treat this as a fresh download to avoid appending full content to a partial file.
+                    // Check the on-disk size before publishing the validated response.
+                    let expectedSize =
+                        preflightMetadata?.size
+                        ?? DownloadContentRange(httpResponse.value(forHTTPHeaderField: "Content-Range"))?.total
+                        ?? FileMetadata(response: response)?.size
+                    if let expectedSize,
+                        fileSizeIfExists(at: incompleteBlobPath) != expectedSize
+                    {
                         try? FileManager.default.removeItem(at: incompleteBlobPath)
+                        throw StreamingDownloadError.sizeMismatch
                     }
-
-                    // Persist into cache and resolve via repo-path mapping when possible
-                    // Store in cache before moving to destination.
-                    // This fallback parses metadata from the existing GET response object (no extra request).
+                    var completedURL = incompleteBlobPath
                     let responseMetadata = FileMetadata(response: response)
-                    if let commitHash = preflightMetadata?.commitHash ?? responseMetadata?.commitHash {
-                        if shouldMergeResume {
-                            do {
-                                let blobsDirectory = cache.blobsDirectory(repo: repo, kind: kind)
-                                try FileManager.default.createDirectory(
-                                    at: blobsDirectory,
-                                    withIntermediateDirectories: true
-                                )
-                                if !FileManager.default.fileExists(atPath: incompleteBlobPath.path) {
-                                    FileManager.default.createFile(atPath: incompleteBlobPath.path, contents: nil)
-                                }
-                                try appendFileContents(from: tempURL, to: incompleteBlobPath)
-                                if FileManager.default.fileExists(atPath: blobPath.path) {
-                                    _ = try FileManager.default.replaceItemAt(blobPath, withItemAt: incompleteBlobPath)
-                                } else {
-                                    try FileManager.default.moveItem(at: incompleteBlobPath, to: blobPath)
-                                }
-                                try? FileManager.default.removeItem(at: tempURL)
-                            } catch {
-                                try? FileManager.default.removeItem(at: incompleteBlobPath)
-                                try? FileManager.default.removeItem(at: tempURL)
-                                throw error
-                            }
-                            try? await cache.storeFile(
-                                at: blobPath,
-                                repo: repo,
-                                kind: kind,
-                                revision: commitHash,
-                                filename: repoPath,
-                                etag: etag,
-                                ref: revision != commitHash ? revision : nil
-                            )
+                    // Without a pinned commit, require a matching response ETag
+                    // before associating these bytes with the preflight blob.
+                    if let commitHash = preflightMetadata?.commitHash ?? responseMetadata?.commitHash,
+                        preflightMetadata?.commitHash != nil || responseMetadata?.normalizedEtag == etag
+                    {
+                        let blobsDirectory = cache.blobsDirectory(repo: repo, kind: kind)
+                        try FileManager.default.createDirectory(
+                            at: blobsDirectory,
+                            withIntermediateDirectories: true
+                        )
+                        if FileManager.default.fileExists(atPath: blobPath.path) {
+                            _ = try FileManager.default.replaceItemAt(blobPath, withItemAt: incompleteBlobPath)
                         } else {
-                            try? await cache.storeFile(
-                                at: tempURL,
-                                repo: repo,
-                                kind: kind,
-                                revision: commitHash,
-                                filename: repoPath,
-                                etag: etag,
-                                ref: revision != commitHash ? revision : nil
-                            )
+                            try FileManager.default.moveItem(at: incompleteBlobPath, to: blobPath)
                         }
+                        completedURL = blobPath
+                        try? await cache.storeFile(
+                            at: blobPath,
+                            repo: repo,
+                            kind: kind,
+                            revision: commitHash,
+                            filename: repoPath,
+                            etag: etag,
+                            ref: revision != commitHash ? revision : nil
+                        )
                         if let cachedPath = cache.cachedFilePath(
                             repo: repo,
                             kind: kind,
                             revision: commitHash,
                             filename: repoPath
                         ) {
-                            // The file was copied into the cache; the download temp file is no longer needed.
-                            try? FileManager.default.removeItem(at: tempURL)
                             return try copyFileToDestinationIfNeeded(
                                 cachedPath,
-                                destination: destination
+                                destination: destination,
+                                progress: progress
                             )
                         }
                     }
@@ -715,38 +861,41 @@ public extension HubClient {
                     guard let destination else {
                         throw HubCacheError.cachedPathResolutionFailed(repoPath)
                     }
-                    // Create parent directory if needed
                     try FileManager.default.createDirectory(
                         at: destination.deletingLastPathComponent(),
                         withIntermediateDirectories: true
                     )
-
-                    // Move from temporary location to final destination
                     try? FileManager.default.removeItem(at: destination)
-                    try FileManager.default.moveItem(at: tempURL, to: destination)
+                    try FileManager.default.moveItem(at: completedURL, to: destination)
 
                     return destination
                 }
             }
         }
 
-        // Generic non-ETag fallback path
-        let resumeOffset: Int64 = 0
-        let tempURL: URL
+        // Generic non-ETag fallback path. Without an etag there is no
+        // resumable identity, so stream into an owned temp file and remove
+        // it on cancellation or error instead of leaking it.
+        let tempURL = Self.downloadTemporaryDirectory
+            .appendingPathComponent("hf-download-\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
         let response: URLResponse
+        let errorData: Data?
         do {
-            #if canImport(FoundationNetworking)
-                (tempURL, response) = try await session.asyncDownload(for: baseRequest, progress: progress)
-            #else
-                (tempURL, response) = try await session.hfAsyncDownload(
-                    for: baseRequest,
-                    progress: progress,
-                    resumeOffset: resumeOffset
-                )
-            #endif
+            (response, errorData) = try await session.hfStreamingDownload(
+                for: baseRequest,
+                progress: progress,
+                resumeOffset: 0,
+                targetURL: tempURL,
+                keepPartialFile: false,
+                metadata: preflightMetadata
+            )
         } catch {
             if error is CancellationError {
                 throw error
+            }
+            if let urlError = error as? URLError, urlError.code == .cancelled {
+                throw CancellationError()
             }
             if let cache = cache,
                 let fallback = cache.cachedFilePath(
@@ -756,7 +905,7 @@ public extension HubClient {
                     filename: repoPath
                 )
             {
-                return try copyFileToDestinationIfNeeded(fallback, destination: destination)
+                return try copyFileToDestinationIfNeeded(fallback, destination: destination, progress: progress)
             }
             throw error
         }
@@ -764,8 +913,6 @@ public extension HubClient {
             throw HTTPClientError.unexpectedError("Invalid response from server: \(response)")
         }
         if !(200 ..< 300).contains(httpResponse.statusCode) {
-            let errorData = try? Data(contentsOf: tempURL)
-            try? FileManager.default.removeItem(at: tempURL)
             _ = try httpClient.validateResponse(response, data: errorData)
             throw HTTPClientError.responseError(response: httpResponse, detail: "Invalid response")
         }
@@ -793,11 +940,10 @@ public extension HubClient {
                 revision: commitHash,
                 filename: repoPath
             ) {
-                // The file was copied into the cache; the download temp file is no longer needed.
-                try? FileManager.default.removeItem(at: tempURL)
                 return try copyFileToDestinationIfNeeded(
                     cachedPath,
-                    destination: destination
+                    destination: destination,
+                    progress: progress
                 )
             }
         }
@@ -941,11 +1087,329 @@ public extension HubClient {
     }
 }
 
+extension HubClient {
+    // Task-local storage lets tests inspect only the files owned by their operation.
+    @TaskLocal static var downloadTemporaryDirectory = FileManager.default.temporaryDirectory
+}
+
+// MARK: - Streaming Download
+
+enum StreamingDownloadError: Error {
+    case invalidRange
+    case identityMismatch
+    case sizeMismatch
+}
+
+/// A single, complete byte range with a known total size.
+private struct DownloadContentRange {
+    let start: Int64
+    let end: Int64
+    let total: Int64
+
+    init?(_ value: String?) {
+        guard let value, value.hasPrefix("bytes ") else { return nil }
+        let parts = value.dropFirst(6).split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, let total = Int64(parts[1]) else { return nil }
+        let bounds = parts[0].split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2, let start = Int64(bounds[0]), let end = Int64(bounds[1]),
+            start >= 0, end >= start, total > end
+        else { return nil }
+        self.start = start
+        self.end = end
+        self.total = total
+    }
+}
+
+private final class DataTaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionDataTask?
+    private var isCancelled = false
+
+    func start(_ task: URLSessionDataTask) {
+        lock.lock()
+        self.task = task
+        let cancelled = isCancelled
+        lock.unlock()
+        if cancelled {
+            task.cancel()
+        } else {
+            task.resume()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+}
+
+/// Streams a response body into a file as bytes arrive.
+///
+/// Bytes for a successful (2xx) response are written synchronously in the
+/// data delegate callback, so the file on disk always holds every byte the
+/// session has delivered. A process kill therefore leaves a resumable
+/// partial file, and cancellation leaves the same partial file behind.
+/// Successful responses are appended only when HTTP 206 identifies the requested
+/// offset and passes the metadata checks. HTTP 200 truncates the file and restarts.
+private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    // Mutable state is confined to the session's serial delegate queue.
+    private let progress: Progress
+    private let resumeOffset: Int64
+    private let targetURL: URL
+    private let keepPartialFile: Bool
+    private let metadata: FileMetadata?
+    private var expectedSize: Int64?
+    private var expectedBodySize: Int64?
+    private let continuation: CheckedContinuation<(URLResponse, Data?), Error>
+    fileprivate weak var session: URLSession?
+    private var hasResumed = false
+    private var response: URLResponse?
+    private var fileHandle: FileHandle?
+    private var errorData = Data()
+    private var writeError: Error?
+    private var effectiveOffset: Int64 = 0
+    private var bytesWritten: Int64 = 0
+    private var isSuccessfulResponse = false
+
+    init(
+        progress: Progress,
+        resumeOffset: Int64,
+        targetURL: URL,
+        keepPartialFile: Bool,
+        metadata: FileMetadata?,
+        continuation: CheckedContinuation<(URLResponse, Data?), Error>
+    ) {
+        self.progress = progress
+        self.resumeOffset = resumeOffset
+        self.targetURL = targetURL
+        self.keepPartialFile = keepPartialFile
+        self.metadata = metadata
+        self.expectedSize = metadata?.size
+        self.continuation = continuation
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard metadata?.matches(response) != false else {
+            writeError = StreamingDownloadError.identityMismatch
+            completionHandler(nil)
+            return
+        }
+        var request = request
+        if response.url?.scheme != request.url?.scheme
+            || response.url?.host != request.url?.host || response.url?.port != request.url?.port
+        {
+            request.setValue(nil, forHTTPHeaderField: "If-Range")
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        self.response = response
+        guard let httpResponse = response as? HTTPURLResponse,
+            (200 ..< 300).contains(httpResponse.statusCode)
+        else {
+            completionHandler(.allow)
+            return
+        }
+        isSuccessfulResponse = true
+        do {
+            guard metadata?.matches(httpResponse) != false else {
+                throw StreamingDownloadError.identityMismatch
+            }
+            if httpResponse.statusCode == 206 {
+                if resumeOffset > 0, metadata?.allowsResume(from: httpResponse) == false {
+                    throw StreamingDownloadError.identityMismatch
+                }
+                guard let range = DownloadContentRange(httpResponse.value(forHTTPHeaderField: "Content-Range")),
+                    range.start == resumeOffset
+                else { throw StreamingDownloadError.invalidRange }
+                if let expectedSize, expectedSize != range.total {
+                    throw StreamingDownloadError.sizeMismatch
+                }
+                expectedSize = range.total
+                expectedBodySize = range.end - range.start + 1
+            } else {
+                expectedBodySize = response.expectedContentLength >= 0 ? response.expectedContentLength : nil
+                if expectedSize == nil { expectedSize = expectedBodySize }
+            }
+            try FileManager.default.createDirectory(
+                at: targetURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let appending = resumeOffset > 0 && httpResponse.statusCode == 206
+            if appending {
+                if !FileManager.default.fileExists(atPath: targetURL.path) {
+                    FileManager.default.createFile(atPath: targetURL.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: targetURL)
+                _ = try handle.seekToEnd()
+                fileHandle = handle
+                effectiveOffset = resumeOffset
+            } else {
+                FileManager.default.createFile(atPath: targetURL.path, contents: nil)
+                fileHandle = try FileHandle(forWritingTo: targetURL)
+                effectiveOffset = 0
+            }
+            if let expectedSize {
+                progress.totalUnitCount = expectedSize
+            }
+            progress.completedUnitCount = effectiveOffset
+        } catch {
+            writeError = error
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard isSuccessfulResponse else {
+            errorData.append(data)
+            return
+        }
+        guard let fileHandle else { return }
+        do {
+            try fileHandle.write(contentsOf: data)
+        } catch {
+            writeError = error
+            dataTask.cancel()
+            return
+        }
+        bytesWritten += Int64(data.count)
+        if progress.totalUnitCount <= 0, let response, response.expectedContentLength > 0 {
+            progress.totalUnitCount = response.expectedContentLength + effectiveOffset
+        }
+        progress.completedUnitCount = effectiveOffset + bytesWritten
+    }
+
+    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !hasResumed else { return }
+        hasResumed = true
+        try? fileHandle?.close()
+        fileHandle = nil
+        session?.invalidateAndCancel()
+        if let writeError {
+            if !keepPartialFile {
+                try? FileManager.default.removeItem(at: targetURL)
+            }
+            continuation.resume(throwing: writeError)
+            return
+        }
+        if let error {
+            if !keepPartialFile {
+                try? FileManager.default.removeItem(at: targetURL)
+            }
+            continuation.resume(throwing: error)
+            return
+        }
+        guard let response else {
+            if !keepPartialFile {
+                try? FileManager.default.removeItem(at: targetURL)
+            }
+            continuation.resume(throwing: URLError(.badServerResponse))
+            return
+        }
+        if isSuccessfulResponse {
+            if (expectedBodySize != nil && expectedBodySize != bytesWritten)
+                || (expectedSize != nil && expectedSize != effectiveOffset + bytesWritten)
+            {
+                try? FileManager.default.removeItem(at: targetURL)
+                continuation.resume(throwing: StreamingDownloadError.sizeMismatch)
+                return
+            }
+            progress.totalUnitCount = max(effectiveOffset + bytesWritten, 1)
+            progress.completedUnitCount = progress.totalUnitCount
+            continuation.resume(returning: (response, nil))
+        } else {
+            continuation.resume(returning: (response, errorData))
+        }
+    }
+}
+
+extension URLSession {
+    /// Downloads `request`, streaming the body into `targetURL` as bytes arrive.
+    ///
+    /// - Parameters:
+    ///   - targetURL: File that receives a successful response body.
+    ///   - keepPartialFile: When `true`, bytes written before an error or
+    ///     cancellation stay in `targetURL` for a later ranged resume.
+    ///     When `false`, `targetURL` is removed on error or cancellation.
+    /// - Returns: The response and, for a non-2xx response, its body data.
+    func hfStreamingDownload(
+        for request: URLRequest,
+        progress: Progress? = nil,
+        resumeOffset: Int64 = 0,
+        targetURL: URL,
+        keepPartialFile: Bool,
+        metadata: FileMetadata? = nil
+    ) async throws -> (URLResponse, Data?) {
+        let box = DataTaskBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let delegate = StreamingDownloadDelegate(
+                    progress: progress ?? Progress(totalUnitCount: 0),
+                    resumeOffset: resumeOffset,
+                    targetURL: targetURL,
+                    keepPartialFile: keepPartialFile,
+                    metadata: metadata,
+                    continuation: continuation
+                )
+                let session = URLSession(
+                    configuration: configuration,
+                    delegate: delegate,
+                    delegateQueue: nil
+                )
+                delegate.session = session
+                let task = session.dataTask(with: request)
+                box.start(task)
+            }
+        } onCancel: {
+            box.cancel()
+        }
+    }
+}
+
 // MARK: - Progress Delegate
 
 #if !canImport(FoundationNetworking)
     private final class DownloadTaskBox: @unchecked Sendable {
-        var task: URLSessionDownloadTask?
+        private let lock = NSLock()
+        private var task: URLSessionDownloadTask?
+        private var isCancelled = false
+
+        func start(_ task: URLSessionDownloadTask) {
+            lock.lock()
+            self.task = task
+            let isCancelled = isCancelled
+            lock.unlock()
+            if isCancelled {
+                task.cancel()
+            } else {
+                task.resume()
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let task = task
+            lock.unlock()
+            task?.cancel()
+        }
     }
 
     extension URLSession {
@@ -962,6 +1426,8 @@ public extension HubClient {
                         resumeOffset: resumeOffset,
                         continuation: continuation
                     )
+                    // A session-level delegate reports intermediate bytes on SDKs
+                    // where download(for:delegate:) omits download progress callbacks.
                     let session = URLSession(
                         configuration: configuration,
                         delegate: delegate,
@@ -969,11 +1435,10 @@ public extension HubClient {
                     )
                     delegate.session = session
                     let task = session.downloadTask(with: request)
-                    box.task = task
-                    task.resume()
+                    box.start(task)
                 }
             } onCancel: {
-                box.task?.cancel()
+                box.cancel()
             }
         }
 
@@ -996,16 +1461,16 @@ public extension HubClient {
                     )
                     delegate.session = session
                     let task = session.downloadTask(withResumeData: resumeData)
-                    box.task = task
-                    task.resume()
+                    box.start(task)
                 }
             } onCancel: {
-                box.task?.cancel()
+                box.cancel()
             }
         }
     }
 
     private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        // Mutable state is confined to the session's serial delegate queue.
         private let progress: Progress
         private let appliesResumeOffsetToAllResponses: Bool
         private let continuation: CheckedContinuation<(URL, URLResponse), Error>?
@@ -1032,10 +1497,13 @@ public extension HubClient {
             totalBytesWritten: Int64,
             totalBytesExpectedToWrite: Int64
         ) {
-            let responseStatus = (downloadTask.response as? HTTPURLResponse)?.statusCode
+            guard !hasResumed,
+                let response = downloadTask.response as? HTTPURLResponse,
+                (200 ..< 300).contains(response.statusCode)
+            else { return }
             let appliesOffset =
                 currentResumeOffset > 0
-                && (responseStatus == 206 || appliesResumeOffsetToAllResponses)
+                && (response.statusCode == 206 || appliesResumeOffsetToAllResponses)
             let appliedOffset = appliesOffset ? currentResumeOffset : 0
             if totalBytesExpectedToWrite > 0 {
                 progress.totalUnitCount = totalBytesExpectedToWrite + appliedOffset
@@ -1049,6 +1517,7 @@ public extension HubClient {
             didResumeAtOffset fileOffset: Int64,
             expectedTotalBytes: Int64
         ) {
+            guard !hasResumed else { return }
             currentResumeOffset = fileOffset
             progress.completedUnitCount = fileOffset
             if expectedTotalBytes > 0 {
@@ -1076,12 +1545,24 @@ public extension HubClient {
             do {
                 try? FileManager.default.removeItem(at: persistedURL)
                 try FileManager.default.moveItem(at: location, to: persistedURL)
-                if progress.totalUnitCount > 0 {
+                if let response = response as? HTTPURLResponse,
+                    (200 ..< 300).contains(response.statusCode)
+                {
+                    let attributes = try FileManager.default.attributesOfItem(atPath: persistedURL.path)
+                    let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+                    // Native resume data already produces a complete file.
+                    // An explicit Range request produces only the remaining bytes.
+                    let offset =
+                        response.statusCode == 206 && !appliesResumeOffsetToAllResponses
+                        ? currentResumeOffset : 0
+                    // Foundation treats 0/0 as unfinished, including for child progress.
+                    progress.totalUnitCount = max(size + offset, 1)
                     progress.completedUnitCount = progress.totalUnitCount
                 }
                 session?.finishTasksAndInvalidate()
                 continuation.resume(returning: (persistedURL, response))
             } catch {
+                try? FileManager.default.removeItem(at: persistedURL)
                 session?.invalidateAndCancel()
                 continuation.resume(throwing: error)
             }
@@ -1179,7 +1660,8 @@ public extension HubClient {
     ///   - kind: Kind of repository
     ///   - revision: Git revision
     ///   - recursive: List files recursively
-    /// - Returns: Array of tree entries
+    /// - Returns: The first page of tree entries.
+    ///   Use ``listAllTree(in:kind:revision:path:recursive:)`` for the complete listing.
     func listFiles(
         in repo: Repo.ID,
         kind: Repo.Kind = .model,
@@ -1208,12 +1690,10 @@ public extension HubClient {
     func getFile(
         at repoPath: String,
         in repo: Repo.ID,
-        kind _: Repo.Kind = .model,
+        kind: Repo.Kind = .model,
         revision: String = "main"
     ) async throws -> File {
-        let url = httpClient.host
-            .appending(path: repo.namespace)
-            .appending(path: repo.name)
+        let url = repositoryURL(repo, kind: kind)
             .appending(path: "resolve")
             .appending(component: revision)
             .appending(path: repoPath)
@@ -1290,7 +1770,58 @@ public extension HubClient {
             returnCachePath: false,
             localFilesOnly: localFilesOnly,
             maxConcurrentDownloads: maxConcurrentDownloads,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            fileProgressHandler: nil
+        )
+    }
+
+    /// Download a repository snapshot to a destination directory, reporting progress for each file.
+    ///
+    /// This is a separate overload, rather than a defaulted parameter on the
+    /// method above, so that an unlabeled trailing closure in an existing call
+    /// still binds to `progressHandler` in Swift 5 language mode.
+    ///
+    /// This method downloads all files from a repository to the cache and then
+    /// copies them to `destination`.
+    /// Files are automatically cached in the Python-compatible cache directory,
+    /// allowing cache reuse between Swift and Python Hugging Face clients.
+    ///
+    /// - Parameters:
+    ///   - repo: Repository identifier
+    ///   - kind: Kind of repository
+    ///   - destination: Local destination directory
+    ///   - revision: Git revision (branch, tag, or commit)
+    ///   - matching: Glob patterns to filter files (empty array downloads all files)
+    ///   - localFilesOnly: When `true`, resolve only from local cache and throw if missing.
+    ///   - progressHandler: Optional closure called with progress updates.
+    ///     Updates are delivered on the main actor.
+    ///   - fileProgressHandler: Closure called with one
+    ///     ``SnapshotFileProgress`` per file, sampled on the same schedule as
+    ///     `progressHandler`. Delivered on the main actor. A snapshot served
+    ///     from cache emits a single complete set of rows.
+    /// - Returns: URL to `destination`.
+    func downloadSnapshot(
+        of repo: Repo.ID,
+        kind: Repo.Kind = .model,
+        to destination: URL,
+        revision: String = "main",
+        matching globs: [String] = [],
+        localFilesOnly: Bool = false,
+        maxConcurrentDownloads: Int = 8,
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil,
+        fileProgressHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)?
+    ) async throws -> URL {
+        try await downloadSnapshot(
+            of: repo,
+            kind: kind,
+            to: destination,
+            revision: revision,
+            matching: globs,
+            returnCachePath: false,
+            localFilesOnly: localFilesOnly,
+            maxConcurrentDownloads: maxConcurrentDownloads,
+            progressHandler: progressHandler,
+            fileProgressHandler: fileProgressHandler
         )
     }
 
@@ -1330,7 +1861,58 @@ public extension HubClient {
             returnCachePath: true,
             localFilesOnly: localFilesOnly,
             maxConcurrentDownloads: maxConcurrentDownloads,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            fileProgressHandler: nil
+        )
+    }
+
+    /// Download a repository snapshot, reporting progress for each file.
+    ///
+    /// This is a separate overload, rather than a defaulted parameter on the
+    /// method above, so that an unlabeled trailing closure in an existing call
+    /// still binds to `progressHandler` in Swift 5 language mode.
+    ///
+    /// This method downloads all files from a repository to the cache by default.
+    /// Files are automatically cached in the Python-compatible cache directory,
+    /// allowing cache reuse between Swift and Python Hugging Face clients.
+    ///
+    /// - Parameters:
+    ///   - repo: Repository identifier
+    ///   - kind: Kind of repository
+    ///   - revision: Git revision (branch, tag, or commit)
+    ///   - matching: Glob patterns to filter files (empty array downloads all files)
+    ///   - localFilesOnly: When `true`, resolve only from local cache and throw if missing.
+    ///   - maxConcurrentDownloads: Maximum number of concurrent downloads for LFS files.
+    ///                             This value is ignored for non-LFS files.
+    ///                             The default value is 8. Values less than 1 are treated as 1.
+    ///   - progressHandler: Optional closure called with progress updates.
+    ///     Updates are delivered on the main actor.
+    ///   - fileProgressHandler: Closure called with one
+    ///     ``SnapshotFileProgress`` per file, sampled on the same schedule as
+    ///     `progressHandler`. Delivered on the main actor. A snapshot served
+    ///     from cache emits a single complete set of rows.
+    /// - Returns: URL to the cache snapshot directory.
+    func downloadSnapshot(
+        of repo: Repo.ID,
+        kind: Repo.Kind = .model,
+        revision: String = "main",
+        matching globs: [String] = [],
+        localFilesOnly: Bool = false,
+        maxConcurrentDownloads: Int = 8,
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil,
+        fileProgressHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)?
+    ) async throws -> URL {
+        try await downloadSnapshot(
+            of: repo,
+            kind: kind,
+            to: nil,
+            revision: revision,
+            matching: globs,
+            returnCachePath: true,
+            localFilesOnly: localFilesOnly,
+            maxConcurrentDownloads: maxConcurrentDownloads,
+            progressHandler: progressHandler,
+            fileProgressHandler: fileProgressHandler
         )
     }
 
@@ -1343,7 +1925,8 @@ public extension HubClient {
         returnCachePath: Bool,
         localFilesOnly: Bool,
         maxConcurrentDownloads: Int,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)?
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+        fileProgressHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)?
     ) async throws -> URL {
         let maxConcurrentDownloads = max(1, maxConcurrentDownloads)
         guard cache != nil || destination != nil else {
@@ -1365,11 +1948,18 @@ public extension HubClient {
             if let progressHandler {
                 await progressHandler(progress)
             }
-            return try copySnapshotToLocalDirectoryIfNeeded(
+            let resolved = try copySnapshotToLocalDirectoryIfNeeded(
                 from: fastPath,
                 destination: effectiveDestination,
                 returnCachePath: returnCachePath
             )
+            if let fileProgressHandler {
+                let sizesByPath = snapshotSizesByPath(cachedSnapshotMetadata(at: fastPath, repo: repo, kind: kind))
+                await fileProgressHandler(
+                    cachedSnapshotFileProgress(at: fastPath, matching: globs, sizesByPath: sizesByPath)
+                )
+            }
+            return resolved
         }
 
         if localFilesOnly {
@@ -1383,11 +1973,18 @@ public extension HubClient {
             else {
                 throw HubCacheError.cachedPathResolutionFailed(repo.description)
             }
-            return try copySnapshotToLocalDirectoryIfNeeded(
+            let resolved = try copySnapshotToLocalDirectoryIfNeeded(
                 from: cachedPath,
                 destination: effectiveDestination,
                 returnCachePath: returnCachePath
             )
+            if let fileProgressHandler {
+                let sizesByPath = snapshotSizesByPath(cachedSnapshotMetadata(at: cachedPath, repo: repo, kind: kind))
+                await fileProgressHandler(
+                    cachedSnapshotFileProgress(at: cachedPath, matching: globs, sizesByPath: sizesByPath)
+                )
+            }
+            return resolved
         }
 
         let allEntries: [Git.TreeEntry]
@@ -1400,11 +1997,20 @@ public extension HubClient {
                 revision: revision,
                 matching: globs
             ) {
-                return try copySnapshotToLocalDirectoryIfNeeded(
+                let resolved = try copySnapshotToLocalDirectoryIfNeeded(
                     from: cachedPath,
                     destination: effectiveDestination,
                     returnCachePath: returnCachePath
                 )
+                if let fileProgressHandler {
+                    let sizesByPath = snapshotSizesByPath(
+                        cachedSnapshotMetadata(at: cachedPath, repo: repo, kind: kind)
+                    )
+                    await fileProgressHandler(
+                        cachedSnapshotFileProgress(at: cachedPath, matching: globs, sizesByPath: sizesByPath)
+                    )
+                }
+                return resolved
             }
             throw error
         }
@@ -1458,9 +2064,19 @@ public extension HubClient {
             }
         let xetEntries = workItems.filter { $0.transport != .lfs }
 
+        // Per-file rows (path + child Progress) for the optional per-file
+        // handler; sampled by the same 100 ms task as the aggregate.
+        let fileRows: [(path: String, size: Int64?, progress: SnapshotProgressBox)] =
+            fileProgressHandler == nil
+            ? []
+            : workItems
+                .filter { $0.entry.type == .file }
+                .map { ($0.entry.path, $0.entry.size.map(Int64.init), $0.progress) }
         let samplingTask = makeSnapshotProgressSamplingTask(
             progress: progress,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            fileRows: fileRows,
+            fileProgressHandler: fileProgressHandler
         )
 
         do {
@@ -1507,18 +2123,26 @@ public extension HubClient {
             : cache.resolveRevision(repo: repo, kind: kind, ref: revision) ?? revision
         let snapshotPath = cache.snapshotsDirectory(repo: repo, kind: kind)
             .appendingPathComponent(resolvedCommitHash)
-        return try copySnapshotToLocalDirectoryIfNeeded(
+        let resolved = try copySnapshotToLocalDirectoryIfNeeded(
             from: snapshotPath,
             destination: effectiveDestination,
             returnCachePath: returnCachePath
         )
+        // Emitted after the sampler is cancelled and the final copy succeeds:
+        // the last 100 ms sample can land before the final bytes, and a copy
+        // that throws must leave the terminal per-file state unobserved, same
+        // as a download that throws.
+        if let fileProgressHandler {
+            await fileProgressHandler(snapshotFileProgress(fileRows))
+        }
+        return resolved
     }
 }
 
 // MARK: - Xet Operations
 
 /// Metadata associated with a Xet-enabled Hub file response.
-private struct XetFileMetadata: Sendable {
+struct XetFileMetadata: Sendable {
     /// The content-addressed Xet object ID from `X-Xet-Hash`.
     let fileID: String
 
@@ -1555,6 +2179,11 @@ private struct XetFileMetadata: Sendable {
 }
 
 private extension HubClient {
+    func repositoryURL(_ repo: Repo.ID, kind: Repo.Kind) -> URL {
+        let base = kind == .model ? httpClient.host : httpClient.host.appending(path: kind.pluralized)
+        return base.appending(path: repo.namespace).appending(path: repo.name)
+    }
+
     func snapshotWeight(for entry: Git.TreeEntry) -> Int64 {
         guard let size = entry.size else {
             return snapshotUnknownFileWeight
@@ -1564,27 +2193,38 @@ private extension HubClient {
 
     func snapshotTransport(for entry: Git.TreeEntry) -> FileDownloadTransport {
         #if HUGGINGFACE_ENABLE_XET
-        let useXet = FileDownloadTransport.automatic.shouldUseXet(
-            fileSizeBytes: entry.size,
-            minimumFileSizeBytes: xetMinimumFileSizeBytes
-        )
-        return useXet ? .automatic : .lfs
+            let useXet = FileDownloadTransport.automatic.shouldUseXet(
+                fileSizeBytes: entry.size,
+                minimumFileSizeBytes: xetMinimumFileSizeBytes
+            )
+            return useXet ? .automatic : .lfs
         #else
-        return .lfs
+            return .lfs
         #endif
     }
 
     func makeSnapshotProgressSamplingTask(
         progress: Progress,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)?
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+        fileRows: [(path: String, size: Int64?, progress: SnapshotProgressBox)],
+        fileProgressHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)?
     ) -> Task<Void, Never>? {
-        guard let progressHandler else {
+        guard progressHandler != nil || fileProgressHandler != nil else {
             return nil
         }
         let boxedProgress = SnapshotProgressBox(progress)
         return Task(priority: Task.currentPriority) {
             while !Task.isCancelled {
-                await progressHandler(boxedProgress.value)
+                // Sampled before the aggregate handler is awaited: the two
+                // describe the same tick, so a slow aggregate handler must not
+                // age the file rows it is delivered beside.
+                let files = fileProgressHandler == nil ? [] : snapshotFileProgress(fileRows)
+                if let progressHandler {
+                    await progressHandler(boxedProgress.value)
+                }
+                if let fileProgressHandler, files.contains(where: { $0.fractionCompleted < 1.0 }) {
+                    await fileProgressHandler(files)
+                }
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
@@ -1682,6 +2322,16 @@ private extension HubClient {
         return isComplete ? snapshotPath : nil
     }
 
+    /// Cached snapshot metadata for the commit backing `snapshotPath`
+    /// (`.../snapshots/<commitHash>`), or `nil` when there is no cache, the
+    /// directory name isn't a commit hash, or nothing was ever saved for it.
+    func cachedSnapshotMetadata(at snapshotPath: URL, repo: Repo.ID, kind: Repo.Kind) -> CachedSnapshotMetadata? {
+        guard let cache else { return nil }
+        let commitHash = snapshotPath.lastPathComponent
+        guard isCommitHash(commitHash) else { return nil }
+        return loadCachedSnapshotMetadata(cache: cache, repo: repo, kind: kind, commitHash: commitHash)
+    }
+
     /// Generates the URL for cached snapshot metadata.
     func cachedSnapshotMetadataURL(
         cache: HubCache,
@@ -1727,9 +2377,21 @@ private extension HubClient {
     /// Copies a file to a local destination path if needed.
     func copyFileToDestinationIfNeeded(
         _ source: URL,
-        destination: URL?
+        destination: URL?,
+        progress: Progress? = nil
     ) throws -> URL {
+        // Publish completion only after a requested destination copy succeeds.
+        var succeeded = false
+        defer {
+            if succeeded, let progress {
+                let size = fileSizeIfExists(at: source.resolvingSymlinksInPath())
+                // An empty file must still complete its parent's pending units.
+                progress.totalUnitCount = max(size, 1)
+                progress.completedUnitCount = progress.totalUnitCount
+            }
+        }
         guard let destination else {
+            succeeded = true
             return source
         }
         let fileManager = FileManager.default
@@ -1743,6 +2405,7 @@ private extension HubClient {
         let resolvedSource = source.resolvingSymlinksInPath().standardizedFileURL
         let resolvedDestination = destination.resolvingSymlinksInPath().standardizedFileURL
         if resolvedSource == resolvedDestination {
+            succeeded = true
             return destination
         }
         try fileManager.createDirectory(
@@ -1751,6 +2414,7 @@ private extension HubClient {
         )
         try? fileManager.removeItem(at: destination)
         try fileManager.copyItem(at: resolvedSource, to: destination)
+        succeeded = true
         return destination
     }
 
@@ -1879,27 +2543,6 @@ private extension HubClient {
         return url.lastPathComponent
     }
 
-    /// Appends source file bytes to destination file.
-    func appendFileContents(from source: URL, to destination: URL) throws {
-        let sourceHandle = try FileHandle(forReadingFrom: source)
-        let destinationHandle = try FileHandle(forWritingTo: destination)
-        defer {
-            try? sourceHandle.close()
-            try? destinationHandle.close()
-        }
-
-        _ = try destinationHandle.seekToEnd()
-
-        let chunkSize = 64 * 1024
-        while true {
-            let chunk = try sourceHandle.read(upToCount: chunkSize) ?? Data()
-            if chunk.isEmpty {
-                break
-            }
-            try destinationHandle.write(contentsOf: chunk)
-        }
-    }
-
     /// Downloads file data using Xet's content-addressable storage system.
     func downloadDataWithXet(
         repoPath: String,
@@ -1913,6 +2556,7 @@ private extension HubClient {
                 let fileID = try await fetchXetFileID(
                     repoPath: repoPath,
                     repo: repo,
+                    kind: kind,
                     revision: revision,
                     transport: transport
                 )
@@ -1948,6 +2592,7 @@ private extension HubClient {
                 let fileID = try await fetchXetFileID(
                     repoPath: repoPath,
                     repo: repo,
+                    kind: kind,
                     revision: revision,
                     transport: transport
                 )
@@ -1955,15 +2600,14 @@ private extension HubClient {
                 return nil
             }
 
-            _ = try await Xet.withDownloader(
-                refreshURL: xetRefreshURL(for: repo, kind: kind, revision: revision),
-                hubToken: try? await httpClient.tokenProvider.getToken()
-            ) { downloader in
-                try await downloader.download(fileID, to: destination)
+            try await XetDownloadProgress.track(progress) { report in
+                try await Xet.withDownloader(
+                    refreshURL: xetRefreshURL(for: repo, kind: kind, revision: revision),
+                    hubToken: try? await httpClient.tokenProvider.getToken()
+                ) { downloader in
+                    try await downloader.download(fileID, to: destination, progress: report)
+                }
             }
-
-            progress?.totalUnitCount = 100
-            progress?.completedUnitCount = 100
 
             return destination
         #else
@@ -1976,6 +2620,7 @@ private extension HubClient {
     /// - Parameters:
     ///   - repoPath: Path to file
     ///   - repo: Repository identifier
+    ///   - kind: Kind of repository
     ///   - revision: Git revision
     ///   - transport: Transport to use
     /// - Returns: Xet file ID
@@ -1983,11 +2628,15 @@ private extension HubClient {
     func fetchXetFileID(
         repoPath: String,
         repo: Repo.ID,
+        kind: Repo.Kind,
         revision: String,
         transport: FileDownloadTransport
     ) async throws -> String? {
-        let urlPath = "/\(repo)/resolve/\(revision)/\(repoPath)"
-        var request = try await httpClient.createRequest(.head, urlPath)
+        let url = repositoryURL(repo, kind: kind)
+            .appending(path: "resolve")
+            .appending(component: revision)
+            .appending(path: repoPath)
+        var request = try await httpClient.createRequest(.head, url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
         #if canImport(FoundationNetworking)
@@ -2011,10 +2660,9 @@ private extension HubClient {
 
     /// Generate the Xet refresh URL for a given repository, kind, and revision.
     func xetRefreshURL(for repo: Repo.ID, kind: Repo.Kind, revision: String) -> URL {
-        let url = httpClient.host.appendingPathComponent(
-            "api/\(kind.pluralized)/\(repo)/xet-read-token/\(revision)"
-        )
-        return url
+        httpClient.host
+            .appending(path: "api/\(kind.pluralized)/\(repo)/xet-read-token")
+            .appending(component: revision)
     }
 
     /// Fetch metadata without following cross-host redirects.
@@ -2027,6 +2675,9 @@ private extension HubClient {
         #else
             let (_, response) = try await session.data(for: request, delegate: SameHostRedirectDelegate.shared)
         #endif
+        guard let httpResponse = response as? HTTPURLResponse,
+            (200 ..< 400).contains(httpResponse.statusCode)
+        else { return nil }
         return FileMetadata(response: response)
     }
 

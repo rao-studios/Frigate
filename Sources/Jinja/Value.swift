@@ -147,6 +147,13 @@ public enum Value: Sendable {
         return false
     }
 
+    /// This value with a Boolean replaced by 0 or 1,
+    /// because Python's `bool` is a subclass of `int`.
+    var booleanAsInt: Value {
+        if case let .boolean(value) = self { return .int(value ? 1 : 0) }
+        return self
+    }
+
     /// Returns `true` if this value is an integer.
     public var isInt: Bool {
         if case .int = self { return true }
@@ -191,6 +198,7 @@ public enum Value: Sendable {
 
     /// Returns `true` if this value can be iterated over (array, object, or string).
     public var isIterable: Bool {
+        if namespace != nil { return false }
         switch self {
         case .array, .object, .string: return true
         default: return false
@@ -221,7 +229,7 @@ public enum Value: Sendable {
     public func add(with other: Value) throws -> Value {
         switch (self, other) {
         case let (.int(a), .int(b)):
-            return .int(a + b)
+            return .int(try checkedInt(a.addingReportingOverflow(b), "\(a) + \(b)"))
         case let (.double(a), .double(b)):
             return .double(a + b)
         case let (.int(a), .double(b)):
@@ -267,7 +275,7 @@ public enum Value: Sendable {
     public func subtract(by other: Value) throws -> Value {
         switch (self, other) {
         case let (.int(a), .int(b)):
-            return .int(a - b)
+            return .int(try checkedInt(a.subtractingReportingOverflow(b), "\(a) - \(b)"))
         case let (.double(a), .double(b)):
             return .double(a - b)
         case let (.int(a), .double(b)):
@@ -286,17 +294,18 @@ public enum Value: Sendable {
     public func multiply(by other: Value) throws -> Value {
         switch (self, other) {
         case let (.int(a), .int(b)):
-            return .int(a * b)
+            return .int(try checkedInt(a.multipliedReportingOverflow(by: b), "\(a) * \(b)"))
         case let (.double(a), .double(b)):
             return .double(a * b)
         case let (.int(a), .double(b)):
             return .double(Double(a) * b)
         case let (.double(a), .int(b)):
             return .double(a * Double(b))
+        // Python repeats a string zero times for a negative count.
         case let (.string(s), .int(n)):
-            return .string(String(repeating: s, count: n))
+            return .string(try repeatedString(s, count: n))
         case let (.int(n), .string(s)):
-            return .string(String(repeating: s, count: n))
+            return .string(try repeatedString(s, count: n))
         default:
             throw JinjaError.runtime("Cannot multiply values of these types (\(self) and \(other))")
         }
@@ -333,7 +342,8 @@ public enum Value: Sendable {
         switch (self, other) {
         case let (.int(a), .int(b)):
             guard b != 0 else { throw JinjaError.runtime("Modulo by zero") }
-            return .int(a % b)
+            // `Int.min % -1` overflows in Swift; the remainder is 0.
+            return .int(a.remainderReportingOverflow(dividingBy: b).partialValue)
         default:
             throw JinjaError.runtime("Modulo operation requires integers (\(self) and \(other))")
         }
@@ -347,16 +357,17 @@ public enum Value: Sendable {
         switch (self, other) {
         case let (.int(a), .int(b)):
             guard b != 0 else { throw JinjaError.runtime("Division by zero") }
-            return .int(a / b)  // Integer division in Swift already floors
+            // Integer division in Swift already floors
+            return .int(try checkedInt(a.dividedReportingOverflow(by: b), "\(a) // \(b)"))
         case let (.double(a), .double(b)):
             guard b != 0 else { throw JinjaError.runtime("Division by zero") }
-            return .int(Int(floor(a / b)))
+            return .int(try truncatedInt(floor(a / b)))
         case let (.int(a), .double(b)):
             guard b != 0 else { throw JinjaError.runtime("Division by zero") }
-            return .int(Int(floor(Double(a) / b)))
+            return .int(try truncatedInt(floor(Double(a) / b)))
         case let (.double(a), .int(b)):
             guard b != 0 else { throw JinjaError.runtime("Division by zero") }
-            return .int(Int(floor(a / Double(b))))
+            return .int(try truncatedInt(floor(a / Double(b))))
         default:
             throw JinjaError.runtime(
                 "Cannot floor divide non-numeric values (\(self) and \(other))"
@@ -374,7 +385,20 @@ public enum Value: Sendable {
             guard b >= 0 else {
                 return .double(pow(Double(a), Double(b)))
             }
-            return .int(Int(pow(Double(a), Double(b))))
+            // Exponentiation by squaring, which is exact where `pow` on doubles is not.
+            var result = 1
+            var base = a
+            var exponent = b
+            while exponent > 0 {
+                if exponent & 1 == 1 {
+                    result = try checkedInt(result.multipliedReportingOverflow(by: base), "\(a) ** \(b)")
+                }
+                exponent >>= 1
+                if exponent > 0 {
+                    base = try checkedInt(base.multipliedReportingOverflow(by: base), "\(a) ** \(b)")
+                }
+            }
+            return .int(result)
         case let (.double(a), .double(b)):
             return .double(pow(a, b))
         case let (.int(a), .double(b)):
@@ -406,6 +430,10 @@ public enum Value: Sendable {
             return a < val ? -1 : a > val ? 1 : 0
         case let (.string(a), .string(b)):
             return a < b ? -1 : a > b ? 1 : 0
+        case (.boolean, .boolean), (.boolean, .int), (.boolean, .double),
+            (.int, .boolean), (.double, .boolean):
+            // Python orders booleans as the integers 0 and 1.
+            return try booleanAsInt.compare(to: other.booleanAsInt)
         default:
             throw JinjaError.runtime(
                 "Cannot compare values of different types (\(self) and \(other))"
@@ -424,12 +452,13 @@ public enum Value: Sendable {
         case .null:
             return false
         case let .array(items):
-            return items.contains { self == $0 }
+            return items.contains { self == $0 || self.isEquivalent(to: $0) }
         case let .string(str):
             guard case let .string(substr) = self else { return false }
             guard !substr.isEmpty else { return true }  // '' in 'abc' -> true
             return str.contains(substr)
         case let .object(dict):
+            try Namespace.requireMapping(dict)
             guard let key = ObjectKey(self) else { return false }
             return dict.keys.contains(key)
 
@@ -442,9 +471,9 @@ public enum Value: Sendable {
 
     /// Checks if the current value is equivalent to another value.
     ///
-    /// This is similar to `==`, but provides special handling for numeric types,
-    /// allowing an `Int` and a `Double` to be considered equivalent if they represent
-    /// the same number.
+    /// This is similar to `==`, but compares numbers as Python does:
+    /// an `Int` and a `Double` are equivalent if they represent the same number,
+    /// and `true` and `false` are equivalent to 1 and 0.
     ///
     /// - Parameters:
     ///   - other: The value to compare for equivalence.
@@ -456,13 +485,18 @@ public enum Value: Sendable {
         case let (.double(a), .double(b)):
             return a == b
         case let (.int(a), .double(b)):
-            return Double(a) == b
+            return Int(exactly: b) == a
         case let (.double(a), .int(b)):
-            return a == Double(b)
+            return Int(exactly: a) == b
         case let (.string(a), .string(b)):
             return a == b
         case let (.boolean(a), .boolean(b)):
             return a == b
+        // Python's `bool` is a subclass of `int`, so `True == 1` and `False == 0.0`.
+        case let (.boolean(a), .int(b)), let (.int(b), .boolean(a)):
+            return (a ? 1 : 0) == b
+        case let (.boolean(a), .double(b)), let (.double(b), .boolean(a)):
+            return (a ? 1.0 : 0.0) == b
         case (.null, .null):
             return true
         case (.undefined, .undefined):
@@ -471,6 +505,8 @@ public enum Value: Sendable {
             guard a.count == b.count else { return false }
             return zip(a, b).allSatisfy { $0.isEquivalent(to: $1) }
         case let (.object(a), .object(b)):
+            if let namespace = Namespace.get(a) { return namespace == Namespace.get(b) }
+            if Namespace.get(b) != nil { return false }
             guard a.count == b.count else { return false }
             for ((keyA, valueA), (keyB, valueB)) in zip(a, b) {
                 if keyA != keyB || !valueA.isEquivalent(to: valueB) {
@@ -496,23 +532,102 @@ extension Value: CustomStringConvertible {
         case .string(let s): return s
         case .double(let n): return String(n)
         case .int(let i): return String(i)
-        case .boolean(let b): return String(b)
-        case .null: return ""
+        case .boolean, .null, .array, .object: return pythonRepr
         case .undefined: return ""
-        case .array(let a):
-            // Python-style representation of strings in the array
-            let elements = a.map { element -> String in
-                if case let .string(s) = element {
-                    return "'\(s)'"
-                } else {
-                    return element.description
-                }
-            }
-            return "[\(elements.joined(separator: ", "))]"
-        case .object(let o):
-            return "{\(o.map { "\($0.key.description): \($0.value.description)" }.joined(separator: ", "))}"
         case .function: return "[Function]"
         case .macro(let m): return "[Macro \(m.name)]"
+        }
+    }
+
+    /// The value as Python's `repr()` writes it.
+    ///
+    /// Python prints each element of a list or dict with `repr()`,
+    /// so strings are quoted and escaped,
+    /// booleans, none, and undefined print as `True`, `False`, `None`, and `Undefined`,
+    /// and floats use Python's shortest round-trip form.
+    /// A function keeps its ``description``,
+    /// because Python's representation of a function shows its memory address.
+    var pythonRepr: String {
+        switch self {
+        case .string(let s): return s.pythonRepr
+        case .double(let n):
+            if n.isNaN { return "nan" }
+            if n.isInfinite { return n < 0 ? "-inf" : "inf" }
+            return JSON.pythonRepr(n)
+        case .int(let i): return String(i)
+        case .boolean(let b): return b ? "True" : "False"
+        case .null: return "None"
+        case .undefined: return "Undefined"
+        case .array(let a):
+            return "[\(a.map(\.pythonRepr).joined(separator: ", "))]"
+        case .object(let o):
+            if let namespace = Namespace.get(o) {
+                return "<Namespace \(Value.object(namespace.attributes).pythonRepr)>"
+            }
+            return "{\(o.map { "\(Value($0.key).pythonRepr): \($0.value.pythonRepr)" }.joined(separator: ", "))}"
+        case .function: return description
+        case .macro(let m): return "<Macro \(m.name.pythonRepr)>"
+        }
+    }
+}
+
+extension String {
+    /// The string as Python's `repr()` writes it.
+    ///
+    /// The string is in single quotes,
+    /// or in double quotes if it contains a single quote and no double quote.
+    /// Backslashes, the enclosing quote, and nonprintable characters are escaped.
+    ///
+    /// See: https://github.com/python/cpython/blob/main/Objects/unicodeobject.c (`unicode_repr`)
+    var pythonRepr: String {
+        let quote: Unicode.Scalar =
+            unicodeScalars.contains("'") && !unicodeScalars.contains("\"") ? "\"" : "'"
+        var result = String.UnicodeScalarView()
+        result.append(quote)
+        for scalar in unicodeScalars {
+            switch scalar {
+            case quote, "\\":
+                result.append("\\")
+                result.append(scalar)
+            case "\t": result.append(contentsOf: "\\t".unicodeScalars)
+            case "\n": result.append(contentsOf: "\\n".unicodeScalars)
+            case "\r": result.append(contentsOf: "\\r".unicodeScalars)
+            case " " ... "~":
+                result.append(scalar)
+            default:
+                if !scalar.isASCII && scalar.isPythonPrintable {
+                    result.append(scalar)
+                } else {
+                    let (prefix, width) =
+                        switch scalar.value {
+                        case ..<0x100: ("\\x", 2)
+                        case ..<0x10000: ("\\u", 4)
+                        default: ("\\U", 8)
+                        }
+                    let hex = String(scalar.value, radix: 16)
+                    result.append(contentsOf: prefix.unicodeScalars)
+                    result.append(contentsOf: String(repeating: "0", count: width - hex.count).unicodeScalars)
+                    result.append(contentsOf: hex.unicodeScalars)
+                }
+            }
+        }
+        result.append(quote)
+        return String(result)
+    }
+}
+
+extension Unicode.Scalar {
+    /// Whether Python's `str.isprintable()` treats the character as printable.
+    ///
+    /// Python treats characters in the Other and Separator categories as nonprintable,
+    /// except for the ASCII space.
+    fileprivate var isPythonPrintable: Bool {
+        switch properties.generalCategory {
+        case .control, .format, .surrogate, .privateUse, .unassigned,
+            .lineSeparator, .paragraphSeparator, .spaceSeparator:
+            return self == " "
+        default:
+            return true
         }
     }
 }
@@ -530,7 +645,10 @@ extension Value: Equatable {
         case (.null, .null): return true
         case (.undefined, .undefined): return true
         case let (.array(lhs), .array(rhs)): return lhs == rhs
-        case let (.object(lhs), .object(rhs)): return lhs == rhs
+        case let (.object(lhs), .object(rhs)):
+            if let namespace = Namespace.get(lhs) { return namespace == Namespace.get(rhs) }
+            if Namespace.get(rhs) != nil { return false }
+            return lhs == rhs
         case (.function, .function): return false
         case let (.macro(lhs), .macro(rhs)): return lhs == rhs
         default: return false
@@ -551,7 +669,12 @@ extension Value: Hashable {
         case .null: hasher.combine(0)
         case .undefined: hasher.combine(0)
         case let .array(value): hasher.combine(value)
-        case let .object(value): hasher.combine(value)
+        case let .object(value):
+            if let namespace = Namespace.get(value) {
+                hasher.combine(namespace)
+            } else {
+                hasher.combine(value)
+            }
         case .function: hasher.combine(0)
         case .macro(let m): hasher.combine(m)
         }
@@ -564,6 +687,7 @@ extension Value: Encodable {
     public func encode(to encoder: Encoder) throws {
         switch self {
         case let .object(value):
+            try Namespace.requireMapping(value)
             var keyedContainer = encoder.container(keyedBy: ObjectKey.self)
             var seenStringValues: Set<String> = []
             for key in value.keys.sorted() {
@@ -736,7 +860,10 @@ public enum ObjectKey: Hashable, Sendable {
 
     /// Creates an object key from a runtime value.
     ///
-    /// - Parameter value: A string or integer value to use as a key.
+    /// A Boolean becomes the integer key 0 or 1,
+    /// because Python's `True` and `1` are the same dictionary key.
+    ///
+    /// - Parameter value: A string, integer, or Boolean value to use as a key.
     /// - Returns: The corresponding key, or `nil` if the value is not a valid key type.
     public init?(_ value: Value) {
         switch value {
@@ -744,6 +871,8 @@ public enum ObjectKey: Hashable, Sendable {
             self = .string(string)
         case let .int(int):
             self = .int(int)
+        case let .boolean(boolean):
+            self = .int(boolean ? 1 : 0)
         default:
             return nil
         }
@@ -791,7 +920,7 @@ extension ObjectKey: CustomStringConvertible {
     public var description: String {
         switch self {
         case let .string(string):
-            return "'\(string)'"
+            return string.pythonRepr
         case let .int(int):
             return String(int)
         }

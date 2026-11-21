@@ -10,6 +10,8 @@ import Foundation
 import Hub
 
 /// A pair of byte/token strings used in Byte-Pair Encoding (BPE) merge operations.
+///
+/// Equality and hashing compare code units as in the reference Rust library.
 struct BytePair: Hashable, Sendable {
     let a: String
     let b: String
@@ -24,12 +26,23 @@ struct BytePair: Hashable, Sendable {
     }
 
     static func == (lhs: BytePair, rhs: BytePair) -> Bool {
-        lhs.a == rhs.a && lhs.b == rhs.b
+        lhs.a.utf8.elementsEqual(rhs.a.utf8) && lhs.b.utf8.elementsEqual(rhs.b.utf8)
     }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(a)
-        hasher.combine(b)
+        Self.combine(a, into: &hasher)
+        Self.combine(b, into: &hasher)
+    }
+
+    /// Feeds the length and UTF-8 bytes of `part` to `hasher`, always through `combine(bytes:)`,
+    /// so equal byte sequences hash the same whether or not the string is natively stored.
+    private static func combine(_ part: String, into hasher: inout Hasher) {
+        hasher.combine(part.utf8.count)
+        if part.utf8.withContiguousStorageIfAvailable({ hasher.combine(bytes: UnsafeRawBufferPointer($0)) }) == nil {
+            var contiguous = part
+            contiguous.makeContiguousUTF8()
+            contiguous.utf8.withContiguousStorageIfAvailable { hasher.combine(bytes: UnsafeRawBufferPointer($0)) }
+        }
     }
 }
 
@@ -97,8 +110,10 @@ private struct BPEMergeCandidate: Comparable {
 /// including GPT-2, RoBERTa, and other transformer models.
 class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     let bpeRanks: [BytePair: Int]
-    private let tokensToIds: [NSString: Int]
-    private let idsToTokens: [Int: NSString]
+    // NSString equality and hashing disagree for some canonically equivalent strings on Linux.
+    // Preserve the exact vocabulary keys on every platform.
+    private let tokensToIds: [BinaryDistinctString: Int]
+    private let idsToTokens: [Int: String]
 
     /// The total number of tokens in the vocabulary.
     var vocabCount: Int { tokensToIds.count }
@@ -124,25 +139,39 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
 
-    /// `model.ignore_merges`: a word already in the vocabulary is that one token, merges unread (Llama 3's
-    /// tokenizer.json sets it). Hugging Face's `BPE::merge_word` looks the word up before it merges.
+    /// Whether the model declares SentencePiece byte fallback.
+    let byteFallback: Bool
+
+    /// Whether a word found whole in the vocabulary is returned without applying merges.
     let ignoreMerges: Bool
 
-    static func mergesFromConfig(_ config: Config?) -> [[String]]? {
-        guard let config else { return nil }
-
-        if let merges = config.array() {
-            return merges.reduce(into: [[String]]()) { result, element in
-                if let val: [String] = element.get() { // New format (pushed with tokenizers >= 0.20.0): each merge is a list of 2 items
-                    result.append(val)
+    /// Builds the merge ranks straight from the `merges` list, without an intermediate `[[String]]`.
+    ///
+    /// A merge's rank is its position among the entries that are a list or a legacy `"a b"`
+    /// string (anything else is skipped), and a repeated pair keeps its last rank.
+    static func bpeRanks(merges: [Config]) -> [BytePair: Int] {
+        var ranks = [BytePair: Int](minimumCapacity: merges.count)
+        var rank = 0
+        for element in merges {
+            let pair: BytePair
+            if let parts = element.array() {
+                // New format (pushed with tokenizers >= 0.20.0): each merge is a list of 2 items.
+                if parts.count == 2, let a = parts[0].string(), let b = parts[1].string() {
+                    pair = BytePair(a, b)
+                } else if let val: [String] = element.get() {
+                    pair = BytePair(tuple: val)
+                } else {
+                    continue
                 }
-                if let val: String = element.get() { // legacy
-                    result.append(val.unicodeScalars.split(separator: " ", omittingEmptySubsequences: false).map { String($0) })
-                }
+            } else if let val: String = element.get() { // legacy
+                pair = BytePair(tuple: val.unicodeScalars.split(separator: " ", omittingEmptySubsequences: false).map { String($0) })
+            } else {
+                continue
             }
+            ranks[pair] = rank
+            rank += 1
         }
-
-        return nil
+        return ranks
     }
 
     /// Initializes a BPE tokenizer from configuration data.
@@ -153,45 +182,44 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     ///   - addedTokens: Additional tokens to include in the vocabulary
     /// - Throws: `TokenizerError` if required configuration is missing
     required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
-        guard let merges = Self.mergesFromConfig(tokenizerData.model.merges) else { fatalError("BPETokenizer requires merges") }
+        guard let merges = tokenizerData.model.merges.array() else { fatalError("BPETokenizer requires merges") }
         guard let vocab = tokenizerData.model.vocab.dictionary() else {
             throw TokenizerError.missingVocab
         }
-        var bpeRanks: [BytePair: Int] = [:]
-        for (i, merge) in merges.enumerated() {
-            let bp = BytePair(tuple: merge)
-            bpeRanks[bp] = i
-        }
-        self.bpeRanks = bpeRanks
+        // After the vocabulary check: a malformed merge (fewer than two parts) traps in
+        // `BytePair(tuple:)`, and a tokenizer without a vocabulary throws `missingVocab` first.
+        self.bpeRanks = Self.bpeRanks(merges: merges)
 
         let addedTokens = addedTokens.reduce(into: [BinaryDistinctString: Config]()) { result, element in
             result[BinaryDistinctString(element.key)] = .init(element.value)
         }
-        tokensToIds = vocab.merging(addedTokens) { $1 }.reduce(into: [NSString: Int]()) { result, element in
-            result[element.key.nsString] = element.value.integer()
-        }
+        tokensToIds = vocab.merging(addedTokens) { $1 }.compactMapValues { $0.integer() }
 
-        idsToTokens = tokensToIds.reduce(into: [Int: NSString]()) { result, element in
-            result[element.value] = element.key
+        var idsToTokens = [Int: String](minimumCapacity: tokensToIds.count)
+        for (token, id) in tokensToIds {
+            idsToTokens[id] = token.string
         }
+        self.idsToTokens = idsToTokens
 
         // Populate tokens
         if let unknownToken = TokenizerModel.unknownToken(from: tokenizerConfig) {
             self.unknownToken = unknownToken
-            unknownTokenId = tokensToIds[unknownToken as NSString]
+            unknownTokenId = tokensToIds[BinaryDistinctString(unknownToken)]
         } else {
             unknownToken = nil
             unknownTokenId = nil
         }
 
         eosToken = addedTokenAsString(tokenizerConfig.eosToken)
-        eosTokenId = eosToken == nil ? nil : tokensToIds[eosToken! as NSString]
+        eosTokenId = eosToken == nil ? nil : tokensToIds[BinaryDistinctString(eosToken!)]
 
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
-        bosTokenId = bosToken == nil ? nil : tokensToIds[bosToken! as NSString]
+        bosTokenId = bosToken == nil ? nil : tokensToIds[BinaryDistinctString(bosToken!)]
 
-        fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: false)
-        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
+        // `fuse_unk` is a model setting in tokenizer.json; tokenizer_config.json files don't carry it.
+        fuseUnknownTokens = tokenizerData.model["fuseUnk"].boolean() ?? tokenizerConfig.fuseUnk.boolean(or: false)
+        byteFallback = tokenizerData.model["byteFallback"].boolean() ?? false
+        ignoreMerges = tokenizerData.model["ignoreMerges"].boolean() ?? false
     }
 
     /// Converts a token string to its corresponding numeric ID.
@@ -199,7 +227,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Parameter token: The token string to convert
     /// - Returns: The numeric ID, or the unknown token ID if not found
     func convertTokenToId(_ token: String) -> Int? {
-        tokensToIds[token as NSString] ?? unknownTokenId
+        tokensToIds[BinaryDistinctString(token)] ?? unknownTokenId
     }
 
     /// Converts a numeric token ID back to its string representation.
@@ -207,11 +235,8 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Parameter id: The numeric token ID to convert
     /// - Returns: The token string, or nil if the ID is invalid
     func convertIdToToken(_ id: Int) -> String? {
-        idsToTokens[id] as String?
+        idsToTokens[id]
     }
-
-    /// Cached `<0x%02X>` byte fallback strings, indexed by byte value.
-    private static let hexaEncoderTable: [String] = (0..<256).map { String(format: "<0x%02X>", $0) }
 
     func byteEncode(text: String) -> [String] {
         var result: [String] = []
@@ -230,7 +255,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
         var result: [String] = []
         enumerateRegexTokens(in: text, with: byteLevelPreTokenizeRegex) { token in
             for byte in token.utf8 {
-                result.append(Self.hexaEncoderTable[Int(byte)])
+                result.append(byteFallbackEncoderTable[Int(byte)])
             }
         }
         return result
@@ -248,7 +273,6 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// non-spacing mark, because the mark forms a single grapheme cluster with the
     /// preceding space and the split silently swallows the boundary.
     func bpe(token: String) -> [String] {
-        if ignoreMerges, tokensToIds[token as NSString] != nil { return [token] }
         var symbols = token.unicodeScalars.map { String($0) }
         if symbols.count <= 1 {
             return symbols.isEmpty ? [] : [token]
@@ -330,14 +354,22 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Parameter text: The input text to tokenize
     /// - Returns: An array of BPE token strings
     func tokenize(text: String) -> [String] {
+        // As in `tokenizers`, the whole word is looked up before any merge.
+        if ignoreMerges, tokensToIds[BinaryDistinctString(text)] != nil {
+            return [text]
+        }
         var tokens: [String] = []
         let bpeTokens = bpe(token: text)
         for token in bpeTokens {
-            if convertTokenToId(token) != unknownTokenId {
+            if tokensToIds[BinaryDistinctString(token)] != nil {
                 tokens.append(token)
             } else {
-                // TODO: if config.byte_fallback is False, append the unknown token instead
-                tokens.append(contentsOf: hexaEncode(text: token))
+                let bytePieces = byteFallback ? hexaEncode(text: token) : []
+                if byteFallback && bytePieces.allSatisfy({ tokensToIds[BinaryDistinctString($0)] != nil }) {
+                    tokens.append(contentsOf: bytePieces)
+                } else if let unknownToken {
+                    tokens.append(unknownToken)
+                }
             }
         }
         return tokens

@@ -195,21 +195,14 @@ class DeepseekV3Attention: Module {
         kv = kv.reshaped(B, L, self.numHeads, -1).transposed(0, 2, 1, 3)
         let splitKv = split(kv, indices: [self.qkNopeHeadDim], axis: -1)
 
-        var (kNope, values) = (splitKv[0], splitKv[1])
+        let (kNope, values) = (splitKv[0], splitKv[1])
 
         let offset = cache?.ropeOffset
         qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
         kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        var keys: MLXArray
-        if let cache = cache {
-            (keys, values) = cache.update(
-                keys: concatenated([kNope, kPe], axis: -1), values: values)
-        } else {
-            keys = concatenated([kNope, kPe], axis: -1)
-        }
-
+        let keys = concatenated([kNope, kPe], axis: -1)
         let queries = concatenated([qNope, qPe], axis: -1)
 
         let output = attentionWithCacheUpdate(
@@ -277,26 +270,33 @@ class MoEGate: Module {
         let (bsz, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         let hiddenStates = x.matmul(weight.T)
-        var scores = sigmoid(hiddenStates)
-        let scoresForChoice = scores + e_score_correction_bias
+        // Score in float32, as mlx-lm does: next to a correction bias near 4,
+        // bfloat16 scores collapse to a few distinct values and change the
+        // selection.
+        let originalScores = sigmoid(hiddenStates.asType(.float32))
+        let scoresForChoice = originalScores + e_score_correction_bias.asType(.float32)
         let groupScores = scoresForChoice.reshaped(bsz, seqLen, self.nGroup, -1)
         let topKGroup = top(groupScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
         var k = nGroup - (topkGroup ?? 1)
         var groupIdx = argPartition(topKGroup, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
         groupIdx = broadcast(groupIdx, to: [bsz, seqLen, k, (nRoutedExperts ?? 1) / nGroup])
-        scores = putAlong(groupScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
+        var scores = putAlong(
+            groupScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
         scores = flattened(scores, start: -2, end: -1)
 
+        // The correction bias only selects the experts; the routing weights
+        // come from the uncorrected scores, as in mlx-lm.
         k = topK ?? 1
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        scores = takeAlong(scores, inds, axis: -1)
+        scores = takeAlong(originalScores, inds, axis: -1)
         if topK ?? 1 > 1, normTopkProb {
             let denominator = scores.sum(axis: -1, keepDims: true) + 1e-20
             scores = scores / denominator
-            scores = scores * routedScalingFactor
         }
+        scores = scores * routedScalingFactor
 
-        return (inds, scores)
+        // Return the weights in the activation dtype so the expert sum keeps it.
+        return (inds, scores.asType(x.dtype))
     }
 }
 
@@ -330,7 +330,9 @@ class DeepseekV3MoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         var y = switchMLP(x, indices)
-        y = weightedExpertSum(y, scores)
+        // A float32 e_score_correction_bias makes the scores float32. Cast
+        // back so the residual stream keeps the activation dtype.
+        y = weightedExpertSum(y, scores).asType(y.dtype)
 
         if let shared = sharedExperts {
             y = y + shared(x)
@@ -415,14 +417,15 @@ public class DeepseekV3ModelInner: Module {
 }
 
 public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
-    public var kvHeads: [Int] = []
+    public var kvHeads: [Int]
 
     var args: DeepseekV3Configuration
     public var model: DeepseekV3ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    init(_ args: DeepseekV3Configuration) {
+    public init(_ args: DeepseekV3Configuration) {
         self.args = args
+        self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -430,6 +433,16 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let out = model(inputs, cache: cache)
         return lmHead(out)
+    }
+
+    private func isMultiTokenPredictionLayer(_ key: String) -> Bool {
+        let components = key.split(separator: ".", maxSplits: 3)
+        guard components.count >= 3,
+            components[0] == "model", components[1] == "layers",
+            let layerIndex = Int(components[2])
+        else { return false }
+
+        return layerIndex >= args.numHiddenLayers
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -475,7 +488,7 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         }
 
         return newWeights.filter { key, _ in
-            !key.starts(with: "model.layers.61") && !key.contains("rotary_emb.inv_freq")
+            !isMultiTokenPredictionLayer(key) && !key.contains("rotary_emb.inv_freq")
         }
     }
 
@@ -483,3 +496,11 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         model.layers
     }
 }
+
+// MARK: - Chat conventions
+//
+// Deliberately none. `deepseek_v3` is an architecture shared by DeepSeek-V3 and
+// DeepSeek-R1, while always-on reasoning is a property of the R1 checkpoints and
+// their chat template, not of the architecture. Declaring it here would advertise
+// reasoning for plain V3 too, so R1 is recognized by repo id in
+// `DeepSeekR1ConventionsResolver` instead.

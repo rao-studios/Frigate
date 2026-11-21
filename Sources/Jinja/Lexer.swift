@@ -1,5 +1,5 @@
 /// Tokenizes Jinja template source code into a sequence of tokens.
-public enum Lexer: Sendable {
+enum Lexer: Sendable {
     private static let keywords: [String: Token.Kind] = [
         "if": .`if`, "else": .`else`, "elif": .elif, "endif": .endif,
         "for": .`for`, "endfor": .endfor, "in": .`in`, "not": .not,
@@ -29,28 +29,39 @@ public enum Lexer: Sendable {
     /// - Parameter source: The Jinja template source code to tokenize
     /// - Returns: An array of tokens representing the lexical structure
     /// - Throws: `JinjaError.lexer` if the source contains invalid syntax
-    public static func tokenize(_ source: String) throws
+    static func tokenize(_ source: String) throws
         -> [Token]
     {
-        let preprocessed = preprocess(source)
         var tokens: [Token] = []
-        tokens.reserveCapacity(preprocessed.count / 4)
+        tokens.reserveCapacity(source.utf8.count / 4)
 
-        var position = preprocessed.startIndex
+        var position = source.startIndex
         var inTag = false
         var curlyBracketDepth = 0
 
-        while position < preprocessed.endIndex {
+        // Token positions count characters from the start of the source.
+        // Tokens start in order, so count only the characters since the previous token
+        // instead of counting from the start for each token.
+        var offsetIndex = source.startIndex
+        var offset = 0
+        func characterOffset(of index: String.Index) -> Int {
+            offset += source.distance(from: offsetIndex, to: index)
+            offsetIndex = index
+            return offset
+        }
+
+        while position < source.endIndex {
             if inTag {
-                position = skipWhitespace(in: preprocessed, at: position)
-                if position >= preprocessed.endIndex {
+                position = skipWhitespace(in: source, at: position)
+                if position >= source.endIndex {
                     break
                 }
             }
 
             let (token, newPosition) = try extractToken(
-                from: preprocessed,
+                from: source,
                 at: position,
+                charPosition: characterOffset(of: position),
                 inTag: inTag,
                 curlyBracketDepth: curlyBracketDepth
             )
@@ -69,6 +80,18 @@ public enum Lexer: Sendable {
                 break
             }
 
+            // `{{-`, `{%-`, and `{#-` strip the whitespace at the end of the text before them,
+            // as Jinja2 does with `str.rstrip()`.
+            if token.kind == .openExpression || token.kind == .openStatement || token.kind == .comment,
+                source[position...].dropFirst(2).first == "-",
+                let previous = tokens.last, previous.kind == .text
+            {
+                tokens.removeLast()
+                if let last = previous.value.lastIndex(where: { !isPythonWhitespace($0) }) {
+                    tokens.append(Token(kind: .text, value: previous.value[...last], position: previous.position))
+                }
+            }
+
             if token.kind == .text, token.value.isEmpty {
                 position = newPosition
                 continue
@@ -83,8 +106,7 @@ public enum Lexer: Sendable {
         }
 
         if tokens.isEmpty || tokens.last?.kind != .eof {
-            let charPosition = preprocessed.distance(from: preprocessed.startIndex, to: position)
-            tokens.append(Token(kind: .eof, value: "", position: charPosition))
+            tokens.append(Token(kind: .eof, value: "", position: characterOffset(of: position)))
         }
 
         return tokens
@@ -106,64 +128,51 @@ public enum Lexer: Sendable {
         return pos
     }
 
-    private static func preprocess(_ template: String) -> String {
-        // Optimized preprocessing with single pass
-        var result = template
+    /// Returns the position after the dash of `{{-`, `{%-`, or `{#-`,
+    /// or the given position if there's no dash there.
+    private static func indexAfterDash(in source: String, at position: String.Index) -> String.Index {
+        position < source.endIndex && source[position] == "-" ? source.index(after: position) : position
+    }
 
-        // Handle whitespace control
+    /// Returns the position after the whitespace that `-}}`, `-%}`, or `-#}` strips,
+    /// as Jinja2 does with `\s*`.
+    private static func skipPythonWhitespace(
+        in source: String,
+        at position: String.Index
+    ) -> String.Index {
+        source[position...].firstIndex { !isPythonWhitespace($0) } ?? source.endIndex
+    }
 
-        // Note: We must avoid merging a literal '{' with the delimiter.
-        // For example, "{<newline>{%-" should become "{ {%" not "{{%" (which would be parsed as "{{" + "%").
-        // Since Swift Regex doesn't support lookbehind
-        // (see https://github.com/swiftlang/swift-evolution/blob/main/proposals/0448-regex-lookbehind-assertions.md),
-        // we use a multi-step approach:
-
-        // 1. Handle closing delimiters (these don't have the merging issue)
-        result = result.replacing(#/-%}\s*/#, with: "%}")
-        result = result.replacing(#/-}}\s*/#, with: "}}")
-
-        // 2. For opening delimiters, we need to be careful about preceding '{'
-        // When preceded by '{', we keep a single space to prevent token merging.
-        // When preceded by other characters, we strip the whitespace entirely.
-
-        // Handle {%- : if preceded by '{', keep one space; otherwise strip whitespace
-        result = result.replacing(#/\{\s+\{%-/#, with: "{ {%")
-        result = result.replacing(#/([^\{])\s*\{%-/#) { match in
-            "\(match.1){%"
-        }
-        result = result.replacing(#/^\s*\{%-/#, with: "{%")
-
-        // Handle {{- : if preceded by '{', keep one space; otherwise strip whitespace
-        result = result.replacing(#/\{\s+\{\{-/#, with: "{ {{")
-        result = result.replacing(#/([^\{])\s*\{\{-/#) { match in
-            "\(match.1){{"
-        }
-        result = result.replacing(#/^\s*\{\{-/#, with: "{{")
-
-        return result
+    /// Returns whether Python's `str.isspace()` is true for every scalar of a character.
+    ///
+    /// Python's whitespace is Unicode's `White_Space` property
+    /// and the separators U+001C through U+001F.
+    /// A character that combines whitespace with a mark, such as U+0020 U+0301,
+    /// isn't whitespace here, though Python strips its U+0020.
+    private static func isPythonWhitespace(_ char: Character) -> Bool {
+        char.unicodeScalars.allSatisfy(\.isPythonWhitespace)
     }
 
     private static func extractToken(
         from source: String,
         at position: String.Index,
+        charPosition: Int,
         inTag: Bool,
         curlyBracketDepth: Int = 0
     ) throws -> (Token, String.Index) {
         guard position < source.endIndex else {
-            let charPosition = source.distance(from: source.startIndex, to: position)
             return (Token(kind: .eof, value: "", position: charPosition), position)
         }
 
         let char = source[position]
-        let charPosition = source.distance(from: source.startIndex, to: position)
 
         // Template delimiters - check for {{, {%, and {#
         if char == "{" {
             let nextIndex = source.index(after: position)
             if nextIndex < source.endIndex {
                 let nextChar = source[nextIndex]
-                if nextChar == "{" {  // "{{"
-                    let endIndex = source.index(after: nextIndex)
+                if nextChar == "{" {  // "{{" or "{{-"
+                    let endIndex = indexAfterDash(in: source, at: source.index(after: nextIndex))
                     return (
                         Token(
                             kind: .openExpression,
@@ -171,8 +180,8 @@ public enum Lexer: Sendable {
                             position: charPosition
                         ), endIndex
                     )
-                } else if nextChar == "%" {  // "{%"
-                    let endIndex = source.index(after: nextIndex)
+                } else if nextChar == "%" {  // "{%" or "{%-"
+                    let endIndex = indexAfterDash(in: source, at: source.index(after: nextIndex))
                     return (
                         Token(
                             kind: .openStatement,
@@ -181,13 +190,27 @@ public enum Lexer: Sendable {
                         ), endIndex
                     )
                 } else if nextChar == "#" {  // "{#"
-                    return try extractCommentToken(from: source, at: position)
+                    return try extractCommentToken(from: source, at: position, charPosition: charPosition)
                 }
             }
         }
 
         // Closing delimiters are only meaningful inside {{ ... }} / {% ... %}
         if inTag {
+            // `-}}` and `-%}` also strip the whitespace after them.
+            if char == "-" {
+                let rest = source[source.index(after: position)...]
+                let kind: Token.Kind? =
+                    rest.hasPrefix("}}") && curlyBracketDepth == 0
+                    ? .closeExpression : rest.hasPrefix("%}") ? .closeStatement : nil
+                if let kind {
+                    let endIndex = source.index(position, offsetBy: 3)
+                    return (
+                        Token(kind: kind, value: source[position ..< endIndex], position: charPosition),
+                        skipPythonWhitespace(in: source, at: endIndex)
+                    )
+                }
+            }
             if char == "}" {
                 let nextIndex = source.index(after: position)
                 if nextIndex < source.endIndex && source[nextIndex] == "}"
@@ -217,7 +240,7 @@ public enum Lexer: Sendable {
                 }
             }
         } else {
-            return extractTextToken(from: source, at: position)
+            return extractTextToken(from: source, at: position, charPosition: charPosition)
         }
 
         // Single character tokens
@@ -322,17 +345,25 @@ public enum Lexer: Sendable {
 
         // String literals
         if char == "'" || char == "\"" {
-            return try extractStringToken(from: source, at: position, delimiter: char)
+            return try extractStringToken(from: source, at: position, charPosition: charPosition, delimiter: char)
         }
 
         // Numbers
         if char.isNumber {
-            return extractNumberToken(from: source, at: position)
+            // As in Jinja2, a number right after a dot has no fraction,
+            // so `foo.0.1` is `foo[0][1]`, not `foo` and `0.1`.
+            let followsDot = position > source.startIndex && source[source.index(before: position)] == "."
+            return extractNumberToken(
+                from: source,
+                at: position,
+                charPosition: charPosition,
+                allowsFraction: !followsDot
+            )
         }
 
         // Identifiers and keywords
         if char.isLetter || char == "_" {
-            return extractIdentifierToken(from: source, at: position)
+            return extractIdentifierToken(from: source, at: position, charPosition: charPosition)
         }
 
         throw JinjaError.lexer(
@@ -342,7 +373,8 @@ public enum Lexer: Sendable {
 
     private static func extractTextToken(
         from source: String,
-        at position: String.Index
+        at position: String.Index,
+        charPosition: Int
     ) -> (Token, String.Index) {
         var pos = position
         let startPos = position
@@ -361,18 +393,17 @@ public enum Lexer: Sendable {
             pos = nextIndex
         }
 
-        let charPosition = source.distance(from: source.startIndex, to: position)
         return (Token(kind: .text, value: source[startPos ..< pos], position: charPosition), pos)
     }
 
     private static func extractStringToken(
         from source: String,
         at position: String.Index,
+        charPosition: Int,
         delimiter: Character
     ) throws -> (Token, String.Index) {
         var pos = source.index(after: position)
         var value = ""
-        let charPosition = source.distance(from: source.startIndex, to: position)
 
         while pos < source.endIndex {
             let char = source[pos]
@@ -412,7 +443,9 @@ public enum Lexer: Sendable {
 
     private static func extractNumberToken(
         from source: String,
-        at position: String.Index
+        at position: String.Index,
+        charPosition: Int,
+        allowsFraction: Bool
     ) -> (Token, String.Index) {
         var pos = position
         var hasDot = false
@@ -422,7 +455,7 @@ public enum Lexer: Sendable {
             let char = source[pos]
             if char.isNumber {
                 pos = source.index(after: pos)
-            } else if char == "." && !hasDot {
+            } else if char == "." && allowsFraction && !hasDot {
                 hasDot = true
                 pos = source.index(after: pos)
             } else {
@@ -430,13 +463,13 @@ public enum Lexer: Sendable {
             }
         }
 
-        let charPosition = source.distance(from: source.startIndex, to: position)
         return (Token(kind: .number, value: source[startPos ..< pos], position: charPosition), pos)
     }
 
     private static func extractIdentifierToken(
         from source: String,
-        at position: String.Index
+        at position: String.Index,
+        charPosition: Int
     ) -> (Token, String.Index) {
         var pos = position
         let startPos = position
@@ -452,22 +485,30 @@ public enum Lexer: Sendable {
 
         let value = String(source[startPos ..< pos])
         let tokenKind = keywords[value] ?? .identifier
-        let charPosition = source.distance(from: source.startIndex, to: position)
         return (Token(kind: tokenKind, value: source[startPos ..< pos], position: charPosition), pos)
     }
 
     private static func extractCommentToken(
         from source: String,
-        at position: String.Index
+        at position: String.Index,
+        charPosition: Int
     ) throws -> (Token, String.Index) {
-        // Skip the opening {#
-        var pos = source.index(position, offsetBy: 2)
+        // Skip the opening {# or {#-
+        var pos = indexAfterDash(in: source, at: source.index(position, offsetBy: 2))
         var value = ""
-        let charPosition = source.distance(from: source.startIndex, to: position)
 
         while pos < source.endIndex {
             let char = source[pos]
             let nextIndex = source.index(after: pos)
+
+            // `-#}` also strips the whitespace after it.
+            if char == "-" && source[nextIndex...].hasPrefix("#}") {
+                let endPos = source.index(nextIndex, offsetBy: 2)
+                return (
+                    Token(kind: .comment, value: value, position: charPosition),
+                    skipPythonWhitespace(in: source, at: endPos)
+                )
+            }
 
             if nextIndex < source.endIndex && char == "#" && source[nextIndex] == "}" {
                 let endPos = source.index(after: nextIndex)

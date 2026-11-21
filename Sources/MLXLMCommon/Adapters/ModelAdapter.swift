@@ -13,18 +13,29 @@ import MLXNN
 public enum ModelAdapterError: Error {
     case unsupportedAdapterType(String)
     case incompatibleModelType
+    /// The adapter targets a layer it cannot reproduce, such as a rotated quantized linear.
+    case unsupportedLayer(key: String, type: String)
 }
 
 /// Protocol defining an adapter that can modify a `LanguageModel`.
 public protocol ModelAdapter: Sendable {
 
     /// Loads the adapter into the specified model.
+    ///
+    /// Prefer ``LanguageModel/load(adapter:)`` when invoking an adapter so the
+    /// model can rebuild derived inference state after the topology change.
     func load(into model: LanguageModel) throws
 
     /// Permanently fuses the adapter into the specified model.
+    ///
+    /// Prefer ``LanguageModel/fuse(with:)`` when invoking an adapter so the
+    /// model can rebuild derived inference state after the topology change.
     func fuse(with model: LanguageModel) throws
 
     /// Unloads the adapter from the specified model.
+    ///
+    /// Prefer ``LanguageModel/unload(adapter:)`` when invoking an adapter so
+    /// the model can rebuild derived inference state after the topology change.
     func unload(from model: LanguageModel)
 }
 
@@ -42,6 +53,7 @@ extension LanguageModel {
     /// try model.load(adapter: adapter)
     /// ```
     public func load(adapter: ModelAdapter) throws {
+        defer { prepareInferenceState(in: self) }
         try adapter.load(into: self)
     }
 
@@ -54,6 +66,7 @@ extension LanguageModel {
     /// try model.fuse(with: adapter)
     /// ```
     public func fuse(with adapter: ModelAdapter) throws {
+        defer { prepareInferenceState(in: self) }
         try adapter.fuse(with: self)
     }
 
@@ -67,6 +80,7 @@ extension LanguageModel {
     /// ```
     public func unload(adapter: ModelAdapter) {
         adapter.unload(from: self)
+        prepareInferenceState(in: self)
     }
 
     /// Temporarily loads an adapter, performs a synchronous action, then unloads the adapter.
@@ -85,8 +99,10 @@ extension LanguageModel {
     ) throws -> R {
         defer {
             adapter.unload(from: self)
+            prepareInferenceState(in: self)
         }
         try adapter.load(into: self)
+        prepareInferenceState(in: self)
         let result = try perform()
         return result
     }
@@ -107,8 +123,10 @@ extension LanguageModel {
     ) async throws -> R {
         defer {
             adapter.unload(from: self)
+            prepareInferenceState(in: self)
         }
         try adapter.load(into: self)
+        prepareInferenceState(in: self)
         let result = try await perform()
         return result
     }

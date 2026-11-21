@@ -228,7 +228,7 @@ public actor Harness {
                 switch item {
                 case .chunk(let chunk): text += chunk
                 case .info(let completed): info = completed
-                case .toolCall: break
+                default: break
                 }
                 continuation.yield(item)
             }

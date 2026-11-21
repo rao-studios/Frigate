@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-@testable import MLXLLM
+@_spi(GemmaEncoder) @testable import MLXLLM
 import Testing
 
 /// MLX graph ops abort on Darwin: the vendored Cmlx compiles the Metal backend but ships

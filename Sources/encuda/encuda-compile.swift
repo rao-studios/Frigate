@@ -1,3 +1,4 @@
+// Frigate: the CudaBuild plugin is cross-compiled for the iOS family by xcodebuild, where Process is absent.
 #if !os(iOS) && !os(tvOS) && !os(watchOS) && !os(visionOS)
 import ArgumentParser
 import Foundation
@@ -31,40 +32,105 @@ extension Encuda {
         @Flag(name: .customShort("v"), help: "Enable verbose output")
         var verbose: Bool = false
 
+        @Flag(name: .customLong("incremental"), help: "Skip compilation if output is up to date")
+        var incremental: Bool = false
+
         mutating func run() throws {
+            #if os(macOS) || os(Linux)
+                if verbose {
+                    print("Running encuda compile")
+                }
 
-            if verbose {
-                print("Running encuda compile")
+                if incremental && isUpToDate() {
+                    if verbose {
+                        print("Output is up to date, skipping compilation")
+                    }
+                    return
+                }
+
+                let resolvedNvcc: String
+                if let path = nvccPath {
+                    resolvedNvcc = path
+                } else if let found = searchForCommand("nvcc") {
+                    resolvedNvcc = found.path
+                } else {
+                    fatalError("nvcc not found")
+                }
+
+                let includeArgs = includeDirs.flatMap { ["-I", $0] }
+                let ccbinArgs = clangppPath.map { ["-ccbin=\($0)"] } ?? []
+                let stdArgs = std.map { ["-std=\($0)"] } ?? []
+                let archArgs =
+                    ProcessInfo.processInfo.environment["CUDA_ARCH"].map { ["-arch", $0] } ?? []
+
+                let verboseArgs: [String] = verbose ? ["-v"] : []
+
+                // Built up in steps rather than as one `+` chain, which is expensive
+                // to type-check and gets more so with each argument added.
+                var arguments: [String] = ["-cuda", "-rdc=true", "--expt-relaxed-constexpr"]
+                arguments += stdArgs
+                arguments += ccbinArgs
+                arguments += archArgs
+                arguments += verboseArgs
+                arguments += includeArgs
+                arguments += inputFiles
+                arguments += ["-o", output]
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: resolvedNvcc)
+                process.arguments = arguments
+                try process.run()
+                let status = process.waitForExitStatus()
+                guard status == 0 else {
+                    throw EncudaError.nvccFailed(status)
+                }
+                writeStamp()
+            #endif
+        }
+
+        /// Inputs to the generated `.cpp` that are not themselves input *files*.
+        /// A modification-time comparison cannot see any of these change, so the
+        /// signature is stamped beside the output and compared on the next run.
+        private var configurationSignature: String {
+            [
+                "nvcc=\(nvccPath ?? "")",
+                "ccbin=\(clangppPath ?? "")",
+                "std=\(std ?? "")",
+                "arch=\(ProcessInfo.processInfo.environment["CUDA_ARCH"] ?? "")",
+                "include=\(includeDirs.joined(separator: ":"))",
+            ].joined(separator: "\n")
+        }
+
+        private var stampURL: URL {
+            URL(fileURLWithPath: output + ".encuda-stamp")
+        }
+
+        private func writeStamp() {
+            try? configurationSignature.write(to: stampURL, atomically: true, encoding: .utf8)
+        }
+
+        private func isUpToDate() -> Bool {
+            let fm = FileManager.default
+            let outputURL = URL(fileURLWithPath: output)
+            guard let stamp = try? String(contentsOf: stampURL, encoding: .utf8),
+                stamp == configurationSignature
+            else { return false }
+            guard fm.fileExists(atPath: output),
+                let outputMod =
+                    (try? outputURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+            else { return false }
+            for input in inputFiles {
+                guard fm.fileExists(atPath: input),
+                    let inputMod =
+                        (try? URL(fileURLWithPath: input).resourceValues(forKeys: [
+                            .contentModificationDateKey
+                        ]))?.contentModificationDate
+                else { return false }
+                if inputMod >= outputMod { return false }
             }
-
-            let resolvedNvcc: String
-            if let path = nvccPath {
-                resolvedNvcc = path
-            } else if let found = searchForCommand("nvcc") {
-                resolvedNvcc = found.path
-            } else {
-                fatalError("nvcc not found")
-            }
-
-            let includeArgs = includeDirs.flatMap { ["-I", $0] }
-            let ccbinArgs = clangppPath.map { ["-ccbin=\($0)"] } ?? []
-            let stdArgs = std.map { ["-std=\($0)"] } ?? []
-            let archArgs =
-                ProcessInfo.processInfo.environment["CUDA_ARCH"].map { ["-arch", $0] } ?? []
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: resolvedNvcc)
-            process.arguments =
-                ["-cuda", "-rdc=true", "--expt-relaxed-constexpr", "-allow-unsupported-compiler"]
-                + stdArgs + ccbinArgs + archArgs
-                + (verbose ? ["-v"] : []) + includeArgs + inputFiles + ["-o", output]
-            try process.run()
-            process.waitUntilExitWorkaround()
-            guard process.terminationStatus == 0 else {
-                throw EncudaError.nvccFailed(process.terminationStatus)
-            }
+            return true
         }
     }
 }
-
 #endif

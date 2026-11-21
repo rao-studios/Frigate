@@ -230,6 +230,7 @@ for await event in handle.stream {
     case .chunk(let text):    /* write `text` to your SSE or websocket */ break
     case .toolCall(let call): /* your tool-call path */ break
     case .info:               break
+    default:                  break
     }
 }
 let completion = await handle.completion.value

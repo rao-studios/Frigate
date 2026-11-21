@@ -11,9 +11,14 @@ import MLXNN
 
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay
+/// Fused form of the decay gate chain — elementwise, and MLX `compile`
+/// preserves per-node dtype rounding (verified bitwise against the unfused
+/// chain on the real decode/prefill shapes, bf16 and f16), so this is
+/// bit-identical while cutting ~6 kernel launches per GDN layer per step.
+private let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { aLog, a, dtBias in
+    exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
 }
 
 // MARK: - Metal Kernel
@@ -56,10 +61,20 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             for (int t = 0; t < T; ++t) {
               if (\(maskSource)) {
                 float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
-                  kv_mem += state[i] * k_[s_idx];
+                {
+                  // Preserve Kahan summation under Metal's default fast math.
+                  #pragma clang fp reassociate(off)
+                  #pragma clang fp contract(off)
+                  float kv_compensation = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[hv_idx];
+                    auto product = state[i] * k_[s_idx];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                  }
                 }
                 kv_mem = simd_sum(kv_mem);
 
@@ -215,6 +230,59 @@ private func gatedDeltaStepOps(
     return (y.asType(q.dtype), state)
 }
 
+/// Steps per recompute chunk in `gatedDeltaOps`.
+///
+/// The ops path is the one that can be trained through (the fused kernel
+/// has no gradient), and a recurrence run as plain ops keeps every step's
+/// state for the backward pass: at Qwen3.5-27B's shapes (48 heads of
+/// 128x128 fp32) that is about 4 MB a step, gigabytes per layer at a
+/// thousand tokens. Each chunk is run through a custom function whose
+/// backward recomputes the chunk instead, so only the chunk boundaries are
+/// kept - what `mx.checkpoint` does for the Python trainer. Inference is
+/// unaffected: the forward is the same ops in the same order.
+let gatedDeltaRecomputeChunk = 16
+
+private enum GatedDeltaRecompute {
+    /// `inputs` = [q, k, v, g, beta, state] plus the mask when there is one,
+    /// each sliced to the chunk; returns [y, state].
+    static func steps(_ inputs: [MLXArray], masked: Bool) -> [MLXArray] {
+        let (q, k, v, g, beta) = (inputs[0], inputs[1], inputs[2], inputs[3], inputs[4])
+        var state = inputs[5]
+        let mask = masked ? inputs[6] : nil
+        var ys = [MLXArray]()
+        ys.reserveCapacity(q.dim(1))
+        for t in 0 ..< q.dim(1) {
+            let (y, newState) = gatedDeltaStepOps(
+                q: q[0..., t],
+                k: k[0..., t],
+                v: v[0..., t],
+                g: g[0..., t],
+                beta: beta[0..., t],
+                state: state,
+                mask: mask.map { $0[0..., t] }
+            )
+            ys.append(y)
+            state = newState
+        }
+        return [MLX.stacked(ys, axis: 1), state]
+    }
+
+    // The closure holds a locked state object; two callers serialise on it.
+    nonisolated(unsafe) static let unmasked: ([MLXArray]) -> [MLXArray] = CustomFunction {
+        Forward { steps($0, masked: false) }
+        VJP { primals, cotangents in
+            vjp({ steps($0, masked: false) }, primals: primals, cotangents: cotangents).1
+        }
+    }
+
+    nonisolated(unsafe) static let masked: ([MLXArray]) -> [MLXArray] = CustomFunction {
+        Forward { steps($0, masked: true) }
+        VJP { primals, cotangents in
+            vjp({ steps($0, masked: true) }, primals: primals, cotangents: cotangents).1
+        }
+    }
+}
+
 func gatedDeltaOps(
     q: MLXArray,
     k: MLXArray,
@@ -243,31 +311,56 @@ func gatedDeltaOps(
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
-    ys.reserveCapacity(T)
+    ys.reserveCapacity((T + gatedDeltaRecomputeChunk - 1) / gatedDeltaRecomputeChunk)
 
-    for t in 0 ..< T {
-        let qT = q[0..., t]
-        let kT = k[0..., t]
-        let vT = v[0..., t]
-        let gT = g[0..., t]
-        let betaT = beta[0..., t]
-        let maskT = mask == nil ? nil : mask![0..., t]
-
-        let (y, newState) = gatedDeltaStepOps(
-            q: qT,
-            k: kT,
-            v: vT,
-            g: gT,
-            beta: betaT,
-            state: state,
-            mask: maskT
-        )
-        ys.append(y)
-        state = newState
+    for start in stride(from: 0, to: T, by: gatedDeltaRecomputeChunk) {
+        let steps = start ..< min(start + gatedDeltaRecomputeChunk, T)
+        var inputs = [
+            q[0..., steps], k[0..., steps], v[0..., steps], g[0..., steps], beta[0..., steps],
+            state,
+        ]
+        let run: ([MLXArray]) -> [MLXArray]
+        if let mask {
+            inputs.append(mask[0..., steps])
+            run = GatedDeltaRecompute.masked
+        } else {
+            run = GatedDeltaRecompute.unmasked
+        }
+        let out = run(inputs)
+        ys.append(out[0])
+        state = out[1]
     }
 
-    let y = MLX.stacked(ys, axis: 1)
+    let y = ys.count == 1 ? ys[0] : MLX.concatenated(ys, axis: 1)
     return (y, state)
+}
+
+// MARK: - MLXFast
+
+/// Whether mlx core runs a fused kernel for these inputs, as `use_fallback`
+/// in mlx core. Otherwise it runs a per-step fallback, which is slower than
+/// `gatedDeltaKernel`.
+private func hasFastGatedDelta(q: MLXArray, v: MLXArray, mask: MLXArray?) -> Bool {
+    guard mask == nil, q.dim(3) == 128, v.dim(3) == 128 else { return false }
+    switch (q.dim(2), v.dim(2)) {
+    case (16, 16), (16, 32), (16, 48), (16, 64), (24, 24), (32, 32): return true
+    default: return false
+    }
+}
+
+/// `MLXFast.gatedDeltaUpdate` with `g` and `beta` kept in float32.
+///
+/// mlx core casts `g` and `beta` to the dtype of `q` and `k`. In bf16 a decay
+/// just below 1 rounds to 1, so the state stops decaying (ml-explore/mlx#4725).
+/// Float32 `q` and `k` prevent the cast. Remove the casts when mlx-swift includes
+/// ml-explore/mlx#4760.
+private func fastGatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+) -> (MLXArray, MLXArray) {
+    let (y, state) = MLXFast.gatedDeltaUpdate(
+        queries: q.asType(.float32), keys: k.asType(.float32), values: v,
+        gamma: g, beta: beta, initialState: state)
+    return (y.asType(q.dtype), state)
 }
 
 // MARK: - Public API
@@ -281,7 +374,8 @@ public func gatedDeltaUpdate(
     aLog: MLXArray,
     dtBias: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    useKernel: Bool = true
 ) -> (MLXArray, MLXArray) {
     let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
@@ -298,7 +392,24 @@ public func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    // The fused kernel distributes Dk over exactly 32 simd lanes
+    // (`n_per_t = Dk / 32`, integer-truncating). A key head dim that is not a
+    // multiple of 32 would silently drop its trailing `Dk % 32` state
+    // dimensions and produce wrong output with no error. Stock Qwen3.5 uses
+    // Dk = 128 (a multiple of 32), but the value is config-driven, so route any
+    // non-multiple-of-32 Dk to the ops fallback, which handles an arbitrary key
+    // dimension correctly (slower, but never truncating).
+    //
+    // `useKernel: false` is for training: the kernel is a custom Metal
+    // kernel and has no gradient, so a model in training mode passes
+    // `!training` here, as the Python model does with `use_kernel`.
+    //
+    // The MLXFast kernel has a gradient and is faster than both, so the
+    // layouts it supports take it in training and in inference.
+    if hasFastGatedDelta(q: q, v: v, mask: mask) {
+        return fastGatedDelta(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
+    if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

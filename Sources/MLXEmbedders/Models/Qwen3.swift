@@ -262,14 +262,32 @@ private class Qwen3ModelInner: Module {
     /// - Parameters:
     ///   - inputs: An `MLXArray` of token IDs with shape `[Batch, Length]`.
     ///   - cache: An optional array of `KVCache` objects, one for each layer.
+    ///   - attentionMask: Optional `[Batch, Length]` key-padding mask
+    ///     (nonzero = attend, zero = padding). Folded into the causal mask so
+    ///     padded positions are excluded as attention keys — required for
+    ///     correct batched embedding with left padding, where pads *precede*
+    ///     the tokens that must not see them.
     /// - Returns: The final hidden states of shape `[Batch, Length, HiddenSize]`.
-    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]? = nil, attentionMask: MLXArray? = nil
+    ) -> MLXArray {
         // Step 1: Token Embedding lookup
         var h = embedTokens(inputs)
 
         // Step 2: Create the Attention Mask
         // Uses MLXFast utility to determine if a causal or additive mask is needed
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        var mask = createAttentionMask(h: h, cache: cache?.first)
+        if let attentionMask, inputs.dim(1) > 1,
+            case .array(let causal) = createAttentionMask(
+                h: h, cache: cache?.first, returnArray: true)
+        {
+            // Causal ∧ key-not-padding, broadcast to [Batch, 1, L, L]. The
+            // causal array spans the retained keys; cached keys are real
+            // tokens, so padding applies to the current inputs only.
+            var keep = MLXArray.ones([inputs.dim(0), causal.dim(-1)], dtype: .bool)
+            keep[0..., (causal.dim(-1) - inputs.dim(1))...] = attentionMask.asType(.bool)
+            mask = .array(causal & keep[0..., .newAxis, .newAxis, 0...])
+        }
 
         // Step 3: Sequential processing through Transformer Layers
         for (i, layer) in layers.enumerated() {
@@ -321,7 +339,11 @@ public class Qwen3Model: Module, EmbeddingModel {
     ///   - inputIds: Tensor of token indices.
     ///   - positionIds: Optional indices for positional information.
     ///   - tokenTypeIds: Optional indices for segment-based tasks.
-    ///   - attentionMask: Optional mask for specific attention patterns.
+    ///   - attentionMask: Optional `[Batch, Length]` key-padding mask
+    ///     (nonzero = attend). Honored, not decorative: without it a padded
+    ///     batch lets real tokens attend to padding keys whenever padding
+    ///     precedes them (left padding, the Hugging Face default for this
+    ///     model family).
     /// - Returns: An `EmbeddingModelOutput` containing the final hidden states.
     public func callAsFunction(
         _ inputIds: MLXArray,
@@ -330,7 +352,7 @@ public class Qwen3Model: Module, EmbeddingModel {
         attentionMask: MLXArray? = nil
     ) -> EmbeddingModelOutput {
         // Pass the input through the inner model backbone
-        let out = model(inputIds, cache: nil)
+        let out = model(inputIds, cache: nil, attentionMask: attentionMask)
 
         return EmbeddingModelOutput(
             hiddenStates: out,

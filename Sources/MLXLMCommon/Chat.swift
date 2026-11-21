@@ -1,5 +1,15 @@
 // Copyright © 2025 Apple Inc.
 
+import MLX
+
+private let messageContentLogger = MLXLogger(label: "MessageContent")
+
+package enum MessageContentLayout: Sendable {
+    case imagesThenVideosThenText
+    case imagesThenText
+    case textThenImages
+}
+
 public enum Chat {
     public struct Message {
         /// The role of the message sender.
@@ -7,6 +17,13 @@ public enum Chat {
 
         /// The content of the message.
         public var content: String
+
+        // Records an opening reasoning delimiter supplied by the generation prompt.
+        package var prefilledReasoningStartDelimiter: String? = nil
+
+        // Finished reasoning that was streamed apart from `content`, kept for
+        // templates that replay it.
+        package var reasoning: String? = nil
 
         /// Array of image data associated with the message.
         public var images: [UserInput.Image]
@@ -23,12 +40,12 @@ public enum Chat {
         public struct Tool: Sendable {
             fileprivate enum Storage: Sendable {
                 case calls([ToolCall])
-                case result(id: String)
+                case result(id: String?, name: String?)
             }
 
             fileprivate let storage: Storage
 
-            private init(storage: Storage) {
+            fileprivate init(storage: Storage) {
                 self.storage = storage
             }
 
@@ -37,9 +54,17 @@ public enum Chat {
                 Self(storage: .calls(calls))
             }
 
-            /// Id of the assistant tool call answered by a tool message.
-            public static func result(id: String) -> Self {
-                Self(storage: .result(id: id))
+            /// Identifies the assistant tool call answered by a tool message.
+            ///
+            /// Some chat templates correlate results by `tool_call_id`, while
+            /// others (including Onyx) render the function `name` directly.
+            public static func result(id: String, name: String? = nil) -> Self {
+                Self(storage: .result(id: id, name: name))
+            }
+
+            package var calls: [ToolCall]? {
+                guard case .calls(let calls) = storage else { return nil }
+                return calls
             }
         }
 
@@ -84,8 +109,16 @@ public enum Chat {
             Self(role: .user, content: content, images: images, videos: videos, audios: audios)
         }
 
-        public static func tool(_ content: String, id: String? = nil) -> Self {
-            Self(role: .tool, content: content, tool: id.map { .result(id: $0) })
+        public static func tool(
+            _ content: String, id: String? = nil, name: String? = nil
+        ) -> Self {
+            let metadata: Tool? =
+                if id != nil || name != nil {
+                    Tool(storage: .result(id: id, name: name))
+                } else {
+                    nil
+                }
+            return Self(role: .tool, content: content, tool: metadata)
         }
 
         public enum Role: String, Sendable {
@@ -128,9 +161,18 @@ extension MessageGenerator {
             "content": message.content,
         ]
 
+        addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
 
         return dictionary
+    }
+
+    /// Adds reasoning the session recorded apart from the content, as `reasoning_content`.
+    /// Qwen and Gemma 4 templates replay it; templates that do not read the key ignore it.
+    package func addReasoning(to dictionary: inout Message, for message: Chat.Message) {
+        if let reasoning = message.reasoning {
+            dictionary["reasoning_content"] = reasoning
+        }
     }
 
     /// Adds tool-call metadata from a structured message to a raw message dictionary.
@@ -150,11 +192,57 @@ extension MessageGenerator {
                 }
                 return entry
             }
-        case .result(let id):
-            dictionary["tool_call_id"] = id
+        case .result(let id, let name):
+            if let id { dictionary["tool_call_id"] = id }
+            if let name { dictionary["name"] = name }
         case nil:
             break
         }
+    }
+
+    /// Avoid truthy empty text parts on assistant tool calls.
+    /// Keep empty text parts elsewhere for templates that require nonempty lists.
+    package func contentParts(
+        for message: Chat.Message, layout: MessageContentLayout
+    ) -> [[String: String]] {
+        var parts: [[String: String]] = []
+
+        func appendText(_ text: String) {
+            if text.isEmpty, message.role == .assistant, let calls = message.tool?.calls,
+                !calls.isEmpty
+            {
+                return
+            }
+            parts.append(["type": "text", "text": text])
+        }
+
+        func appendImages() {
+            for image in message.images {
+                if let marker = image.labelMarkerCharacter {
+                    messageContentLogger.warning(
+                        "Leaving an image name out of the prompt: it holds `\(marker)`, which vision models build their image placeholders from"
+                    )
+                } else if let label = image.label {
+                    appendText(UserInput.Image.promptText(forLabel: label))
+                }
+                parts.append(["type": "image"])
+            }
+        }
+
+        switch layout {
+        case .imagesThenVideosThenText:
+            appendImages()
+            parts.append(contentsOf: message.videos.map { _ in ["type": "video"] })
+            appendText(message.content)
+        case .imagesThenText:
+            appendImages()
+            appendText(message.content)
+        case .textThenImages:
+            appendText(message.content)
+            appendImages()
+        }
+
+        return parts
     }
 
     public func generate(messages: [Chat.Message]) -> [Message] {
@@ -181,7 +269,8 @@ extension MessageGenerator {
 }
 
 /// Default implementation of ``MessageGenerator`` that produces `role` and
-/// `content`, plus `tool_call_id` and `tool_calls` when present.
+/// `content`, plus `name`, `tool_call_id`, `tool_calls`, and `reasoning_content`
+/// when present.
 ///
 /// ```swift
 /// [
@@ -209,5 +298,33 @@ public struct NoSystemMessageGenerator: MessageGenerator {
         messages
             .filter { $0.role != .system }
             .map { generate(message: $0) }
+    }
+}
+
+extension UserInput {
+
+    /// Returns the input unchanged if its prompt is not `.chat`. Call this method before a
+    /// message generator turns the prompt into `.messages`.
+    package func removingSpecialTokenLabels(using tokenizer: any Tokenizer) -> UserInput {
+        guard case .chat(let messages) = prompt else { return self }
+        var screened = self
+        screened.prompt = .chat(
+            messages.map { message in
+                var message = message
+                message.images = message.images.map { image in
+                    guard let label = image.label,
+                        let names = tokenizer.specialTokenNames(inImageLabel: label)
+                    else { return image }
+                    let named = names.isEmpty ? "a special token" : names.joined(separator: ", ")
+                    messageContentLogger.warning(
+                        "Leaving an image name out of the prompt, because this model's tokenizer reads it as \(named)"
+                    )
+                    var image = image
+                    image.label = nil
+                    return image
+                }
+                return message
+            })
+        return screened
     }
 }

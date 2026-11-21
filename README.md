@@ -343,19 +343,20 @@ public actor FrigateBoost {
 All fork sources are copied directly into `Sources/`. No git submodules, no external URLs for patched code.
 
 Record the **tag**, not a branch — the absence of that record is what made the
-2026-09 audit necessary. Last synced 2026-09-08.
+2026-09 audit necessary. Last synced 2026-11-20, by a three-way merge (the old upstream tags as base, the new tags
+as theirs, this tree as ours), so every local patch was kept, dropped as adopted upstream, or re-applied by hand.
 
 | Directory | From | Version | Local patches |
 |---|---|---|---|
-| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.31.1** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86); `io/safetensors.cpp` lays tensors out in key order, so the same tensors always save to the same bytes (`SafetensorsLayoutTests`; upstream follows the map's insertion order, which Swift seeds per process); `io/gguf.cpp` writes its metadata, tensor infos and tensor data in key order the same way. That file is not built here: `Package.swift` excludes it for `no_gguf.cpp`, gguflib is not vendored, and mlx-c has no GGUF binding. It was checked on 2026-10-19 against gguflib `8fa6eb6`, upstream's pin, in a scratch harness linked to Frigate's Cmlx objects |
-| `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | v0.6.0 | none |
+| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.32.4** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86); the CUDA SDPA graph cache is per thread (`static thread_local`, 2048 entries); the Metal sort's multi-block partitions are offset per row and use 64-bit row offsets, in `kernels/sort.h` and its generated copies `mlx-generated/{metal/sort.h,sort.cpp}` (`SortTests`; still wrong upstream in 0.32.4); `io/safetensors.cpp` lays tensors out in key order, so the same tensors always save to the same bytes (`SafetensorsLayoutTests`; upstream follows the map's insertion order, which Swift seeds per process); `io/gguf.cpp` writes its metadata, tensor infos and tensor data in key order the same way. That file is not built here: `Package.swift` excludes it for `no_gguf.cpp`, gguflib is not vendored, and mlx-c has no GGUF binding. It was checked on 2026-10-19 against gguflib `8fa6eb6`, upstream's pin, in a scratch harness linked to Frigate's Cmlx objects |
+| `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | **v0.8.0** | none |
 | `Sources/Cmlx/{json,fmt,metal-cpp}/` | pinned by mlx-swift | json 3.11.3, fmt 12.1.0 | none — these are mlx's own pins, **not** drift |
-| `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.31.6** | none |
-| `Sources/Jinja/` | `huggingface/swift-jinja` | **2.5.0** | none |
-| `Sources/Hub/` … `Sources/Models/` | `huggingface/swift-transformers` | **1.3.4** | upstream adopted the fork's Linux patches; only `LocalizedStringLinuxShim.swift` added |
-| `Sources/HuggingFace/` | `huggingface/swift-huggingface` | **0.10.1** | none (Xet trait off) |
-| `Sources/EventSource/` | `mattt/EventSource` | **1.5.1** | `EventSource+AsyncHTTPClient.swift` dropped (AsyncHTTPClient trait off — keeps SwiftNIO out) |
-| `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `ml-explore/mlx-swift-lm` | **3.31.4** | `LinuxCompat.swift` added; Linux `canImport` guards on `UserInput` (incl. `AudioProcessing.audioFormat`), `UserInput+Audio`, `ChatSession`, `ParoQuant/ParoQuantLoader`; `MLXEmbedders/Models/Bert.swift` sanitize chain made table-driven |
+| `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.33.0** | none (the compile lock fix is upstream since 0.32: `evalLock` outermost, `CompiledLockTests`) |
+| `Sources/Jinja/` | `huggingface/swift-jinja` | **3.2.1** | none |
+| `Sources/Hub/` … `Sources/Models/` | `huggingface/swift-transformers` | **1.4.0** | `LocalizedStringLinuxShim.swift` added; `Hub.swift` finds the fallback tokenizer configs beside the executable or in the app's resources, never through `Bundle.module` (which traps in an app's helper); `HubApi.swift` weighs each file's share of the download bar by its size (BPE `ignore_merges` is upstream now) |
+| `Sources/HuggingFace/` | `huggingface/swift-huggingface` | **1.0.1** | none (Xet trait off) |
+| `Sources/EventSource/` | `mattt/EventSource` | **1.6.0** | `EventSource+AsyncHTTPClient.swift` dropped (AsyncHTTPClient trait off — keeps SwiftNIO out) |
+| `Sources/MLXLMCommon/` … `Sources/MLXEmbedders/` | `ml-explore/mlx-swift-lm` | **3.33.0** | `LinuxCompat.swift` and the `LocalizedStringLinuxShim.swift` copies added; `Tool/Value.swift` tells a JSON boolean from a number on Linux by its `objCType` (`ToolCallNumberTests`); `MLXLLM` adds `Mamba3.swift`, `Mamba3Loader.swift`, `SSD3.swift` and the `mamba3` model type, and `SSM.swift` the scan they share; `NemotronH`'s memberwise init takes `moeLatentSize`; `MLXVLM/Models/Mistral3.swift` shows an image at the edge its processor config names, not 336 px; `MLXEmbedders/Models/Bert.swift` sanitize chain made table-driven (upstream's 19 rules, in order). Upstream adopted the `UserInput`, `ChatSession` and `ParoQuant` Linux guards |
 | `Sources/mlx_embeddings/` | `mzbac/mlx.embeddings` | v0.1.3 | `Bert.swift`; `Qwen3.swift` adds `Qwen3BidirectionalModel` (voyage-4-nano: padding-only mask, `linear` head, mean pooling), chosen in the `qwen3` creator by `use_bidirectional_attention` |
 | `Sources/FrigateBridge/` | This package — concrete `Downloader` / `TokenizerLoader` for mlx-swift-lm 3.x |  |  |
 | `Sources/MLXAccelerate/` | This package — Linux-compatible Accelerate ops via MLX (`gaussianBlur`, `sobelGradients`, `filter2D`, `perspectiveWarp`, `spectralDistance`) |  |  |
@@ -363,15 +364,17 @@ Record the **tag**, not a branch — the absence of that record is what made the
 | `Sources/FrigateVisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/FrigateVisionAX/README.md` |  |  |
 | `Sources/SinatraHarness/`, `Sources/sinatra-harness/` | This package — the on-device harness and its CLI (moved in from the SinatraHarness repository, 2026-10); **GPL-3.0-only**, see `Sources/SinatraHarness/LICENSE` and `NOTICE` |  |  |
 
-**mlx C++ is deliberately held at 0.31.1.** v0.32.2 exists, but every mlx-swift release through
-0.31.6 defines `MLX_VERSION` as `"0.31.1"` (see `Package.swift`), so bumping the C++ core would
-outrun the `mlx-c` / Swift bindings. Revisit when mlx-swift 0.32.x ships.
+**mlx C++ moves with mlx-swift.** Each mlx-swift release names the mlx C++ tag it binds through
+`MLX_VERSION` (see `Package.swift`) and the mlx-c tag it vendors; mlx-swift 0.33.0 names mlx 0.32.4
+and mlx-c 0.8.0, so all three moved together on 2026-11-20. Don't bump the C++ core ahead of the
+bindings. The 0.32 core reads FP8 (`float8_e4m3`, loaded as `uint8`) and the NVFP4 / MXFP8 quantized
+modes with a per-expert global scale in `gather_qmm`, which Inkling-2-Mini's checkpoint needs.
 
 **mlx-swift-lm 3.x takes the downloader and tokenizer as parameters.** Upstream supplies that
 wiring through its `MLXHuggingFace` macro target, which needs swift-syntax; this package wires
 it by hand in `Sources/FrigateBridge/` instead, so no compiler plugin enters the Linux build.
 
-**yyjson is an external dependency, not vendored — deliberately.** swift-transformers 1.3.x needs
+**yyjson is an external dependency, not vendored — deliberately.** swift-transformers 1.x needs
 it, and WhisperKit brings its own swift-transformers into the same link in at least one consumer
 (Bonnie). Two copies of `yyjson.c` define the same C symbols and nothing in SwiftPM separates
 them: module aliasing explicitly does not cover non-Swift symbols, renaming the target does not
@@ -382,7 +385,7 @@ this is stock upstream C at the pin swift-transformers itself uses.
 
 **`String(localized:)` does not exist on Linux.** swift-corelibs-foundation ships no `localized:`
 overload (checked on Swift 6.3 / Ubuntu 24.04, with and without `FoundationEssentials`), and
-swift-transformers 1.3.x and mlx-swift-lm 3.x both use it for error text. Each affected vendored
+swift-transformers 1.x and mlx-swift-lm 3.x both use it for error text. Each affected vendored
 module carries an internal `LocalizedStringLinuxShim.swift` that returns the already-interpolated
 literal: `Hub`, `Tokenizers`, `Models`, `MLXLMCommon`, `MLXLLM`, `MLXVLM`.
 

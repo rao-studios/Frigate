@@ -37,7 +37,11 @@ void concatenate_gpu(
     size_t data_offset = strides[axis] * sizes[i];
     out_slice.copy_shared_buffer(
         out, strides, flags, out_slice.size(), data_offset);
-    copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
+    auto ctype = CopyType::GeneralGeneral;
+    if (axis == 0 && inputs[i].flags().row_contiguous) {
+      ctype = CopyType::Vector;
+    }
+    copy_gpu_inplace(inputs[i], out_slice, ctype, s);
   }
 }
 
@@ -46,6 +50,14 @@ array compute_dynamic_offset(
     const Strides& strides,
     const std::vector<int>& axes,
     const Stream& s) {
+  auto& encoder = cu::get_command_encoder(s);
+  // The kernel reads the indices contiguously
+  if (!indices.flags().row_contiguous) {
+    auto copy = contiguous_copy_gpu(indices, s);
+    encoder.add_temporary(copy);
+    return compute_dynamic_offset(copy, strides, axes, s);
+  }
+
   Dtype dtype = indices.dtype();
   int nidx = axes.size();
 
@@ -56,7 +68,7 @@ array compute_dynamic_offset(
       dtype_to_cuda_type(dtype),
       nidx);
 
-  cu::JitModule& mod = cu::get_jit_module(s.device, module_name, [&]() {
+  cu::JitModule& mod = cu::get_jit_module(encoder.device(), module_name, [&]() {
     std::string source = R"(
         #include "mlx/backend/cuda/device/utils.cuh"
 
@@ -81,7 +93,6 @@ array compute_dynamic_offset(
     return std::make_tuple(false, std::move(source), std::vector{kernel_name});
   });
 
-  auto& encoder = cu::get_command_encoder(s);
   // Prepare output.
   array offset({1}, int64, nullptr, {});
   bool donate = indices.is_donatable() &&

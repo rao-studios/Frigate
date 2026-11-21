@@ -67,9 +67,8 @@ public enum JSONValue: Hashable, Codable, Sendable {
         switch value {
         case is NSNull:
             return .null
-        case let number as NSNumber where !isBoolean(number):
-            if let int = value as? Int { return .int(int) }
-            return .double(number.doubleValue)
+        case let number as NSNumber:
+            return from(number)
         case let bool as Bool:
             return .bool(bool)
         case let int as Int:
@@ -91,14 +90,28 @@ public enum JSONValue: Hashable, Codable, Sendable {
         }
     }
 
-    /// Whether `number` is a boolean: CoreFoundation's `true` or `false`, which is what `JSONSerialization` makes of
-    /// JSON's and Swift bridges a `Bool` to, and never a number that happens to be 0 or 1.
-    private static func isBoolean(_ number: NSNumber) -> Bool {
+    /// Classifies a boxed number.
+    ///
+    /// `JSONSerialization` boxes booleans and numbers alike as `NSNumber`, and
+    /// an `NSNumber` holding 0 or 1 bridges to `Bool` successfully. Testing
+    /// `as? Bool` first therefore rewrites every 0 and 1 in a decoded payload —
+    /// `{"limit": 1}` becomes `{"limit": true}` — so the boolean case is keyed
+    /// on the boxed type instead of on a cast that a number also satisfies.
+    ///
+    /// Frigate: CoreFoundation's type ids are Darwin's; swift-corelibs-foundation boxes a `Bool` as `objCType` "c".
+    private static func from(_ number: NSNumber) -> JSONValue {
         #if canImport(Darwin)
-        return CFGetTypeID(number) == CFBooleanGetTypeID()
+        let isBoolean = CFGetTypeID(number) == CFBooleanGetTypeID()
         #else
-        return String(cString: number.objCType) == "c"
+        let isBoolean = String(cString: number.objCType) == "c"
         #endif
+        if isBoolean {
+            return .bool(number.boolValue)
+        }
+        if let int = number as? Int {
+            return .int(int)
+        }
+        return .double(number.doubleValue)
     }
 
     public var anyValue: Any {
@@ -136,6 +149,21 @@ public enum JSONValue: Hashable, Codable, Sendable {
             return value.map { $0.sendableValue }
         case .object(let value):
             return value.mapValues { $0.sendableValue }
+        }
+    }
+
+    /// Like `sendableValue`, but `.null` becomes `Optional.none`: swift-jinja reads that as
+    /// null and throws on `NSNull`.
+    var templateValue: any Sendable {
+        switch self {
+        case .null:
+            return (any Sendable)?.none
+        case .array(let value):
+            return value.map { $0.templateValue }
+        case .object(let value):
+            return value.mapValues { $0.templateValue }
+        default:
+            return sendableValue
         }
     }
 

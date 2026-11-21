@@ -75,6 +75,21 @@ public struct ResolvedModelConfiguration: Sendable {
     public var stopStrings: Set<String>
     public var eosTokenIds: Set<Int>
     public var toolCallFormat: ToolCallFormat?
+    public var reasoningConfig: ReasoningConfig?
+    public var messageGenerator: (any MessageGenerator)?
+    public var generationConfig: GenerationConfigFile?
+
+    /// How to choose the safetensors files holding the model's weights.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/weightFileSelection``
+    public var weightFileSelection: WeightFileSelection
+
+    /// Components to load the model without.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/excludedComponents``
+    public var excludedComponents: Set<ModelComponent>
 
     public init(
         modelDirectory: URL,
@@ -84,7 +99,12 @@ public struct ResolvedModelConfiguration: Sendable {
         extraEOSTokens: Set<String>,
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int>,
-        toolCallFormat: ToolCallFormat?
+        toolCallFormat: ToolCallFormat?,
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil,
+        generationConfig: GenerationConfigFile? = nil,
+        weightFileSelection: WeightFileSelection = .automatic,
+        excludedComponents: Set<ModelComponent> = []
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -94,6 +114,11 @@ public struct ResolvedModelConfiguration: Sendable {
         self.stopStrings = stopStrings ?? extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
+        self.generationConfig = generationConfig
+        self.weightFileSelection = weightFileSelection
+        self.excludedComponents = excludedComponents
     }
 }
 
@@ -109,6 +134,9 @@ extension ResolvedModelConfiguration {
             extraEOSTokens: [],
             stopStrings: [],
             eosTokenIds: [],
-            toolCallFormat: nil)
+            toolCallFormat: nil,
+            reasoningConfig: nil,
+            messageGenerator: nil,
+            generationConfig: nil)
     }
 }

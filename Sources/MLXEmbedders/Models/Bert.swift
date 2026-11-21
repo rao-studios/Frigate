@@ -18,6 +18,8 @@ private class BertEmbedding: Module {
 
     /// The number of distinct token types the model can distinguish.
     let typeVocabularySize: Int
+    let padTokenID: Int
+    let usesPaddingAwarePositionIDs: Bool
 
     /// The embedding lookup table for the vocabulary.
     @ModuleInfo(key: "word_embeddings") var wordEmbeddings: Embedding
@@ -35,6 +37,8 @@ private class BertEmbedding: Module {
     /// - Parameter config: The `BertConfiguration` containing dimensions, vocabulary sizes, and epsilon values.
     init(_ config: BertConfiguration) {
         typeVocabularySize = config.typeVocabularySize
+        padTokenID = config.padTokenID
+        usesPaddingAwarePositionIDs = config.usesPaddingAwarePositionIDs
 
         // Initialize word embeddings based on vocab size and embedding dimension
         _wordEmbeddings.wrappedValue = Embedding(
@@ -69,13 +73,11 @@ private class BertEmbedding: Module {
         positionIds: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil
     ) -> MLXArray {
-        // Generate position IDs [0, 1, ..., N] and broadcast to the input shape if not provided
-        let posIds = positionIds ?? broadcast(MLXArray.arange(inputIds.dim(1)), to: inputIds.shape)
+        let posIds = positionIds ?? defaultPositionIDs(for: inputIds)
 
         // Combine word and position embeddings
         var words = wordEmbeddings(inputIds) + positionEmbeddings(posIds)
 
-        // Add token type (segment) embeddings if both IDs and the layer exist
         if let tokenTypeIds, let tokenTypeEmbeddings {
             words += tokenTypeEmbeddings(tokenTypeIds)
         }
@@ -83,6 +85,25 @@ private class BertEmbedding: Module {
         // Final normalization pass
         return norm(words)
     }
+
+    private func defaultPositionIDs(for inputIDs: MLXArray) -> MLXArray {
+        bertPositionIDs(
+            inputIDs: inputIDs,
+            padTokenID: padTokenID,
+            paddingAware: usesPaddingAwarePositionIDs)
+    }
+}
+
+package func bertPositionIDs(
+    inputIDs: MLXArray,
+    padTokenID: Int,
+    paddingAware: Bool
+) -> MLXArray {
+    guard paddingAware else {
+        return broadcast(MLXArray.arange(inputIDs.dim(1)), to: inputIDs.shape)
+    }
+    let nonPadding = (inputIDs .!= padTokenID).asType(.int32)
+    return MLX.cumsum(nonPadding, axis: 1) * nonPadding + padTokenID
 }
 
 /// A single Transformer Encoder layer implementing BERT-style architecture.
@@ -235,6 +256,21 @@ private class LMHead: Module {
     }
 }
 
+/// Sequence-classification head used by BERT/RoBERTa reranker checkpoints.
+private class SequenceClassificationHead: Module {
+    @ModuleInfo(key: "dense") var dense: Linear
+    @ModuleInfo(key: "out_proj") var outProjection: Linear
+
+    init(_ config: BertConfiguration) {
+        _dense.wrappedValue = Linear(config.embedDim, config.embedDim, bias: true)
+        _outProjection.wrappedValue = Linear(config.embedDim, config.numLabels, bias: true)
+    }
+
+    func callAsFunction(_ hiddenStates: MLXArray) -> MLXArray {
+        outProjection(tanh(dense(hiddenStates[0..., 0])))
+    }
+}
+
 // MARK: - BERT Model
 
 /// The complete BERT model implementation.
@@ -302,35 +338,14 @@ public class BertModel: Module, EmbeddingModel {
         tokenTypeIds: MLXArray? = nil,
         attentionMask: MLXArray? = nil
     ) -> EmbeddingModelOutput {
-        var inp = inputs
-        if inp.ndim == 1 {
-            inp = inp.reshaped(1, -1)
-        }
-        var mask = attentionMask
-        var typeIds = tokenTypeIds
-        var posIds = positionIds
-        if _maxPositionEmbeddings > 0, inp.dim(1) > _maxPositionEmbeddings {
-            print(
-                "Warning: Input length \(inp.dim(1)) exceeds maxPositionEmbeddings"
-                    + " (\(_maxPositionEmbeddings)), truncating."
-            )
-            inp = inp[0..., ..<_maxPositionEmbeddings]
-            mask = mask?[0..., ..<_maxPositionEmbeddings]
-            typeIds = typeIds?[0..., ..<_maxPositionEmbeddings]
-            posIds = posIds?[0..., ..<_maxPositionEmbeddings]
-        }
-        let embeddings = embedder(inp, positionIds: posIds, tokenTypeIds: typeIds)
-        if mask != nil {
-            // Cast mask to the same dtype as the embeddings output so it is
-            // compatible with scaled_dot_product_attention's type promotion
-            // rules. Using the embedding weight dtype can produce a mismatch
-            // when Linear layers are quantized to float16 but Embedding
-            // weights remain float32.
-            mask = mask!.asType(embeddings.dtype).expandedDimensions(axes: [
-                1, 2,
-            ]).log()
-        }
-        let outputs = encoder(embeddings, attentionMask: mask)
+        let outputs = encodedBertHiddenStates(
+            inputs,
+            maxPositionEmbeddings: _maxPositionEmbeddings,
+            embedder: embedder,
+            encoder: encoder,
+            positionIds: positionIds,
+            tokenTypeIds: tokenTypeIds,
+            attentionMask: attentionMask)
         if let lmHead {
             return EmbeddingModelOutput(hiddenStates: lmHead(outputs), pooledOutput: nil)
         } else {
@@ -343,40 +358,233 @@ public class BertModel: Module, EmbeddingModel {
     ///
     /// This is essential for loading pre-trained weights, as it renames keys
     /// like `attention.output.dense` to `attention.out_proj`.
-    private static let weightKeyRewrites: [(String, String)] = [
-        (".layer.", ".layers."),
-        (".self.key.", ".key_proj."),
-        (".self.query.", ".query_proj."),
-        (".self.value.", ".value_proj."),
-        (".attention.output.dense.", ".attention.out_proj."),
-        (".attention.output.LayerNorm.", ".ln1."),
-        (".output.LayerNorm.", ".ln2."),
-        (".intermediate.dense.", ".linear1."),
-        (".output.dense.", ".linear2."),
-        (".LayerNorm.", ".norm."),
-        ("pooler.dense.", "pooler."),
-        ("cls.predictions.transform.dense.", "lm_head.dense."),
-        ("cls.predictions.transform.LayerNorm.", "lm_head.ln."),
-        ("cls.predictions.decoder", "lm_head.decoder"),
-        ("cls.predictions.transform.norm.weight", "lm_head.ln.weight"),
-        ("cls.predictions.transform.norm.bias", "lm_head.ln.bias"),
-        ("cls.predictions.bias", "lm_head.decoder.bias"),
-        ("bert.", ""),
-    ]
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        sanitizeBertWeights(weights)
+    }
+}
+
+/// BERT/RoBERTa-style sequence-classification model used by encoder reranker checkpoints.
+public class BertRerankerModel: Module, RerankerModel {
+
+    @ModuleInfo(key: "embeddings") fileprivate var embedder: BertEmbedding
+    fileprivate let encoder: Encoder
+
+    /// Sequence-classification head that produces reranker logits.
+    @ModuleInfo(key: "classifier") fileprivate var classifier: SequenceClassificationHead
+
+    /// The total count of tokens in the model's vocabulary.
+    public var vocabularySize: Int
+
+    public var maxPositionEmbeddings: Int? {
+        _maxPositionEmbeddings > 0 ? _maxPositionEmbeddings : nil
+    }
+    private let _maxPositionEmbeddings: Int
+    package let rerankerConfiguration: EncoderRerankerModelConfiguration
+
+    public init(_ config: BertConfiguration) {
+        precondition(config.vocabularySize > 0)
+        vocabularySize = config.vocabularySize
+        rerankerConfiguration = config.encoderRerankerConfiguration
+        _maxPositionEmbeddings = config.maxPositionEmbeddings
+        _embedder.wrappedValue = BertEmbedding(config)
+        encoder = Encoder(config)
+        _classifier.wrappedValue = SequenceClassificationHead(config)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        positionIds: MLXArray? = nil,
+        tokenTypeIds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil
+    ) -> EmbeddingModelOutput {
+        let outputs = encodedBertHiddenStates(
+            inputs,
+            maxPositionEmbeddings: _maxPositionEmbeddings,
+            embedder: embedder,
+            encoder: encoder,
+            positionIds: positionIds,
+            tokenTypeIds: tokenTypeIds,
+            attentionMask: attentionMask)
+        return EmbeddingModelOutput(hiddenStates: outputs, pooledOutput: nil)
+    }
+
+    public func score(
+        _ inputs: MLXArray,
+        positionIds: MLXArray? = nil,
+        tokenTypeIds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil
+    ) -> MLXArray {
+        let outputs = encodedBertHiddenStates(
+            inputs,
+            maxPositionEmbeddings: _maxPositionEmbeddings,
+            embedder: embedder,
+            encoder: encoder,
+            positionIds: positionIds,
+            tokenTypeIds: tokenTypeIds,
+            attentionMask: attentionMask)
+        return classifier(outputs)
+    }
+
+    /// Maps external weight names (e.g., from Hugging Face) to this class's internal structure.
+    ///
+    /// This is essential for loading pre-trained weights, as it renames keys
+    /// like `attention.output.dense` to `attention.out_proj`.
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        sanitizeBertWeights(weights)
+    }
+}
+
+/// BERT sequence-classification model used by reranker checkpoints with pooled-output heads.
+public class BertSequenceClassificationRerankerModel: Module, RerankerModel {
+
+    @ModuleInfo(key: "embeddings") fileprivate var embedder: BertEmbedding
+    fileprivate let encoder: Encoder
+
+    /// A linear layer used to pool the [CLS] token before classification.
+    @ModuleInfo fileprivate var pooler: Linear
+
+    /// BERT classifier head that produces reranker logits from pooled output.
+    @ModuleInfo fileprivate var classifier: Linear
+
+    /// The total count of tokens in the model's vocabulary.
+    public var vocabularySize: Int
+
+    public var maxPositionEmbeddings: Int? {
+        _maxPositionEmbeddings > 0 ? _maxPositionEmbeddings : nil
+    }
+    private let _maxPositionEmbeddings: Int
+    package let rerankerConfiguration: EncoderRerankerModelConfiguration
+
+    public init(_ config: BertConfiguration) {
+        precondition(config.vocabularySize > 0)
+        vocabularySize = config.vocabularySize
+        rerankerConfiguration = config.encoderRerankerConfiguration
+        _maxPositionEmbeddings = config.maxPositionEmbeddings
+        _embedder.wrappedValue = BertEmbedding(config)
+        encoder = Encoder(config)
+        _pooler.wrappedValue = Linear(config.embedDim, config.embedDim)
+        _classifier.wrappedValue = Linear(config.embedDim, config.numLabels, bias: true)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        positionIds: MLXArray? = nil,
+        tokenTypeIds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil
+    ) -> EmbeddingModelOutput {
+        let outputs = encodedBertHiddenStates(
+            inputs,
+            maxPositionEmbeddings: _maxPositionEmbeddings,
+            embedder: embedder,
+            encoder: encoder,
+            positionIds: positionIds,
+            tokenTypeIds: tokenTypeIds,
+            attentionMask: attentionMask)
+        return EmbeddingModelOutput(hiddenStates: outputs, pooledOutput: pooledOutput(outputs))
+    }
+
+    public func score(
+        _ inputs: MLXArray,
+        positionIds: MLXArray? = nil,
+        tokenTypeIds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil
+    ) -> MLXArray {
+        let outputs = encodedBertHiddenStates(
+            inputs,
+            maxPositionEmbeddings: _maxPositionEmbeddings,
+            embedder: embedder,
+            encoder: encoder,
+            positionIds: positionIds,
+            tokenTypeIds: tokenTypeIds,
+            attentionMask: attentionMask)
+        return classifier(pooledOutput(outputs))
+    }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        // Table-driven rather than one 18-link `.replacingOccurrences` chain: on Linux the
-        // type checker gives up on that expression ("unable to type-check in reasonable
-        // time"). Order is significant and preserved exactly — the specific LayerNorm and
-        // cls.predictions rules must run before the general ones below them.
-        weights.reduce(into: [:]) { result, item in
-            var key = item.key
-            for (find, replace) in Self.weightKeyRewrites {
-                key = key.replacingOccurrences(of: find, with: replace)
-            }
+        sanitizeBertWeights(weights)
+    }
 
-            result[key] = item.value
-        }.filter { key, _ in key != "embeddings.position_ids" }
+    private func pooledOutput(_ hiddenStates: MLXArray) -> MLXArray {
+        tanh(pooler(hiddenStates[0..., 0]))
+    }
+}
+
+private func encodedBertHiddenStates(
+    _ inputs: MLXArray,
+    maxPositionEmbeddings: Int,
+    embedder: BertEmbedding,
+    encoder: Encoder,
+    positionIds: MLXArray? = nil,
+    tokenTypeIds: MLXArray? = nil,
+    attentionMask: MLXArray? = nil
+) -> MLXArray {
+    var inp = inputs
+    if inp.ndim == 1 {
+        inp = inp.reshaped(1, -1)
+    }
+    var mask = attentionMask
+    var typeIds = tokenTypeIds
+    var posIds = positionIds
+    if maxPositionEmbeddings > 0, inp.dim(1) > maxPositionEmbeddings {
+        print(
+            "Warning: Input length \(inp.dim(1)) exceeds maxPositionEmbeddings"
+                + " (\(maxPositionEmbeddings)), truncating."
+        )
+        inp = inp[0..., ..<maxPositionEmbeddings]
+        mask = mask?[0..., ..<maxPositionEmbeddings]
+        typeIds = typeIds?[0..., ..<maxPositionEmbeddings]
+        posIds = posIds?[0..., ..<maxPositionEmbeddings]
+    }
+    let embeddings = embedder(inp, positionIds: posIds, tokenTypeIds: typeIds)
+    if mask != nil {
+        // Cast mask to the same dtype as the embeddings output so it is
+        // compatible with scaled_dot_product_attention's type promotion
+        // rules. Using the embedding weight dtype can produce a mismatch
+        // when Linear layers are quantized to float16 but Embedding
+        // weights remain float32.
+        mask = mask!.asType(embeddings.dtype).expandedDimensions(axes: [
+            1, 2,
+        ]).log()
+    }
+    return encoder(embeddings, attentionMask: mask)
+}
+
+/// Hugging Face's BERT and RoBERTa weight names, rewritten to this model's: applied in this order, each to the result of the
+/// one before (the specific LayerNorm rules run before the general one, and the `cls.predictions` rules after it).
+///
+/// Frigate: a table rather than one 20-link `.replacingOccurrences` chain, which the type checker gives up on under Linux
+/// ("unable to type-check this expression in reasonable time"). The rules and their order are upstream's.
+private let bertWeightKeyRewrites: [(String, String)] = [
+    (".layer.", ".layers."),
+    (".self.key.", ".key_proj."),
+    (".self.query.", ".query_proj."),
+    (".self.value.", ".value_proj."),
+    (".attention.output.dense.", ".attention.out_proj."),
+    (".attention.output.LayerNorm.", ".ln1."),
+    (".output.LayerNorm.", ".ln2."),
+    (".intermediate.dense.", ".linear1."),
+    (".output.dense.", ".linear2."),
+    (".LayerNorm.", ".norm."),
+    ("pooler.dense.", "pooler."),
+    ("cls.predictions.transform.dense.", "lm_head.dense."),
+    ("cls.predictions.transform.LayerNorm.", "lm_head.ln."),
+    ("cls.predictions.decoder", "lm_head.decoder"),
+    ("cls.predictions.transform.norm.weight", "lm_head.ln.weight"),
+    ("cls.predictions.transform.norm.bias", "lm_head.ln.bias"),
+    ("cls.predictions.bias", "lm_head.decoder.bias"),
+    ("bert.", ""),
+    ("roberta.", ""),
+]
+
+private func sanitizeBertWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+    weights.reduce(into: [:]) { result, item in
+        var key = item.key
+        for (find, replace) in bertWeightKeyRewrites {
+            key = key.replacingOccurrences(of: find, with: replace)
+        }
+        result[key] = item.value
+    }.filter { key, _ in
+        key != "embeddings.position_ids"
     }
 }
 
@@ -465,6 +673,71 @@ public struct BertConfiguration: Decodable, Sendable {
     /// The identifier for the model (e.g., "bert" or "distilbert").
     var modelType: String
 
+    /// Declared Hugging Face architecture names.
+    var architectures: [String] = []
+
+    /// Number of labels for sequence-classification heads.
+    var numLabels: Int = 1
+
+    /// Class labels declared by Hugging Face configuration metadata.
+    var idToLabel: [Int: String] = [:]
+
+    /// Token ID used for padding.
+    var padTokenID: Int = 0
+
+    var usesPaddingAwarePositionIDs: Bool {
+        modelType == "roberta" || modelType == "xlm-roberta"
+    }
+
+    var encoderRerankerConfiguration: EncoderRerankerModelConfiguration {
+        let inputKind: EncoderRerankerModelConfiguration.InputKind =
+            usesPaddingAwarePositionIDs ? .xlmRoberta : .bert
+        let maximumInputTokens: Int? =
+            if maxPositionEmbeddings > 0 {
+                usesPaddingAwarePositionIDs
+                    ? maxPositionEmbeddings - padTokenID - 1
+                    : maxPositionEmbeddings
+            } else {
+                nil
+            }
+        if numLabels == 1 {
+            return .init(
+                inputKind: inputKind,
+                padTokenID: padTokenID,
+                maxInputTokens: maximumInputTokens,
+                scorePolicy: .singleLogit(transform: .sigmoid),
+                scoreKind: .normalizedRelevance)
+        }
+        guard let positiveClassIndex else {
+            return .init(
+                inputKind: inputKind,
+                padTokenID: padTokenID,
+                maxInputTokens: maximumInputTokens,
+                scorePolicy: nil,
+                scoreKind: .normalizedRelevance)
+        }
+        return .init(
+            inputKind: inputKind,
+            padTokenID: padTokenID,
+            maxInputTokens: maximumInputTokens,
+            scorePolicy: .softmaxProbability(classIndex: positiveClassIndex),
+            scoreKind: .normalizedRelevance)
+    }
+
+    private var positiveClassIndex: Int? {
+        let positiveLabels: Set<String> = [
+            "entailment", "label1", "positive", "relevant", "relevance", "true", "yes",
+        ]
+        return idToLabel.first { _, label in
+            let normalized = label.lowercased().filter { $0.isLetter || $0.isNumber }
+            return positiveLabels.contains(normalized)
+        }?.key
+    }
+
+    var isSequenceClassification: Bool {
+        architectures.contains { $0.contains("ForSequenceClassification") }
+    }
+
     // MARK: - Decoding Keys
 
     enum CodingKeys: String, CodingKey {
@@ -473,6 +746,11 @@ public struct BertConfiguration: Decodable, Sendable {
         case vocabularySize = "vocab_size"
         case maxPositionEmbeddings = "max_position_embeddings"
         case modelType = "model_type"
+        case architectures
+        case numLabels = "num_labels"
+        case padTokenID = "pad_token_id"
+        case idToLabel = "id2label"
+        case labelToID = "label2id"
     }
 
     /// Standard BERT naming conventions in JSON.
@@ -504,6 +782,29 @@ public struct BertConfiguration: Decodable, Sendable {
         maxPositionEmbeddings =
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 0
         modelType = try container.decode(String.self, forKey: .modelType)
+        architectures = try container.decodeIfPresent([String].self, forKey: .architectures) ?? []
+        let stringIDToLabel =
+            try container.decodeIfPresent([String: String].self, forKey: .idToLabel) ?? [:]
+        var parsedIDToLabel: [Int: String] = [:]
+        for (key, label) in stringIDToLabel {
+            guard let id = Int(key) else { continue }
+            guard parsedIDToLabel[id] == nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .idToLabel, in: container,
+                    debugDescription: "id2label key \(key) repeats integer id \(id).")
+            }
+            parsedIDToLabel[id] = label
+        }
+        idToLabel = parsedIDToLabel
+        let labelToID =
+            try container.decodeIfPresent([String: Int].self, forKey: .labelToID) ?? [:]
+        for (label, id) in labelToID where idToLabel[id] == nil {
+            idToLabel[id] = label
+        }
+        numLabels =
+            try container.decodeIfPresent(Int.self, forKey: .numLabels)
+            ?? max((idToLabel.keys.max() ?? -1) + 1, 1)
+        padTokenID = try container.decodeIfPresent(Int.self, forKey: .padTokenID) ?? 0
 
         // Switch decoding logic based on model type
         if modelType == "distilbert" {

@@ -5,7 +5,7 @@ import Foundation
 ///
 /// This provides dot-notation property access functionality for various value types,
 /// such as string methods (`str.upper()`), object properties, and built-in methods.
-public enum PropertyMembers {
+enum PropertyMembers {
     /// Evaluates property member access on a value.
     ///
     /// - Parameters:
@@ -13,11 +13,14 @@ public enum PropertyMembers {
     ///   - propertyName: The name of the property to access
     /// - Returns: The property value or `.undefined` if not found
     /// - Throws: `JinjaError.runtime` for invalid operations
-    public static func evaluate(_ object: Value, _ propertyName: String) throws -> Value {
+    static func evaluate(_ object: Value, _ propertyName: String) throws -> Value {
         switch object {
         case let .string(str):
             return try evaluateStringProperty(str, propertyName)
         case let .object(obj):
+            if let namespace = Namespace.get(obj) {
+                return namespace.attributes[.string(propertyName)] ?? .undefined
+            }
             return try evaluateObjectProperty(obj, propertyName)
         default:
             return .undefined
@@ -26,24 +29,63 @@ public enum PropertyMembers {
 
     // MARK: - String Properties
 
+    private static func lowercaseMapping(_ scalars: [Unicode.Scalar], at index: Int) -> String {
+        let scalar = scalars[index]
+        guard scalar == "Σ" else { return scalar.properties.lowercaseMapping }
+
+        // Final sigma requires a preceding cased scalar and no following cased scalar.
+        // Ignore case-ignorable scalars in both directions, except private-use scalars.
+        func isCaseIgnorable(_ scalar: Unicode.Scalar) -> Bool {
+            scalar.properties.generalCategory != .privateUse && scalar.properties.isCaseIgnorable
+        }
+        let before = scalars[..<index].last { !isCaseIgnorable($0) }
+        let after = scalars[(index + 1)...].first { !isCaseIgnorable($0) }
+        return before?.properties.isCased == true && after?.properties.isCased != true ? "ς" : "σ"
+    }
+
+    /// Python's `str.capitalize`: title-cases the first scalar and lowercases the rest.
+    static func capitalize(_ str: String) -> String {
+        let scalars = Array(str.unicodeScalars)
+        guard let first = scalars.first else { return "" }
+        return first.properties.titlecaseMapping
+            + scalars.indices.dropFirst().map { lowercaseMapping(scalars, at: $0) }.joined()
+    }
+
     private static func evaluateStringProperty(_ str: String, _ propertyName: String) throws
         -> Value
     {
         switch propertyName {
+        case "capitalize":
+            return .function { args, kwargs, _ in
+                _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
+                return .string(capitalize(str))
+            }
         case "upper":
             return .function { args, kwargs, _ in
                 _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                return .string(str.uppercased())
+                return .string(str.unicodeScalars.map { $0.properties.uppercaseMapping }.joined())
             }
         case "lower":
             return .function { args, kwargs, _ in
                 _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                return .string(str.lowercased())
+                let scalars = Array(str.unicodeScalars)
+                return .string(
+                    scalars.indices.map { lowercaseMapping(scalars, at: $0) }.joined()
+                )
             }
         case "title":
             return .function { args, kwargs, _ in
                 _ = try resolveCallArguments(args: args, kwargs: kwargs, parameters: [])
-                return .string(str.capitalized)
+                var result = ""
+                var previousIsCased = false
+                let scalars = Array(str.unicodeScalars)
+                for (index, scalar) in scalars.enumerated() {
+                    result +=
+                        previousIsCased
+                        ? lowercaseMapping(scalars, at: index) : scalar.properties.titlecaseMapping
+                    previousIsCased = scalar.properties.isCased
+                }
+                return .string(result)
             }
         case "strip":
             return .function { args, kwargs, _ in
@@ -214,6 +256,47 @@ public enum PropertyMembers {
                 }
                 return .boolean(str.hasSuffix(suffix))
             }
+        case "format":
+            return .function { args, kwargs, _ in
+                let result = try pythonFormat(string: str, args: args, kwargs: kwargs)
+                return .string(result)
+            }
+        case "join":
+            return .function { args, kwargs, _ in
+                guard kwargs.isEmpty else {
+                    throw JinjaError.runtime("join() takes no keyword arguments")
+                }
+                guard args.count == 1 else {
+                    throw JinjaError.runtime(
+                        "join() takes exactly one argument (\(args.count) given)"
+                    )
+                }
+
+                let items: [Value]
+                switch args[0] {
+                case let .array(array):
+                    items = array
+                case let .string(string):
+                    items = string.unicodeScalars.map { .string(String($0)) }
+                case let .object(object):
+                    try Namespace.requireMapping(object)
+                    items = object.keys.map(Value.init)
+                case .undefined:
+                    items = []
+                default:
+                    throw JinjaError.runtime("join() can only join an iterable")
+                }
+
+                let strings = try items.enumerated().map { index, item in
+                    guard case let .string(string) = item else {
+                        throw JinjaError.runtime(
+                            "join() sequence item \(index): expected a string"
+                        )
+                    }
+                    return string
+                }
+                return .string(strings.joined(separator: str))
+            }
         default:
             return .undefined
         }
@@ -317,6 +400,162 @@ private func split(string: String, separator: String?, limit: Int?) -> [String] 
     }
 }
 
+/// Formats a string the way Python's `str.format` does.
+///
+/// Supports automatic (`{}`), positional (`{0}`), and keyword (`{name}`) fields,
+/// the `!s` and `!r` conversions, and the `{{` and `}}` escapes.
+/// Throws for format specs, other conversions, and attribute or item access in fields,
+/// rather than rendering them differently from Python.
+/// - Parameters:
+///   - string: The format string
+///   - args: The positional arguments
+///   - kwargs: The keyword arguments
+/// - Returns: The formatted string
+private func pythonFormat(string: String, args: [Value], kwargs: [String: Value]) throws -> String {
+    let scalars = Array(string.unicodeScalars)
+    var result = String.UnicodeScalarView()
+    var automaticIndex = 0
+    var usesAutomaticNumbering = false
+    var usesManualNumbering = false
+    var index = 0
+
+    while index < scalars.count {
+        let scalar = scalars[index]
+        let next = index + 1 < scalars.count ? scalars[index + 1] : nil
+
+        if scalar == "}" {
+            guard next == "}" else {
+                throw JinjaError.runtime("Single '}' encountered in format string")
+            }
+            result.append("}")
+            index += 2
+            continue
+        }
+        guard scalar == "{" else {
+            result.append(scalar)
+            index += 1
+            continue
+        }
+        if next == "{" {
+            result.append("{")
+            index += 2
+            continue
+        }
+
+        // Find the closing brace, allowing for nested fields in a format spec.
+        var end = index + 1
+        var depth = 1
+        while end < scalars.count {
+            if scalars[end] == "{" {
+                depth += 1
+            } else if scalars[end] == "}" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            end += 1
+        }
+        guard end < scalars.count else {
+            throw JinjaError.runtime("expected '}' before end of string")
+        }
+        let field = String(String.UnicodeScalarView(scalars[(index + 1) ..< end]))
+        index = end + 1
+
+        // Split the field into its name, conversion, and format spec.
+        let nameEnd = field.firstIndex { $0 == "!" || $0 == ":" } ?? field.endIndex
+        let name = field[..<nameEnd]
+        guard !name.contains("."), !name.contains("[") else {
+            throw JinjaError.runtime(
+                "format() doesn't support attribute or item access in field '{\(field)}'"
+            )
+        }
+        var conversion: Character?
+        var rest = field[nameEnd...]
+        if rest.first == "!" {
+            rest = rest.dropFirst()
+            guard let character = rest.first else {
+                throw JinjaError.runtime("format() field '{\(field)}' is missing a conversion")
+            }
+            conversion = character
+            rest = rest.dropFirst()
+            guard rest.isEmpty || rest.first == ":" else {
+                throw JinjaError.runtime("expected ':' after conversion specifier")
+            }
+        }
+        let spec = rest.dropFirst()
+        guard spec.isEmpty else {
+            throw JinjaError.runtime("format() doesn't support the format spec ':\(spec)'")
+        }
+
+        // Look up the value for the field.
+        let value: Value
+        if name.isEmpty {
+            guard !usesManualNumbering else {
+                throw JinjaError.runtime(
+                    "cannot switch from manual field specification to automatic field numbering"
+                )
+            }
+            usesAutomaticNumbering = true
+            guard automaticIndex < args.count else {
+                throw JinjaError.runtime(
+                    "Replacement index \(automaticIndex) out of range for positional args tuple"
+                )
+            }
+            value = args[automaticIndex]
+            automaticIndex += 1
+        } else if name.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            guard !usesAutomaticNumbering else {
+                throw JinjaError.runtime(
+                    "cannot switch from automatic field numbering to manual field specification"
+                )
+            }
+            usesManualNumbering = true
+            guard let position = Int(name), position < args.count else {
+                throw JinjaError.runtime(
+                    "Replacement index \(name) out of range for positional args tuple"
+                )
+            }
+            value = args[position]
+        } else {
+            guard let keywordValue = kwargs[String(name)] else {
+                throw JinjaError.runtime("format() is missing keyword argument '\(name)'")
+            }
+            value = keywordValue
+        }
+
+        // Python would show a function's memory address, which can't match.
+        if case .function = value {
+            throw JinjaError.runtime("format() can't convert a function to a string")
+        }
+
+        switch conversion {
+        case nil, "s":
+            result.append(contentsOf: pythonStr(value).unicodeScalars)
+        case "r":
+            result.append(contentsOf: value.pythonRepr.unicodeScalars)
+        case let conversion?:
+            throw JinjaError.runtime("format() doesn't support the conversion '!\(conversion)'")
+        }
+    }
+
+    return String(result)
+}
+
+/// Returns the string form of a value as Python's `str()` gives it.
+///
+/// An undefined value is an empty string, as in Jinja2.
+/// - Parameter value: The value to convert
+/// - Returns: The string form of the value
+private func pythonStr(_ value: Value) -> String {
+    switch value {
+    case let .string(string):
+        return string
+    case .undefined:
+        return ""
+    default:
+        return value.pythonRepr
+    }
+}
+
 /// Replaces occurrences of old string with new string, optionally limiting replacements.
 /// - Parameters:
 ///   - string: The string to perform replacements on
@@ -347,13 +586,20 @@ private func replace(string: String, old: String, new: String, maxReplacements: 
     }
 
     if let count = maxReplacements {
-        // Replace only the first 'count' occurrences
-        var result = string
+        // Replace only the first 'count' occurrences,
+        // searching after each replacement so that `new` isn't searched again.
+        var result = ""
+        var searchStart = string.startIndex
         var replacements = 0
-        while replacements < count, let range = result.range(of: old) {
-            result.replaceSubrange(range, with: new)
+        while replacements < count,
+            let range = string.range(of: old, range: searchStart ..< string.endIndex)
+        {
+            result += string[searchStart ..< range.lowerBound]
+            result += new
+            searchStart = range.upperBound
             replacements += 1
         }
+        result += string[searchStart...]
         return result
     } else {
         return string.replacingOccurrences(of: old, with: new)

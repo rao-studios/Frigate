@@ -9,6 +9,36 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Metadata describing where a model applies LoRA adapters.
+public struct LoRAModelMetadata: Sendable, Equatable {
+    /// Number of model layers that support LoRA adapters.
+    public let layerCount: Int
+
+    /// Default module paths, relative to each LoRA layer, that receive adapters.
+    public let defaultKeys: [String]
+
+    public init(layerCount: Int, defaultKeys: [String]) {
+        self.layerCount = layerCount
+        self.defaultKeys = defaultKeys
+    }
+}
+
+extension ModelTypeRegistry where T == any LanguageModel {
+    /// Inspects the registered model's LoRA layers without loading checkpoint weights.
+    ///
+    /// Model construction and metadata access use an independent random state.
+    /// Returns `nil` if the model does not conform to ``LoRAModel``.
+    public func loraMetadata(configurationData: Data) throws -> LoRAModelMetadata? {
+        try withRandomState(MLXRandom.RandomState(seed: 0)) {
+            let configuration = try JSONDecoder.json5().decode(
+                BaseConfiguration.self, from: configurationData)
+            let model = try createModel(
+                configuration: configurationData, modelType: configuration.modelType)
+            return (model as? LoRAModel)?.loraMetadata
+        }
+    }
+}
+
 public protocol LoRAModel {
 
     /// Return the layers to apply LoRA adapters to.
@@ -25,6 +55,14 @@ public protocol LoRAModel {
 }
 
 extension LoRAModel {
+
+    /// Metadata for configuring LoRA without inspecting checkpoint weight names.
+    public var loraMetadata: LoRAModelMetadata {
+        LoRAModelMetadata(
+            layerCount: loraLayers.count,
+            defaultKeys: loraDefaultKeys.sorted()
+        )
+    }
 
     /// By default we apply LoRA to all Linear layers.
     /// This is aligned with `mlx-lm` Python logic.
@@ -99,10 +137,34 @@ extension LoRALayer where Self: Linear {
             return QuantizedLinear(
                 weight: quantized.weight, bias: quantized.bias,
                 scales: quantized.scales, biases: quantized.biases,
-                groupSize: quantized.groupSize, bits: quantized.bits
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode,
+                globalScale: quantized.globalScale
             )
         } else {
             return Linear(weight: weight, bias: bias)
+        }
+    }
+}
+
+/// A layer the built-in adapters can wrap: exactly `Linear` or `QuantizedLinear`.
+///
+/// The adapters copy the stock arrays of their base layer, so a subclass that adds state or
+/// changes the forward pass, such as `HadamardQuantizedLinear`, is excluded (#800).
+enum LoRABase {
+    case linear(Linear)
+    case quantized(QuantizedLinear)
+
+    /// Classifies `layer`, or the base layer of `layer` if it is already an adapter.
+    ///
+    /// Returns `nil` for any other `Linear` subclass.
+    init?(_ layer: Linear) {
+        switch (layer as? LoRALayer)?.reverted() as? Linear ?? layer {
+        case let base as QuantizedLinear where type(of: base) == QuantizedLinear.self:
+            self = .quantized(base)
+        case let base where type(of: base) == Linear.self:
+            self = .linear(base)
+        default:
+            return nil
         }
     }
 }
@@ -111,14 +173,18 @@ extension LoRALayer where Self: Linear {
 extension QuantizedLinear {
 
     /// Computes the dequantized weight matrix using the stored quantization parameters.
-    var dequantizedWeight: MLXArray {
+    ///
+    /// Without a `dtype`, MLX infers it from the scales, or uses bfloat16 for integer scales.
+    func dequantizedWeight(dtype: DType? = nil) -> MLXArray {
         dequantized(
             weight,
             scales: scales,
             biases: biases,
             groupSize: groupSize,
             bits: bits,
-            mode: mode
+            mode: mode,
+            globalScale: globalScale,
+            dtype: dtype
         )
     }
 }

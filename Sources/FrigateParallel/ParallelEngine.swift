@@ -470,6 +470,13 @@ public final class ParallelEngine: @unchecked Sendable {
     ///
     /// PIN: a request someone waits on more than on the prompt being read sets that prompt aside (`suspend`) once the
     /// memory policy has let it in; one of equal priority waits its turn, as every request always did.
+    /// A fresh cache for one row.
+    /// PIN: CHECKED AT START. `init` built one from the same model with the same (no) parameters and threw if it could
+    /// not, so this one cannot fail.
+    private func freshLayers() -> [KVCache] {
+        try! model.newCache(parameters: nil)
+    }
+
     private func admit() {
         let next = queue.firstIndex(where: mayStart)
         if let job = prefill {
@@ -525,16 +532,16 @@ public final class ParallelEngine: @unchecked Sendable {
                 } else if let position = cache.rewind(toAtMost: wanted) {
                     prefix = position
                 } else {
-                    slot.cache = CheckpointedCache(layers: model.newCache(parameters: nil), ring: configuration.checkpointRing)
+                    slot.cache = CheckpointedCache(layers: freshLayers(), ring: configuration.checkpointRing)
                 }
             } else {
-                slot.cache = CheckpointedCache(layers: model.newCache(parameters: nil), ring: configuration.checkpointRing)
+                slot.cache = CheckpointedCache(layers: freshLayers(), ring: configuration.checkpointRing)
             }
             slot.inFlight = row.id
             slotCache = slot.cache
             layers = slot.cache!.layers
         } else {
-            layers = model.newCache(parameters: nil)
+            layers = freshLayers()
         }
         row.reused = prefix
         if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }

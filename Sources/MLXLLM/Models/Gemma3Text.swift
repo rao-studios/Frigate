@@ -14,8 +14,8 @@ import MLXNN
 
 public struct Gemma3TextConfiguration: Codable {
     let modelType: String
-    let hiddenSize: Int
-    let hiddenLayers: Int
+    @_spi(GemmaEncoder) public let hiddenSize: Int
+    @_spi(GemmaEncoder) public let hiddenLayers: Int
     let intermediateSize: Int
     let attentionHeads: Int
     let headDim: Int
@@ -30,6 +30,50 @@ public struct Gemma3TextConfiguration: Codable {
     let slidingWindowPattern: Int
     let maxPositionEmbeddings: Int
     let ropeScaling: [String: StringOrNumber]?
+
+    /// Creates a configuration for a small model with the given
+    /// `vocabularySize`.  This is suitable for creating random
+    /// weight models for tests.
+    @_spi(Testing) public static func smallConfiguration(
+        modelType: String = "text", vocabularySize: Int
+    ) -> Self {
+        Gemma3TextConfiguration(
+            modelType: modelType,
+            hiddenSize: 64, hiddenLayers: 8,
+            intermediateSize: 64, attentionHeads: 4,
+            headDim: 64,
+            rmsNormEps: 0.00001, vocabularySize: vocabularySize, kvHeads: 4,
+            ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,
+            ropeTraditional: false, queryPreAttnScalar: 256,
+            slidingWindow: 512, slidingWindowPattern: 6,
+            maxPositionEmbeddings: 32768
+        )
+    }
+
+    /// Creates a configuration for the smallest model with the given
+    /// `vocabularySize`. It has one layer, so every layer uses global attention.
+    @_spi(Testing) public static func tinyConfiguration(
+        modelType: String = "gemma3_text", vocabularySize: Int
+    ) -> Self {
+        Gemma3TextConfiguration(
+            modelType: modelType,
+            hiddenSize: 8,
+            hiddenLayers: 1,
+            intermediateSize: 16,
+            attentionHeads: 2,
+            headDim: 4,
+            rmsNormEps: 1e-6,
+            vocabularySize: vocabularySize,
+            kvHeads: 1,
+            ropeTheta: 1_000_000.0,
+            ropeLocalBaseFreq: 10_000.0,
+            ropeTraditional: false,
+            queryPreAttnScalar: 256,
+            slidingWindow: 16,
+            slidingWindowPattern: 1,
+            maxPositionEmbeddings: 64
+        )
+    }
 
     public init(
         modelType: String, hiddenSize: Int, hiddenLayers: Int, intermediateSize: Int,
@@ -81,6 +125,12 @@ public struct Gemma3TextConfiguration: Codable {
         case textConfig = "text_config"
     }
 
+    // Kept out of `CodingKeys` so the synthesized `Encodable` is unchanged.
+    private enum RopeParametersCodingKeys: String, CodingKey {
+        case textConfig = "text_config"
+        case ropeParameters = "rope_parameters"
+    }
+
     public init(from decoder: Decoder) throws {
         let nestedContainer = try decoder.container(keyedBy: VLMCodingKeys.self)
 
@@ -118,6 +168,28 @@ public struct Gemma3TextConfiguration: Codable {
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
         ropeScaling =
             try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
+            ?? Self.fullAttentionRopeParameters(from: decoder)
+    }
+
+    /// Newer `transformers` exports set `rope_scaling` to null and write `rope_parameters`
+    /// instead, either keyed by layer type or flat.
+    private static func fullAttentionRopeParameters(
+        from decoder: Decoder
+    ) -> [String: StringOrNumber]? {
+        guard var container = try? decoder.container(keyedBy: RopeParametersCodingKeys.self)
+        else { return nil }
+        if let textConfig = try? container.nestedContainer(
+            keyedBy: RopeParametersCodingKeys.self, forKey: .textConfig)
+        {
+            container = textConfig
+        }
+        if let byLayerType = try? container.decodeIfPresent(
+            [String: [String: StringOrNumber]].self, forKey: .ropeParameters)
+        {
+            return byLayerType["full_attention"]
+        }
+        return try? container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
     }
 }
 
@@ -232,7 +304,13 @@ class Gemma3MLP: Module {
     }
 }
 
-class Gemma3TransformerBlock: Module {
+/// A single Gemma 3 transformer layer.
+///
+/// Exposed at `@_spi(GemmaEncoder)` scope so opted-in client code can drive the
+/// layer stack directly — e.g. encoder-style taps that collect every layer's
+/// hidden state — without this becoming advertised public API. Construction
+/// remains internal to ``Gemma3Model``.
+@_spi(GemmaEncoder) public class Gemma3TransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma3Attention
     @ModuleInfo var mlp: Gemma3MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma.RMSNorm
@@ -265,7 +343,7 @@ class Gemma3TransformerBlock: Module {
         super.init()
     }
 
-    func callAsFunction(
+    @_spi(GemmaEncoder) public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil
@@ -283,11 +361,18 @@ class Gemma3TransformerBlock: Module {
 }
 
 public class Gemma3Model: Module {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    @ModuleInfo var layers: [Gemma3TransformerBlock]
+    /// Token embedding table.
+    ///
+    /// Exposed at `@_spi(GemmaEncoder)` scope. Callers must scale its output by
+    /// `sqrt(hiddenSize)` (computed in bfloat16) to match Gemma 3 semantics, as
+    /// this type's own `callAsFunction(_:mask:cache:)` does.
+    @ModuleInfo(key: "embed_tokens") @_spi(GemmaEncoder) public var embedTokens: Embedding
+    /// The transformer layer stack, exposed at `@_spi(GemmaEncoder)` scope for
+    /// encoder-style client taps.
+    @ModuleInfo @_spi(GemmaEncoder) public var layers: [Gemma3TransformerBlock]
     @ModuleInfo var norm: Gemma.RMSNorm
 
-    let config: Gemma3TextConfiguration
+    @_spi(GemmaEncoder) public let config: Gemma3TextConfiguration
 
     init(_ config: Gemma3TextConfiguration) {
         self.config = config
@@ -393,33 +478,31 @@ public class Gemma3TextModel: Module, LLMModel {
         return processedWeights
     }
 
-    public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
-        var caches = [KVCache]()
+    public func newCache(parameters: GenerateParameters? = nil) throws -> [KVCache] {
         let slidingWindow = config.slidingWindow
         let slidingWindowPattern = config.slidingWindowPattern
 
-        for i in 0 ..< config.hiddenLayers {
+        return try (0 ..< config.hiddenLayers).map { i in
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
-
             if isGlobalLayer {
-                // For global layers, use standard cache but with reasonable step size for long sequences
-                let cache = StandardKVCache()
-                cache.step = 1024  // Larger step size for efficiency with long sequences
-                caches.append(cache)
+                // Global (full-attention) layers honor maxKVSize. When unbounded,
+                // use a larger allocation step for long-context efficiency.
+                let cache = try makeAttentionKVCache(parameters: parameters)
+                if let simple = cache as? StandardKVCache {
+                    simple.step = 1024
+                }
+                return cache
             } else {
-                // For sliding window layers, use rotating cache
-                caches.append(
-                    RotatingKVCache(maxSize: slidingWindow, keep: 0)
-                )
+                return try makeSlidingWindowKVCache(
+                    parameters: parameters, window: slidingWindow)
             }
         }
-
-        return caches
     }
 
     /// Handles prompt processing for sequences
     public func prepare(
-        _ input: LMInput, cache: [KVCache], windowSize: Int? = nil
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State? = nil,
+        prefill: PrefillParameters = .init()
     ) throws -> PrepareResult {
         let promptTokens = input.text.tokens
         let promptCount = promptTokens.dim(0)
@@ -430,7 +513,78 @@ public class Gemma3TextModel: Module, LLMModel {
             return .tokens(.init(tokens: emptyToken))
         }
 
-        return .tokens(input.text)
+        // Prefill through the inner model (no lm_head) to fill the KV cache, handing only
+        // the last token to the TokenIterator — skipping the 262k-vocab lm_head over every
+        // prompt position is the speedup. Tuned 128 default, capped at the sliding window.
+        let y = input.text
+        let processed = try prefill.forEachChunk(
+            total: y.tokens.size,
+            defaultStepSize: Self.defaultPrefillChunkSize,
+            maximumStepSize: config.slidingWindow
+        ) { range in
+            _ = model(y[.newAxis, range].tokens, mask: nil, cache: cache)
+            asyncEval(cache)
+        }
+        return .tokens(y[processed...])
+    }
+
+    /// Prefill chunk size when the caller sets none, tuned for this path on Apple Silicon.
+    private static let defaultPrefillChunkSize = 128
+}
+
+/// Message generator for TranslateGemma, Google's translation fine-tunes of Gemma 3.
+///
+/// TranslateGemma's chat template needs each user turn tagged with `source_lang_code` /
+/// `target_lang_code` (ISO 639-1); supply them via `UserInput.additionalContext`. Without
+/// those codes this behaves exactly like `DefaultMessageGenerator`.
+public struct TranslateGemma3MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(from input: UserInput) -> [Message] {
+        guard
+            let source = input.additionalContext?["source_lang_code"] as? String,
+            let target = input.additionalContext?["target_lang_code"] as? String
+        else {
+            return DefaultMessageGenerator().generate(from: input)
+        }
+        return translationMessages(from: input, source: source, target: target)
+    }
+
+    private func translationMessages(
+        from input: UserInput, source: String, target: String
+    ) -> [Message] {
+        let messages: [Chat.Message]
+        switch input.prompt {
+        case .text(let text):
+            messages = [.user(text)]
+        case .chat(let chat):
+            messages = chat
+        case .messages(let raw):
+            // Already model-specific dictionaries; pass through unchanged.
+            return raw
+        }
+
+        // The TranslateGemma template only supports alternating user/assistant turns.
+        return messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return [
+                    "role": "user",
+                    "content": [
+                        [
+                            "type": "text",
+                            "source_lang_code": source,
+                            "target_lang_code": target,
+                            "text": message.content,
+                        ]
+                    ],
+                ]
+            case .assistant:
+                return ["role": "assistant", "content": message.content]
+            case .system, .tool:
+                return nil
+            }
+        }
     }
 }
 

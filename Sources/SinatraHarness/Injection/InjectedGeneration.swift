@@ -118,7 +118,7 @@ public enum InjectedGeneration {
             return Run(stream: stream, task: task, traceLevel: .off, seed: parameters.seed, injected: false, buffer: nil)
         }
 
-        let cache = cache ?? context.model.newCache(parameters: parameters)
+        let cache = try cache ?? context.model.newCache(parameters: parameters)
         let penalty = parameters.processor()
         let recorder = measure ? TokenRecorder() : nil
         var processor: any LogitProcessor

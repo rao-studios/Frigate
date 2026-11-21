@@ -5,7 +5,7 @@ import OrderedCollections
 ///
 /// The parser takes a sequence of tokens from the lexer and builds an abstract syntax tree
 /// that represents the structure and semantics of the template.
-public struct Parser: Sendable {
+struct Parser: Sendable {
     private let tokens: [Token]
     private var current: Int = 0
 
@@ -18,7 +18,7 @@ public struct Parser: Sendable {
     /// - Parameter tokens: The sequence of tokens to parse
     /// - Returns: An array of parsed AST nodes representing the template
     /// - Throws: `JinjaError.parser` if the tokens contain syntax errors
-    public static func parse(_ tokens: [Token]) throws -> [Node] {
+    static func parse(_ tokens: [Token]) throws -> [Node] {
         var parser = Parser(tokens: tokens)
         var nodes: [Node] = []
         nodes.reserveCapacity(tokens.count / 3)  // Rough estimate
@@ -335,23 +335,6 @@ public struct Parser: Sendable {
         return expr
     }
 
-    private mutating func parseFilter() throws -> Expression {
-        var expr = try parseFactor()
-        while match(.pipe) {
-            let filterName = try consumeIdentifier()
-            var args: [Expression] = []
-            var kwargs: [String: Expression] = [:]
-
-            if match(.openParen) {
-                (args, kwargs) = try parseArguments()
-                try consume(.closeParen, message: "Expected ')' after filter arguments.")
-            }
-
-            expr = .filter(expr, filterName, args, kwargs)
-        }
-        return expr
-    }
-
     private mutating func parseOr() throws -> Expression {
         var expr = try parseAnd()
         while match(.or) {
@@ -379,63 +362,40 @@ public struct Parser: Sendable {
     }
 
     private mutating func parseComparison() throws -> Expression {
-        var expr = try parseTerm()
+        let first = try parseTerm()
+        var comparisons: [Expression.Comparison] = []
         while true {
+            let op: Expression.BinaryOp
             if match(.equal) {
-                let right = try parseTerm()
-                expr = .binary(.equal, expr, right)
+                op = .equal
             } else if match(.notEqual) {
-                let right = try parseTerm()
-                expr = .binary(.notEqual, expr, right)
+                op = .notEqual
             } else if match(.less) {
-                let right = try parseTerm()
-                expr = .binary(.less, expr, right)
+                op = .less
             } else if match(.lessEqual) {
-                let right = try parseTerm()
-                expr = .binary(.lessEqual, expr, right)
+                op = .lessEqual
             } else if match(.greater) {
-                let right = try parseTerm()
-                expr = .binary(.greater, expr, right)
+                op = .greater
             } else if match(.greaterEqual) {
-                let right = try parseTerm()
-                expr = .binary(.greaterEqual, expr, right)
+                op = .greaterEqual
             } else if match(.in) {
-                let right = try parseTerm()
-                expr = .binary(.in, expr, right)
+                op = .in
             } else if match(.not), match(.in) {
-                let right = try parseTerm()
-                expr = .binary(.notIn, expr, right)
-            } else if match(.is) {
-                let negated = match(.not)
-                let testName: String
-                let token = peek()
-                if token.kind == .identifier {
-                    testName = try consumeIdentifier()
-                } else if token.kind == .boolean || token.kind == .null {
-                    testName = String(token.value)
-                    advance()
-                } else {
-                    throw JinjaError.parser("Expected test name but found \(token.kind).")
-                }
-                var args: [Expression] = []
-                if match(.openParen) {
-                    (args, _) = try parseArguments()
-                    try consume(.closeParen, message: "Expected ')' after test arguments.")
-                } else {
-                    // Check if the next token can be parsed as an argument (for tests that expect one)
-                    let nextToken = peek()
-                    if nextToken.kind == .identifier || nextToken.kind == .null || nextToken.kind == .boolean
-                        || nextToken.kind == .number || nextToken.kind == .string
-                    {
-                        args = [try parseConcat()]
-                    }
-                }
-                expr = .test(expr, testName, args, negated: negated)
+                op = .notIn
             } else {
                 break
             }
+            comparisons.append(.init(op: op, operand: try parseTerm()))
         }
-        return expr
+        switch comparisons.count {
+        case 0:
+            return first
+        case 1:
+            return .binary(comparisons[0].op, first, comparisons[0].operand)
+        default:
+            // `a < b < c` means `a < b and b < c`, as in Python.
+            return .comparison(first, comparisons)
+        }
     }
 
     private mutating func parseTerm() throws -> Expression {
@@ -455,18 +415,10 @@ public struct Parser: Sendable {
     }
 
     private mutating func parseConcat() throws -> Expression {
-        var expr = try parseFilter()
-        while true {
-            if match(.concat) {
-                let right = try parseFilter()
-                expr = .binary(.concat, expr, right)
-            } else if check(anyOf: Token.Kind.primaryExpressionStarters) {
-                // Implicit string concatenation - if we see another primary expression, concatenate it
-                let right = try parseFilter()
-                expr = .binary(.concat, expr, right)
-            } else {
-                break
-            }
+        var expr = try parseFactor()
+        while match(.concat) {
+            let right = try parseFactor()
+            expr = .binary(.concat, expr, right)
         }
         return expr
     }
@@ -502,16 +454,75 @@ public struct Parser: Sendable {
         return expr
     }
 
-    private mutating func parseUnary() throws -> Expression {
+    /// As in Jinja2, filters and tests bind tighter than the binary operators,
+    /// and apply to the result of a unary minus or plus,
+    /// so `-x|abs` is `(-x)|abs` and `2 * x|length` is `2 * (x|length)`.
+    private mutating func parseUnary(withFilters: Bool = true) throws -> Expression {
+        var expr: Expression
         if match(.minus) {
-            let expr = try parseUnary()
-            return .unary(.minus, expr)
+            expr = .unary(.minus, try parseUnary(withFilters: false))
+        } else if match(.plus) {
+            expr = .unary(.plus, try parseUnary(withFilters: false))
+        } else {
+            expr = try parseAccess()
         }
-        if match(.plus) {
-            let expr = try parseUnary()
-            return .unary(.plus, expr)
+        return withFilters ? try parseFiltersAndTests(expr) : expr
+    }
+
+    private mutating func parseFiltersAndTests(_ operand: Expression) throws -> Expression {
+        var expr = operand
+        while true {
+            if match(.pipe) {
+                let filterName = try consumeIdentifier()
+                var args: [Expression] = []
+                var kwargs: [String: Expression] = [:]
+
+                if match(.openParen) {
+                    (args, kwargs) = try parseArguments()
+                    try consume(.closeParen, message: "Expected ')' after filter arguments.")
+                }
+
+                expr = .filter(expr, filterName, args, kwargs)
+            } else if match(.is) {
+                expr = try parseTest(expr)
+            } else if match(.openParen) {
+                // As in Jinja2, the result of a filter or test can be called.
+                let (args, kwargs) = try parseArguments()
+                try consume(.closeParen, message: "Expected ')' after arguments.")
+                expr = .call(expr, args, kwargs)
+            } else {
+                break
+            }
         }
-        return try parseAccess()
+        return expr
+    }
+
+    private mutating func parseTest(_ operand: Expression) throws -> Expression {
+        let negated = match(.not)
+        let testName: String
+        let token = peek()
+        if check(anyOf: Token.Kind.allowedAsIdentifier) {
+            testName = try consumeIdentifier()
+        } else if token.kind == .boolean || token.kind == .null {
+            testName = String(token.value)
+            advance()
+        } else {
+            throw JinjaError.parser("Expected test name but found \(token.kind).")
+        }
+        var args: [Expression] = []
+        if match(.openParen) {
+            (args, _) = try parseArguments()
+            try consume(.closeParen, message: "Expected ')' after test arguments.")
+        } else if check(anyOf: Token.Kind.testArgumentStarters) {
+            // As in Jinja2, a test takes one argument without parentheses,
+            // such as `x is divisibleby 3`, but filters and operators after it
+            // apply to the result of the test.
+            if check(.is) {
+                throw JinjaError.parser("Multiple tests can't be chained with 'is'.")
+            }
+            args = [try parseAccess()]
+        }
+        return .test(operand, testName, args, negated: negated)
     }
 
     private mutating func parseAccess() throws -> Expression {
@@ -519,19 +530,28 @@ public struct Parser: Sendable {
 
         while true {
             if match(.dot) {
-                let name = try consumeIdentifier()
-                expr = .member(expr, .identifier(name), computed: false)
+                if check(.number) {
+                    // As in Jinja2, `foo.0` is `foo[0]`.
+                    let index = try consumeIntegerAttribute()
+                    expr = .member(expr, .integer(index), computed: true)
+                } else if check(anyOf: Token.Kind.allowedAsIdentifier) {
+                    let name = try consumeIdentifier()
+                    expr = .member(expr, .identifier(name), computed: false)
+                } else {
+                    throw JinjaError.parser("Expected identifier or integer after '.' but found \(peek().kind).")
+                }
             } else if match(.openBracket) {
                 // Slice or subscript
-                let start = try? parseExpression()
+                let start = try check(.colon) || check(.closeBracket) ? nil : parseExpression()
                 if match(.colon) {
-                    let stop = try? parseExpression()
+                    let stop = try check(.colon) || check(.closeBracket) ? nil : parseExpression()
                     let step = match(.colon) ? try parseExpression() : nil
                     expr = .slice(expr, start: start, stop: stop, step: step)
                 } else if let index = start {
                     expr = .member(expr, index, computed: true)
                 } else {
-                    throw JinjaError.parser("Invalid subscript")
+                    // As in Jinja2, `x[]` is `x[()]`.
+                    expr = .member(expr, .tuple([]), computed: true)
                 }
                 try consume(.closeBracket, message: "Expected ']' after index.")
             } else if match(.openParen) {
@@ -551,13 +571,21 @@ public struct Parser: Sendable {
         switch token.kind {
         case .string:
             advance()
-            return .string(String(token.value))
+            // As in Jinja2, adjacent string literals are joined, as in `'a' 'b'`.
+            var value = String(token.value)
+            while check(.string) {
+                value += advance().value
+            }
+            return .string(value)
         case .number:
             advance()
             if token.value.contains(".") {
-                return .number(Double(String(token.value)) ?? 0.0)
+                guard let value = Double(String(token.value)) else {
+                    throw JinjaError.parser("Invalid number literal '\(token.value)'.")
+                }
+                return .number(value)
             } else {
-                return .integer(Int(String(token.value)) ?? 0)
+                return .integer(try parseIntegerLiteral(token))
             }
         case .boolean:
             advance()
@@ -601,16 +629,15 @@ public struct Parser: Sendable {
                             .number,
                             message: "Expected number for object key."
                         )
-                        let raw = String(keyToken.value)
-                        guard !raw.contains("."), let intKey = Int(raw) else {
+                        guard !keyToken.value.contains(".") else {
                             throw JinjaError.parser(
-                                "Expected integer for numeric object key. Got \(raw) instead"
+                                "Expected integer for numeric object key. Got \(describe(keyToken)) instead."
                             )
                         }
-                        key = .int(intKey)
+                        key = .int(try parseIntegerLiteral(keyToken))
                     } else {
                         throw JinjaError.parser(
-                            "Expected string literal, identifier, or integer for object key. Got \(peek().kind) instead"
+                            "Expected string literal, identifier, or integer for object key. Got \(describe(peek())) instead."
                         )
                     }
                     try consume(.colon, message: "Expected ':' after object key.")
@@ -696,6 +723,18 @@ public struct Parser: Sendable {
 
     // MARK: - Helpers
 
+    /// Converts an integer literal token to `Int`,
+    /// throwing instead of substituting another value when it doesn't fit.
+    private func parseIntegerLiteral(_ token: Token) throws -> Int {
+        if let value = Int(token.value) {
+            return value
+        }
+        if token.value.utf8.allSatisfy({ (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains($0) }) {
+            throw JinjaError.parser("Integer literal '\(token.value)' is too large.")
+        }
+        throw JinjaError.parser("Invalid integer literal '\(token.value)'.")
+    }
+
     @inline(__always)
     private var isAtEnd: Bool {
         current >= tokens.count || peek().kind == .eof
@@ -746,7 +785,12 @@ public struct Parser: Sendable {
     @discardableResult
     private mutating func consume(_ kind: Token.Kind, message: String) throws -> Token {
         if check(kind) { return advance() }
-        throw JinjaError.parser("\(message). Got \(peek().kind) instead")
+        throw JinjaError.parser("\(message) Got \(describe(peek())) instead.")
+    }
+
+    /// Describes a token for an error message, such as `'none' (null)`.
+    private func describe(_ token: Token) -> String {
+        token.kind == .eof ? "end of input" : "'\(token.value)' (\(token.kind))"
     }
 
     @discardableResult
@@ -762,6 +806,26 @@ public struct Parser: Sendable {
         }
         throw JinjaError.parser("Expected identifier but found \(token.kind).")
     }
+
+    /// Consumes the integer in an attribute such as `foo.0`.
+    ///
+    /// Jinja2 rejects a decimal (`foo. 1.5`), a leading zero (`foo.01`),
+    /// and a name or literal after the integer (`foo.0abc`, `foo.1e2`),
+    /// so these throw instead of becoming an index or an implicit concatenation.
+    /// An integer too large for `Int` also throws, as other integer literals do.
+    private mutating func consumeIntegerAttribute() throws -> Int {
+        let token = advance()
+        let digits = token.value
+        guard !digits.contains("."), digits.first != "0" || digits.allSatisfy({ $0 == "0" }) else {
+            throw JinjaError.parser("Invalid integer '\(digits)' after '.'.")
+        }
+        let index = try parseIntegerLiteral(token)
+        if check(anyOf: Token.Kind.invalidAfterIntegerAttribute) {
+            let token = peek()
+            throw JinjaError.parser("Unexpected \(token.kind) '\(token.value)' after '.\(digits)'.")
+        }
+        return index
+    }
 }
 
 // MARK: -
@@ -774,4 +838,16 @@ extension Token.Kind {
     fileprivate static let primaryExpressionStarters: Set<Token.Kind> = [
         .string, .identifier, .number, .boolean, .openParen, .openBracket, .openBrace,
     ]
+
+    /// Tokens that start the argument of a test without parentheses, as in Jinja2.
+    /// A name starts an argument unless it is `else`, `or`, or `and`.
+    fileprivate static let testArgumentStarters = allowedAsIdentifier.subtracting([.else, .or, .and])
+        .union([.boolean, .null, .string, .number, .openBracket, .openBrace])
+
+    /// Tokens that can't follow an integer attribute such as `foo.0`,
+    /// as in `foo.0abc` and `foo.1e2`.
+    /// Calls and subscripts, such as `foo.0()` and `foo.0[1]`, still parse.
+    fileprivate static let invalidAfterIntegerAttribute = primaryExpressionStarters.subtracting([
+        .openParen, .openBracket,
+    ])
 }

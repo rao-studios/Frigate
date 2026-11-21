@@ -5,8 +5,16 @@ The simplified LLM/VLM API allows you to load a model and evaluate prompts with 
 For example, this loads a model and asks a question and a follow-on question:
 
 ```swift
+import Foundation
+import MLXLLM
+import MLXLMCommon
+import MLXHuggingFace  // macros: #hubDownloader / #huggingFaceTokenizerLoader
+import HuggingFace
+import Tokenizers
+
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen3-4B-4bit"
 )
 let session = ChatSession(model)
@@ -30,7 +38,8 @@ a stream:
 
 ```swift
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen3-4B-4bit"
 )
 let session = ChatSession(model)
@@ -49,7 +58,8 @@ and then append one or more `.tool` messages without rebuilding the whole
 conversation history:
 
 ```swift
-var toolResults: [Chat.Message] = []
+var pendingToolCalls: [ToolCall] = []
+var rejectedToolCall: RejectedToolCall?
 
 for try await item in session.streamDetails(
     to: "What is the weather in Paris?",
@@ -57,9 +67,21 @@ for try await item in session.streamDetails(
     videos: []
 ) {
     if case .toolCall(let toolCall) = item {
-        let toolResult = try await callTool(toolCall)
-        toolResults.append(.tool(toolResult))
+        pendingToolCalls.append(toolCall)
     }
+    if case .rejectedToolCall(let rejection) = item {
+        rejectedToolCall = rejection
+    }
+}
+
+if let rejectedToolCall {
+    throw RejectedToolCallError(rejectedToolCall)
+}
+
+var toolResults: [Chat.Message] = []
+for toolCall in pendingToolCalls {
+    let toolResult = try await callTool(toolCall)
+    toolResults.append(.tool(toolResult))
 }
 
 if !toolResults.isEmpty {
@@ -68,10 +90,54 @@ if !toolResults.isEmpty {
 }
 ```
 
-When a session is initialized with history, the first generation must tokenize
-and prefill that history to create a KV cache. Reuse the same `ChatSession` and
-continue with structured messages to avoid paying that full prefill cost on
-each tool turn.
+When tool schemas are supplied, `Generation.toolCall` contains only parsed and
+authorized calls that may be considered for dispatch. Tool-call-shaped output
+that is malformed, incomplete, exceeds the parser's bounded safety limit,
+or names an undeclared function is emitted separately as
+`Generation.rejectedToolCall`; rejected protocol is never returned as a normal
+response chunk. `rawTextPreview` is bounded for diagnostics but can contain
+sensitive argument values, so applications should not log or persist it
+automatically.
+
+Cross-dialect recovery defaults to `ToolCallRecoveryPolicy.conservative`. It
+accepts only structurally complete calls naming an exactly declared tool and
+keeps syntax inside reasoning spans, Markdown code, and ordinary JSON data
+inert. Set `GenerateParameters.toolCallPolicy.recovery` to `.disabled` to permit
+only the selected native dialect, or `.permissive` to allow the documented
+end-of-stream outer-close repair. `GenerateCompletionInfo` reports both
+`recoveredToolCallCount` and `rejectedToolCallCount` for production telemetry.
+
+`GenerateParameters.toolCallPolicy.validation` defaults to `.permissive`, leaving
+schema validation to the application. Set it to `.strict` to reject proven schema
+violations, including missing required arguments. Declared-tool authorization
+and native parser requirements apply in both modes.
+
+The example buffers accepted calls until the generation finishes. This makes
+dispatch atomic at the turn level: if a later call in the same model output is
+rejected, no earlier call has already caused an external side effect.
+`ChatSession` automatic dispatch also fails closed when tool schemas are absent
+or empty: no model-emitted call can reach the dispatch callback without an
+exactly matching declaration.
+
+When `ChatSession` builds its cache from messages, it retains the structured
+transcript and renders the complete conversation for every continuation, as
+required by conversation-aware chat templates. When the rendered tokens extend
+the tokens already represented by the session's KV cache, only the new suffix
+is prefilled. Both the string-and-role overloads and the structured-message
+overloads use this same retained-conversation and cache-reuse path. If a
+template rewrites an earlier part of the prompt, the session rewinds to a
+verified common prefix when the cache and input can be trimmed safely.
+Otherwise, it rebuilds the cache rather than combining stale model state with a
+mismatched prompt.
+
+The low-level initializers that accept an existing raw KV cache cannot recover
+the messages used to create it. Those initializers preserve fragment-based
+continuation behavior; use the history initializer when a structured
+conversation must be resumed.
+
+When a session is initialized with history, the first generation must prefill
+that history to create a KV cache. Reuse the same `ChatSession` so later tool
+turns can take the suffix-only fast path.
 
 ## VLMs (Vision Language Models)
 
@@ -80,7 +146,8 @@ to the `ChatSession`:
 
 ```swift
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
 )
 let session = ChatSession(model)

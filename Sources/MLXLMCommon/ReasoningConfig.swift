@@ -1,0 +1,243 @@
+// Copyright © 2025 Apple Inc.
+
+import Foundation
+
+// MARK: - ReasoningError
+
+/// Errors raised while resolving or applying a model's reasoning configuration.
+public enum ReasoningError: Error, Equatable {
+    /// The caller asked to disable reasoning on a model whose reasoning cannot
+    /// be turned off (e.g. DeepSeek-R1).
+    ///
+    /// This is a package-internal error. The `MLXFoundationModels` layer
+    /// translates it into the framework's `LanguageModelError.unsupportedCapability`
+    /// so app developers see a first-party error type.
+    case cannotDisableReasoning
+}
+
+// MARK: - ReasoningPromptStrategy
+
+/// How a model's "thinking on / off" preference is expressed to its chat template.
+///
+/// `MLXLMCommon` deliberately does not depend on `FoundationModels`, so this
+/// takes a plain `Bool?` (think on / off / unspecified) rather than a
+/// `FoundationModels` reasoning level. The level → `Bool?` mapping lives in the
+/// `MLXFoundationModels` layer, mirroring how ``ToolCallFormat`` carries no
+/// `FoundationModels`-typed mirror.
+public enum ReasoningPromptStrategy: Sendable, Equatable {
+    /// Toggleable via a chat-template keyword argument (e.g. Qwen3's
+    /// `enable_thinking`). The `key` is the kwarg name; `defaultOn` is the
+    /// value used when the caller expresses no preference, matching the
+    /// model's own template default.
+    case templateFlag(key: String, defaultOn: Bool)
+
+    /// The model always reasons and cannot be turned off (e.g. DeepSeek-R1).
+    case alwaysOn
+
+    /// The model has no prompt-level thinking control.
+    case none
+
+    /// Maps a "thinking enabled" preference to the chat-template
+    /// `additionalContext` it implies.
+    ///
+    /// - Parameter thinkingEnabled: `true` / `false` to force thinking on / off,
+    ///   `nil` when the caller expressed no preference.
+    /// - Returns: the `additionalContext` to merge into the rendered prompt, or
+    ///   `nil` when no context needs to be injected.
+    /// - Throws: ``ReasoningError/cannotDisableReasoning`` when `false` is
+    ///   requested on a non-suppressible strategy (``alwaysOn`` or ``none``).
+    public func additionalContext(
+        forThinkingEnabled thinkingEnabled: Bool?
+    ) throws -> [String: any Sendable]? {
+        switch self {
+        case .templateFlag(let key, let defaultOn):
+            return [key: thinkingEnabled ?? defaultOn]
+        case .alwaysOn:
+            if thinkingEnabled == false {
+                throw ReasoningError.cannotDisableReasoning
+            }
+            return nil
+        case .none:
+            // .none is non-suppressible: there is no prompt-level knob to
+            // turn thinking off. Asking to disable it is identical in
+            // outcome to asking .alwaysOn to disable, so it raises the
+            // same typed error. The capability gate at MLXLanguageModel
+            // routes this to LanguageModelError.unsupportedCapability.
+            if thinkingEnabled == false {
+                throw ReasoningError.cannotDisableReasoning
+            }
+            return nil
+        }
+    }
+}
+
+// MARK: - ReasoningChannel
+
+/// The labeled-channel shape of a reasoning protocol: the start delimiter opens a
+/// *channel* whose role is named by a short label that follows it, and one shared
+/// end delimiter closes every channel whatever its role.
+///
+/// Gemma 4 is the family that needs this. Its delimiters are real special tokens
+/// (`soc_token` id 100 `<|channel>`, `eoc_token` id 101 `<channel|>`) and the
+/// reasoning span is named by the label:
+///
+/// ```
+/// <|channel>thought\n ... <channel|>the answer
+/// ```
+///
+/// A plain ``ReasoningConfig`` (start/end delimiter pair) cannot express that.
+/// A pair anchored on `<|channel>` emits `thought` as the first word of the
+/// thinking; a pair anchored on `<|channel>thought\n` stops matching the moment
+/// the label is anything else, leaking the raw opener into the answer.
+public struct ReasoningChannel: Sendable, Equatable {
+
+    /// Ends the role label that follows the start delimiter (Gemma 4: a newline).
+    public var labelTerminator: String
+
+    /// Labels whose channel carries the answer rather than reasoning.
+    ///
+    /// Every other label routes to reasoning, which is the safe direction: the text
+    /// is still delivered, and no scratchpad or raw marker can reach the answer.
+    public var responseLabels: Set<String>
+
+    /// How far past the start delimiter a label may run before the opener counts as
+    /// malformed and its text is shown as reasoning instead of consumed as metadata.
+    ///
+    /// Without a bound, a label that never terminates either buffers the whole
+    /// generation or swallows everything up to a distant end delimiter.
+    public var maxLabelLength: Int
+
+    public init(
+        labelTerminator: String = "\n",
+        responseLabels: Set<String>,
+        maxLabelLength: Int = 32
+    ) {
+        self.labelTerminator = labelTerminator
+        self.responseLabels = responseLabels
+        self.maxLabelLength = maxLabelLength
+    }
+
+    /// Gemma 4: `<|channel>thought\n ... <channel|>` carries reasoning.
+    ///
+    /// No shipped template wraps the answer in a channel, so `content` is listed
+    /// defensively: it costs nothing and keeps such an answer out of the thought
+    /// stream if one ever appears.
+    public static let gemma4 = ReasoningChannel(responseLabels: ["content"])
+}
+
+// MARK: - ReasoningConfig
+
+/// Describes a model's reasoning (chain-of-thought) protocol: the delimiters
+/// that bracket its thinking in the decoded generation stream, and how thinking
+/// is toggled at prompt time.
+///
+/// Rides on ``ModelConfiguration`` (and therefore ``ResolvedModelConfiguration``)
+/// so it reaches generation-time code via `ModelContext.configuration`, exactly
+/// like ``ToolCallFormat``.
+public struct ReasoningConfig: Sendable, Equatable {
+
+    /// The marker that opens a reasoning span (e.g. `<think>`).
+    public var startDelimiter: String
+
+    /// The marker that closes a reasoning span (e.g. `</think>`).
+    public var endDelimiter: String
+
+    /// How a thinking on / off preference is expressed to the chat template.
+    public var promptStrategy: ReasoningPromptStrategy
+
+    /// Markers that implicitly leave reasoning without emitting ``endDelimiter``.
+    ///
+    /// These markers remain part of the generated stream. They are boundaries,
+    /// not replacements for the canonical closing delimiter. For example,
+    /// Qwen3.5 may begin `<tool_call>` directly from its thinking block.
+    public var implicitEndDelimiters: [String]
+
+    /// How this model safely transitions to its answer when a reasoning budget
+    /// is exhausted, or `nil` when hard budget enforcement is unsupported.
+    public var budgetTransition: ReasoningBudgetTransition?
+
+    /// Diagnostic only: whether ``startDelimiter`` is a registered special token
+    /// for this model's tokenizer. Budget enforcement compiles every boundary
+    /// with the active tokenizer and does not rely on this hint.
+    public var isSpecialToken: Bool
+
+    /// When non-nil, ``startDelimiter`` opens a *labeled channel* rather than a
+    /// reasoning span directly: a role label follows it and decides whether the
+    /// span is reasoning or the answer. `nil` (the default) is the plain
+    /// delimiter-pair protocol, e.g. `<think>` ... `</think>`.
+    public var channel: ReasoningChannel?
+
+    public init(
+        startDelimiter: String,
+        endDelimiter: String,
+        promptStrategy: ReasoningPromptStrategy,
+        isSpecialToken: Bool = false,
+        implicitEndDelimiters: [String] = [],
+        budgetTransition: ReasoningBudgetTransition? = nil,
+        channel: ReasoningChannel? = nil
+    ) {
+        self.startDelimiter = startDelimiter
+        self.endDelimiter = endDelimiter
+        self.promptStrategy = promptStrategy
+        self.isSpecialToken = isSpecialToken
+        self.implicitEndDelimiters = implicitEndDelimiters
+        self.budgetTransition = budgetTransition
+        self.channel = channel
+    }
+
+    /// A copy of this protocol that declares `transition` as validated for a
+    /// hard reasoning budget.
+    ///
+    /// Families share wire syntax far more often than they share training, so
+    /// a validated transition is expressed as a delta on the protocol instead
+    /// of a second copy of it: the delimiters keep one definition, and the
+    /// only thing a family adapter restates is what it measured.
+    public func declaringBudgetTransition(
+        _ transition: ReasoningBudgetTransition
+    ) -> ReasoningConfig {
+        var copy = self
+        copy.budgetTransition = transition
+        return copy
+    }
+
+    // MARK: - Presets
+
+    /// Generic `<think>`/`</think>` protocol toggled by the `enable_thinking`
+    /// chat-template flag (default on).
+    ///
+    /// This deliberately declares no budget transition. Sharing delimiters and
+    /// a template flag does not imply that two model families were trained to
+    /// respond to the same forced early-stop sequence.
+    public static let thinkTagsWithEnableThinking = ReasoningConfig(
+        startDelimiter: "<think>", endDelimiter: "</think>",
+        promptStrategy: .templateFlag(key: "enable_thinking", defaultOn: true),
+        isSpecialToken: true)
+
+    /// Always-on `<think>`/`</think>` with no prompt-level off switch
+    /// (DeepSeek-R1 and its distills). The protocol does not claim a known-safe
+    /// hard-budget transition; applications may opt into one explicitly after
+    /// validating it for their exact model and tokenizer.
+    public static let alwaysOnThinking = ReasoningConfig(
+        startDelimiter: "<think>", endDelimiter: "</think>",
+        promptStrategy: .alwaysOn)
+
+    /// Gemma 4's protocol: labeled channels (see ``ReasoningChannel/gemma4``), toggled
+    /// via `enable_thinking`, whose template default is thinking off.
+    ///
+    /// Shared here rather than spelled per model because four types (text, unified,
+    /// and the LLM and VLM entry points) declare the same protocol.
+    ///
+    /// Gemma 4's templates differ in how much they prefill, and the 31B template
+    /// suppresses the generation prompt entirely after a tool call or tool response.
+    /// The model then opens the channel itself, so without this config its delimiters
+    /// reach the caller as literal text.
+    ///
+    /// A tool call opened inside a thought channel ends it, since the model does not
+    /// always close the channel first.
+    public static let gemma4 = ReasoningConfig(
+        startDelimiter: "<|channel>", endDelimiter: "<channel|>",
+        promptStrategy: .templateFlag(key: "enable_thinking", defaultOn: false),
+        isSpecialToken: true,
+        implicitEndDelimiters: ["<|tool_call>"],
+        channel: .gemma4)
+}

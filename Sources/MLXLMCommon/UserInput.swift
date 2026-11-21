@@ -1,11 +1,14 @@
 // Copyright © 2024 Apple Inc.
 
-#if canImport(AVFoundation)
-    @preconcurrency import AVFoundation
-    import CoreImage
-#endif
 import Foundation
 import MLX
+
+#if canImport(AVFoundation)
+@preconcurrency import AVFoundation
+#endif
+#if canImport(CoreImage)
+import CoreImage
+#endif
 
 public typealias Message = [String: any Sendable]
 
@@ -41,30 +44,76 @@ public struct UserInput {
         }
     }
 
-    #if canImport(AVFoundation)
     public struct VideoFrame {
-        public let frame: CIImage
+        public let image: Image
         public let timeStamp: CMTime
 
-        public init(frame: CIImage, timeStamp: CMTime) {
-            self.frame = frame
+        public init(image: Image, timeStamp: CMTime) {
+            self.image = image
             self.timeStamp = timeStamp
         }
+
+        #if canImport(CoreImage)
+
+        @available(
+            *, deprecated,
+            message: "Use init(image:, timeStamp:) instead"
+        )
+        public init(frame: CIImage, timeStamp: CMTime) {
+            self.image = .ciImage(frame)
+            self.timeStamp = timeStamp
+        }
+
+        @available(
+            *, deprecated,
+            message: "Use image.asCIImage()"
+        )
+        public var frame: CIImage {
+            return try! image.asCIImage()
+        }
+
+        #endif
     }
 
     /// Representation of a video resource.
-    public enum Video {
-        case avAsset(AVAsset)
-        case url(URL)
-        /// Useful for decoded frames held in memory
-        case frames([VideoFrame])
+    public struct Video {
 
+        public enum Source {
+            #if canImport(AVFoundation)
+            case avAsset(AVAsset)
+            #endif
+            case url(URL)
+            /// Useful for decoded frames held in memory
+            case frames([VideoFrame])
+        }
+
+        public var source: Source
+
+        public init(source: Source) {
+            self.source = source
+        }
+
+        #if canImport(AVFoundation)
+        public static func avAsset(_ asset: AVAsset) -> Self {
+            Self(source: .avAsset(asset))
+        }
+        #endif
+
+        public static func url(_ url: URL) -> Self {
+            Self(source: .url(url))
+        }
+
+        public static func frames(_ frames: [VideoFrame]) -> Self {
+            Self(source: .frames(frames))
+        }
+
+        #if canImport(AVFoundation)
         @available(
             *, deprecated,
             message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
         )
         public func asAVAsset() -> AVAsset {
-            switch self {
+            switch source {
             case .avAsset(let asset):
                 return asset
             case .url(let url):
@@ -75,16 +124,79 @@ public struct UserInput {
                 )
             }
         }
+        #endif
     }
 
     /// Representation of an image resource.
-    public enum Image {
-        case ciImage(CIImage)
-        case url(URL)
-        case array(MLXArray)
+    public struct Image {
 
+        public enum Source {
+            #if canImport(CoreImage)
+            case ciImage(CIImage)
+            #endif
+            case url(URL)
+            case array(MLXArray)
+        }
+
+        public var source: Source
+
+        /// Text that a vision message generator writes into the prompt as `[label]`,
+        /// immediately before this image. The generator leaves out and logs a label that
+        /// contains `<`, `>`, `|`, `[` or `]`. A vision processor also leaves out a label
+        /// whose `[label]` form contains a special token, such as `IMG` on Mistral3.
+        public var label: String?
+
+        /// The characters that delimit image placeholders, such as `<|image_pad|>` and `[IMG]`.
+        package static let markerCharacters: Set<Character> = ["<", ">", "|", "[", "]"]
+
+        package var labelMarkerCharacter: Character? {
+            label?.first(where: Self.markerCharacters.contains)
+        }
+
+        package static func promptText(forLabel label: String) -> String {
+            "[\(label)]"
+        }
+
+        public init(source: Source, label: String? = nil) {
+            self.source = source
+            self.label = label
+        }
+
+        #if canImport(CoreImage)
+        public static func ciImage(_ image: CIImage, label: String? = nil) -> Self {
+            Self(source: .ciImage(image), label: label)
+        }
+
+        /// Makes `images.map(UserInput.Image.ciImage)` compile, because a function value
+        /// cannot use the default `label`.
+        public static func ciImage(_ image: CIImage) -> Self {
+            Self(source: .ciImage(image))
+        }
+        #endif
+
+        public static func url(_ url: URL, label: String? = nil) -> Self {
+            Self(source: .url(url), label: label)
+        }
+
+        /// Makes `urls.map(UserInput.Image.url)` compile, because a function value cannot
+        /// use the default `label`.
+        public static func url(_ url: URL) -> Self {
+            Self(source: .url(url))
+        }
+
+        public static func array(_ array: MLXArray, label: String? = nil) -> Self {
+            Self(source: .array(array), label: label)
+        }
+
+        /// Makes `arrays.map(UserInput.Image.array)` compile, because a function value
+        /// cannot use the default `label`.
+        public static func array(_ array: MLXArray) -> Self {
+            Self(source: .array(array))
+        }
+
+        #if canImport(CoreImage)
         public func asCIImage() throws -> CIImage {
-            switch self {
+            switch source {
             case .ciImage(let image):
                 return image
 
@@ -96,7 +208,8 @@ public struct UserInput {
 
             case .array(let array):
                 guard array.ndim == 3 else {
-                    throw UserInputError.arrayError("array must have 3 dimensions: \(array.ndim)")
+                    throw UserInputError.arrayError(
+                        "array must have 3 dimensions: \(array.ndim)")
                 }
 
                 var array = array
@@ -138,28 +251,44 @@ public struct UserInput {
                     format: .RGBA8, colorSpace: cs)
             }
         }
+        #endif
     }
-    #else
-        // Linux: image/video processing needs AVFoundation/CoreImage (Apple only).
-        // These stand-ins keep Chat.Message and the rest of the UserInput API compiling;
-        // the VLM media paths that would consume them are excluded on Linux anyway.
-        public struct VideoFrame: Sendable {}
-        public enum Video: Sendable { case url(URL) }
-        public enum Image: Sendable { case url(URL); case array(MLXArray) }
-    #endif
 
     /// Representation of an audio resource.
-    public enum Audio {
-        case url(URL)
-        case array(MLXArray)
+    public struct Audio {
+
+        public enum Source {
+            case url(URL)
+            case array(MLXArray)
+        }
+
+        public var source: Source
+
+        public init(source: Source) {
+            self.source = source
+        }
+
+        public static func url(_ url: URL) -> Self {
+            Self(source: .url(url))
+        }
+
+        public static func array(_ array: MLXArray) -> Self {
+            Self(source: .array(array))
+        }
 
         // See also UserInput+Audio
+    }
+
+    /// Representation of the audio format.
+    public enum AudioFormat: Sendable {
+        case linearPCM
     }
 
     /// Representation of processing to apply to media.
     public struct Processing: Sendable {
         public var resize: CGSize?
 
+        public var video = VideoProcessing()
         public var audio = AudioProcessing()
 
         /// Optional per-call overrides for the image resize budget. When set,
@@ -170,10 +299,78 @@ public struct UserInput {
         public var minPixels: Int?
         public var maxPixels: Int?
 
-        public init(resize: CGSize? = nil, minPixels: Int? = nil, maxPixels: Int? = nil) {
+        public init(
+            resize: CGSize? = nil,
+            video: VideoProcessing = VideoProcessing(),
+            audio: AudioProcessing = AudioProcessing(),
+            minPixels: Int? = nil,
+            maxPixels: Int? = nil
+        ) {
             self.resize = resize
+            self.video = video
+            self.audio = audio
             self.minPixels = minPixels
             self.maxPixels = maxPixels
+        }
+    }
+
+    /// Representation of video processing options.
+    public struct VideoProcessing: Sendable, Equatable {
+        /// Strategy for temporal frame sampling.
+        public enum SamplingMethod: Sendable, Equatable {
+            /// Sample a fixed total count of frames distributed evenly across the video duration.
+            case targetFrames(Int)
+
+            /// Derive a target frame count from frames per second, then distribute those frames
+            /// evenly across the video duration.
+            case framesPerSecond(Double)
+        }
+
+        /// The sampling strategy to use, or `nil` to use model default behavior.
+        public var sampling: SamplingMethod?
+
+        public init(sampling: SamplingMethod? = nil) {
+            self.sampling = sampling
+        }
+
+        /// Convenience initializer to sample a fixed number of frames across the video.
+        public init(targetFrames: Int) {
+            self.sampling = .targetFrames(targetFrames)
+        }
+
+        /// Convenience initializer to target a sampling density in frames per second.
+        public init(targetFramesPerSecond: Double) {
+            self.sampling = .framesPerSecond(targetFramesPerSecond)
+        }
+
+        /// Target number of frames to sample from the video, regardless of duration.
+        public var targetFrames: Int? {
+            get {
+                if case .targetFrames(let count) = sampling { return count }
+                return nil
+            }
+            set {
+                if let newValue {
+                    sampling = .targetFrames(newValue)
+                } else if case .targetFrames = sampling {
+                    sampling = nil
+                }
+            }
+        }
+
+        /// Target frame rate (frames per second) to sample from the video.
+        public var targetFramesPerSecond: Double? {
+            get {
+                if case .framesPerSecond(let fps) = sampling { return fps }
+                return nil
+            }
+            set {
+                if let newValue {
+                    sampling = .framesPerSecond(newValue)
+                } else if case .framesPerSecond = sampling {
+                    sampling = nil
+                }
+            }
         }
     }
 
@@ -185,14 +382,8 @@ public struct UserInput {
         /// Number of channels of audio.  If 1, convert to mono
         public var channels = 1
 
-        /// audio format
-        ///
-        /// `AudioFormatID` comes from CoreAudioTypes via AVFoundation. The only consumer
-        /// is `UserInput+Audio.swift`, which is itself AVFoundation-only, so on Linux the
-        /// property simply is not there rather than carrying a meaningless stand-in.
-        #if canImport(AVFoundation)
-            public var audioFormat: AudioFormatID = kAudioFormatLinearPCM
-        #endif
+        /// Audio format
+        public var audioFormat: AudioFormat = .linearPCM
 
         public init() {
         }
@@ -428,6 +619,46 @@ public protocol UserInputProcessor: Sendable {
     func prepare(input: UserInput) async throws -> LMInput
 }
 
+/// Applies a configured message generator before delegating input processing.
+///
+/// This lets a model configuration override a VLM processor's built-in generator without
+/// changing the processor implementation.
+///
+/// - Important: the override fully replaces the model's own generator, including any
+///   image/video placeholder content that generator would emit. A text-only generator on a
+///   VLM configuration therefore loses media conditioning: Qwen-family processors throw on
+///   the placeholder-count mismatch, others silently ignore the attached media.
+public struct MessageGeneratorUserInputProcessor: UserInputProcessor {
+    private let processor: any UserInputProcessor
+    private let messageGenerator: any MessageGenerator
+    private let tokenizer: (any Tokenizer)?
+
+    public init(
+        processor: any UserInputProcessor,
+        messageGenerator: any MessageGenerator
+    ) {
+        self.processor = processor
+        self.messageGenerator = messageGenerator
+        self.tokenizer = nil
+    }
+
+    package init(
+        processor: any UserInputProcessor,
+        messageGenerator: any MessageGenerator,
+        tokenizer: any Tokenizer
+    ) {
+        self.processor = processor
+        self.messageGenerator = messageGenerator
+        self.tokenizer = tokenizer
+    }
+
+    public func prepare(input: UserInput) async throws -> LMInput {
+        var input = tokenizer.map { input.removingSpecialTokenLabels(using: $0) } ?? input
+        input.prompt = .messages(messageGenerator.generate(from: input))
+        return try await processor.prepare(input: input)
+    }
+}
+
 internal enum UserInputError: LocalizedError {
     case notImplemented
     case unableToLoad(URL)
@@ -454,5 +685,38 @@ public struct StandInUserInputProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) throws -> LMInput {
         throw UserInputError.notImplemented
+    }
+}
+
+extension Tokenizer {
+
+    /// The special tokens that `[label]` encodes to, or `nil` if it encodes to none.
+    /// An empty array still means that `[label]` contains a special token.
+    package func specialTokenNames(inImageLabel label: String) -> [String]? {
+        // Special tokens that `encode` adds, such as BOS, would otherwise flag every label.
+        let ids = encode(
+            text: UserInput.Image.promptText(forLabel: label), addSpecialTokens: false)
+        guard containsSpecialToken(ids) else { return nil }
+        return specialTokenNames(inIDs: ids)
+    }
+
+    /// The `Tokenizer` protocol cannot list special tokens, so this function compares a
+    /// decode with and without `skipSpecialTokens`. An added token without the special
+    /// flag passes, so callers must refuse the marker characters too.
+    private func containsSpecialToken(_ ids: [Int]) -> Bool {
+        decode(tokenIds: ids, skipSpecialTokens: false)
+            != decode(tokenIds: ids, skipSpecialTokens: true)
+    }
+
+    /// Each name comes from `convertIdToToken`, because decoding one id can change the
+    /// token's text.
+    private func specialTokenNames(inIDs ids: [Int]) -> [String] {
+        var names: [String] = []
+        var seen = Set<Int>()
+        for id in ids where containsSpecialToken([id]) {
+            guard seen.insert(id).inserted else { continue }
+            names.append(convertIdToToken(id) ?? "token \(id)")
+        }
+        return names
     }
 }

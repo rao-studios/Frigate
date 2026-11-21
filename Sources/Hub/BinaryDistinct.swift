@@ -23,12 +23,73 @@ public struct BinaryDistinctString: Equatable, Hashable, Sendable, Comparable, C
 
     /// The NSString representation of this binary-distinct string.
     public var nsString: NSString {
-        String(utf16CodeUnits: value, count: value.count) as NSString
+        let native = string
+        // Well-formed UTF-16 (every real vocabulary) takes the native-string path. A lone surrogate
+        // would be repaired to U+FFFD there, so it keeps the exact NSString it always produced.
+        if native.utf16.elementsEqual(value) { return native as NSString }
+        return String(utf16CodeUnits: value, count: value.count) as NSString
     }
 
     /// The Swift String representation of this binary-distinct string.
     public var string: String {
-        String(nsString)
+        // A native Swift String. Going through `String(utf16CodeUnits:count:) as NSString` makes a
+        // bridged (foreign) string, and every hash and comparison of those takes the slow
+        // UTF-16-via-CoreFoundation path. Lone surrogates decode to U+FFFD.
+        Self.decodeUTF16(value)
+    }
+
+    /// `String(decoding: value, as: UTF16.self)`, transcoded to UTF-8 by hand.
+    ///
+    /// The standard library only fast-paths UTF-8 input; UTF-16 takes its generic slow path, which
+    /// was the largest cost of loading a large BPE tokenizer (every vocabulary key and merge half
+    /// is decoded once). The repair is the same: each unpaired surrogate becomes one U+FFFD.
+    static func decodeUTF16(_ value: [UInt16]) -> String {
+        value.withUnsafeBufferPointer { units in
+            let count = units.count
+            if count == 0 { return "" }
+            // At most 3 UTF-8 bytes per UTF-16 code unit (a surrogate pair is 2 units, 4 bytes).
+            return String(unsafeUninitializedCapacity: count * 3) { utf8 in
+                var out = 0
+                var i = 0
+                while i < count {
+                    let unit = units[i]
+                    i += 1
+                    if unit < 0x80 {
+                        utf8[out] = UInt8(truncatingIfNeeded: unit)
+                        out += 1
+                        continue
+                    }
+                    var scalar = UInt32(unit)
+                    if unit & 0xF800 == 0xD800 {
+                        // A high surrogate followed by a low surrogate is one scalar; anything
+                        // else (a lone high or a lone low surrogate) is U+FFFD.
+                        if unit < 0xDC00, i < count, units[i] & 0xFC00 == 0xDC00 {
+                            scalar = 0x10000 + ((UInt32(unit) & 0x3FF) << 10) + (UInt32(units[i]) & 0x3FF)
+                            i += 1
+                        } else {
+                            scalar = 0xFFFD
+                        }
+                    }
+                    if scalar < 0x800 {
+                        utf8[out] = UInt8(truncatingIfNeeded: 0xC0 | (scalar >> 6))
+                        utf8[out + 1] = UInt8(truncatingIfNeeded: 0x80 | (scalar & 0x3F))
+                        out += 2
+                    } else if scalar < 0x10000 {
+                        utf8[out] = UInt8(truncatingIfNeeded: 0xE0 | (scalar >> 12))
+                        utf8[out + 1] = UInt8(truncatingIfNeeded: 0x80 | ((scalar >> 6) & 0x3F))
+                        utf8[out + 2] = UInt8(truncatingIfNeeded: 0x80 | (scalar & 0x3F))
+                        out += 3
+                    } else {
+                        utf8[out] = UInt8(truncatingIfNeeded: 0xF0 | (scalar >> 18))
+                        utf8[out + 1] = UInt8(truncatingIfNeeded: 0x80 | ((scalar >> 12) & 0x3F))
+                        utf8[out + 2] = UInt8(truncatingIfNeeded: 0x80 | ((scalar >> 6) & 0x3F))
+                        utf8[out + 3] = UInt8(truncatingIfNeeded: 0x80 | (scalar & 0x3F))
+                        out += 4
+                    }
+                }
+                return out
+            }
+        }
     }
 
     /// The character count of the string.
@@ -52,14 +113,14 @@ public struct BinaryDistinctString: Equatable, Hashable, Sendable, Comparable, C
     ///
     /// - Parameter str: The NSString to convert
     public init(_ str: NSString) {
-        value = Array(str as String).flatMap { $0.utf16 }
+        value = Array((str as String).utf16)
     }
 
     /// Creates a binary-distinct string from a Swift String.
     ///
     /// - Parameter str: The String to convert
     public init(_ str: String) {
-        self.init(str as NSString)
+        value = Array(str.utf16)
     }
 
     /// Creates a binary-distinct string from a single character.

@@ -14,14 +14,21 @@ public struct Template: Hashable, Sendable {
         /// The default value is `false`.
         public var trimBlocks: Bool = false
 
+        /// Whether a single newline at the end of the template is kept.
+        /// When this is `false`, one trailing `\n`, `\r\n`, or `\r` is removed.
+        /// The default value is `false`.
+        public var keepTrailingNewline: Bool = false
+
         /// Creates template options with the specified settings.
         ///
         /// - Parameters:
         ///   - lstripBlocks: Whether to strip leading whitespace from blocks
         ///   - trimBlocks: Whether to remove the first newline after blocks
-        public init(lstripBlocks: Bool = false, trimBlocks: Bool = false) {
+        ///   - keepTrailingNewline: Whether to keep a single newline at the end of the template
+        public init(lstripBlocks: Bool = false, trimBlocks: Bool = false, keepTrailingNewline: Bool = false) {
             self.lstripBlocks = lstripBlocks
             self.trimBlocks = trimBlocks
+            self.keepTrailingNewline = keepTrailingNewline
         }
     }
 
@@ -40,11 +47,18 @@ public struct Template: Hashable, Sendable {
     public init(_ template: String, with options: Options = .init()) throws {
         var source = template
 
+        // Remove a single trailing newline unless keep_trailing_newline is enabled
+        if !options.keepTrailingNewline, let last = source.last,
+            last == "\n" || last == "\r\n" || last == "\r"
+        {
+            source.removeLast()
+        }
+
         // Apply lstrip_blocks if enabled
         if options.lstripBlocks {
             // Strip tabs and spaces from the beginning of a line to the start of a block
             // This matches lines that start with spaces/tabs followed by {%, {#, or {-
-            let lines = template.components(separatedBy: .newlines)
+            let lines = source.components(separatedBy: .newlines)
             let leadingWhitespace = /^[ \t]*{[#%]/
             let removeWhitespace = /^[ \t]*/
             source = lines.map { line in
@@ -70,6 +84,13 @@ public struct Template: Hashable, Sendable {
 
     /// Renders the template with the given context variables.
     ///
+    /// The template renders in a new child scope of `environment`
+    /// that holds the context and the variables the template sets,
+    /// so rendering doesn't change `environment`,
+    /// and no variable carries over from one render to the next.
+    /// A context value hides a variable with the same name in `environment`,
+    /// including a built-in global such as `range`.
+    ///
     /// - Parameters:
     ///   - context: Variables and values to use during template rendering
     ///   - environment: Optional environment containing additional variables and settings
@@ -79,13 +100,6 @@ public struct Template: Hashable, Sendable {
         _ context: [String: Value],
         environment: Environment? = nil
     ) throws -> String {
-        let env = environment ?? Environment()
-
-        // Set context values directly
-        for (key, value) in context {
-            env[key] = value
-        }
-
-        return try Interpreter.interpret(nodes, environment: env)
+        try Interpreter.interpret(nodes, context: context, environment: environment ?? Environment())
     }
 }

@@ -337,7 +337,6 @@ public func ssmAttn(
         )
         ys.append(y)
         state = nextState
-        asyncEval(y, nextState)
         if let currentLengths = lengths {
             lengths = currentLengths - step
         }
@@ -347,7 +346,6 @@ public func ssmAttn(
     guard let state else {
         fatalError("SSM update did not produce a state")
     }
-    eval(y, state)
     return (y, state)
 }
 

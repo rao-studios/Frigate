@@ -116,11 +116,11 @@ public enum GroundingScorer {
         var bareStart: Int
         if reused, let decodeCache {
             ctxCache = decodeCache
-            (bareCache, bareStart) = fork(ctxCache, at: shared, model: model)
+            (bareCache, bareStart) = try fork(ctxCache, at: shared, model: model)
         } else {
-            ctxCache = model.newCache(parameters: nil)
+            ctxCache = try model.newCache(parameters: nil)
             try prefill(model, cache: ctxCache, tokens: contextTokens[0..<shared], step: options.prefillStep, check: check)
-            (bareCache, bareStart) = fork(ctxCache, at: shared, model: model)
+            (bareCache, bareStart) = try fork(ctxCache, at: shared, model: model)
             try prefill(model, cache: ctxCache, tokens: contextTokens[shared..<(pc - 1)], step: options.prefillStep, check: check)
         }
         // The bare side: whatever of the bare prompt the context prompt does not share.
@@ -159,7 +159,7 @@ public enum GroundingScorer {
         model: any LanguageModel, prompt: [Int], continuation: [Int], chunk: Int = 64, prefillStep: Int = 512
     ) throws -> [Float] {
         guard !prompt.isEmpty, !continuation.isEmpty else { return [] }
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         try prefill(model, cache: cache, tokens: prompt[0..<(prompt.count - 1)], step: prefillStep, check: {})
         let feed = [prompt[prompt.count - 1]] + continuation.dropLast()
         var out: [Float] = []
@@ -183,14 +183,14 @@ public enum GroundingScorer {
 
     /// A copy of `cache` holding its first `length` tokens, and where prefilling continues.
     /// A layer that will not trim leaves the copy empty: the caller prefills from 0.
-    static func fork(_ cache: [KVCache], at length: Int, model: any LanguageModel) -> ([KVCache], Int) {
-        guard length > 0 else { return (model.newCache(parameters: nil), 0) }
+    static func fork(_ cache: [KVCache], at length: Int, model: any LanguageModel) throws -> ([KVCache], Int) {
+        guard length > 0 else { return (try model.newCache(parameters: nil), 0) }
         let copy = cache.map { $0.copy() }
         guard copy.allSatisfy({ $0.isTrimmable && $0.offset >= length }) else {
-            return (model.newCache(parameters: nil), 0)
+            return (try model.newCache(parameters: nil), 0)
         }
         for layer in copy { layer.trim(layer.offset - length) }
-        guard copy.allSatisfy({ $0.offset == length }) else { return (model.newCache(parameters: nil), 0) }
+        guard copy.allSatisfy({ $0.offset == length }) else { return (try model.newCache(parameters: nil), 0) }
         return (copy, length)
     }
 

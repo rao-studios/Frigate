@@ -7,8 +7,11 @@ import Foundation
 public struct JSONToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    public let supportsBareJSON: Bool
+    private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
 
-    public init(startTag: String, endTag: String) {
+    public init(startTag: String, endTag: String, supportsBareJSON: Bool = false) {
+        self.supportsBareJSON = supportsBareJSON
         self.startTag = startTag
         self.endTag = endTag
     }
@@ -16,41 +19,49 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         guard let start = startTag, let end = endTag else { return nil }
 
-        // Find the JSON content between tags
-        var text = content
-
-        // Strip tags if present
-        if let startRange = text.range(of: start) {
-            text = String(text[startRange.upperBound...])
+        var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A bare JSON payload may contain literal protocol markers in its
+        // strings. Only wrapper tags outside that payload are delimiters.
+        if !text.hasPrefix("{"), let startRange = text.range(of: start) {
+            text = String(text[startRange.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
         }
-        if let endRange = text.range(of: end) {
-            text = String(text[..<endRange.lowerBound])
-        }
-
-        let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard
-            let data = jsonStr.data(using: .utf8),
-            let toolCall = parseToolCall(from: data)
-        else { return nil }
-
-        // If tool schemas are provided, only accept calls to declared tools.
-        if let tools, !tools.isEmpty {
-            var isDeclaredTool = false
-            for tool in tools {
-                let functionSpec = tool["function"] as? [String: any Sendable]
-                if functionSpec?["name"] as? String == toolCall.function.name {
-                    isDeclaredTool = true
-                    break
-                }
-            }
-
-            guard isDeclaredTool else {
-                return nil
-            }
+        if text.hasSuffix(end) {
+            text.removeLast(end.count)
         }
 
-        return toolCall
+        return parsePayload(text)
+    }
+
+    /// Parse an already-extracted JSON payload without searching for protocol
+    /// delimiters again. Framing-aware callers use this after finding the
+    /// structural outer close, so a literal end-tag string inside an argument
+    /// remains JSON data rather than truncating the payload.
+    func parsePayload(_ payload: String) -> ToolCall? {
+        let json = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        return parseToolCall(from: json) ?? parseRedundantOuterBraces(from: json)
+    }
+
+    /// Some Qwen chat templates emit an EOS-delimited JSON call with a
+    /// redundant leading brace and two redundant closing braces.
+    /// Recover only that exact shape and only when the enclosed prefix is one
+    /// complete, valid tool-call object followed solely by those braces.
+    private func parseRedundantOuterBraces(from text: String) -> ToolCall? {
+        guard text.hasPrefix("{{") else { return nil }
+        let withoutLeadingBrace = String(text.dropFirst())
+        guard let split = jsonObjectScanner.splitLeadingObject(from: withoutLeadingBrace) else {
+            return nil
+        }
+        let trailing = split.trailing.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trailing == "}}" else {
+            return nil
+        }
+        return parseToolCall(from: split.object)
+    }
+
+    private func parseToolCall(from text: String) -> ToolCall? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return parseToolCall(from: data)
     }
 
     private func parseToolCall(from data: Data) -> ToolCall? {

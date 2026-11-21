@@ -72,18 +72,18 @@ struct BlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : src_ld(src_ld_),
-        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
+        tile_stride(reduction_dim ? BCOLS : BROWS* src_ld),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * src_ld + bj) {}
 
   /* Apply operation to threadgroup without bound checking */
   template <typename UnaryOp>
-  METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const {
+  METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       STEEL_PRAGMA_UNROLL
@@ -94,7 +94,7 @@ struct BlockLoader {
   }
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
@@ -103,7 +103,7 @@ struct BlockLoader {
   }
 
   /* Load from device memory into threadgroup memory - with bound checking */
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
     src_tile_dim = src_tile_dim - short2(bj, bi);
 
     // Skip loading if thread has no valid reads
@@ -151,7 +151,7 @@ struct BlockLoader {
   }
 
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     src += tile_stride;
   }
 };
@@ -196,18 +196,18 @@ struct BlockLoaderT {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : src_ld(src_ld_),
-        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
+        tile_stride(reduction_dim ? BCOLS : BROWS* src_ld),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * kDstStrRow + bj * kDstStrCol),
         src(src_ + bi * src_ld + bj) {}
 
   /* Apply operation to threadgroup without bound checking */
   template <typename UnaryOp>
-  METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const {
+  METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       STEEL_PRAGMA_UNROLL
@@ -219,7 +219,7 @@ struct BlockLoaderT {
   }
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       STEEL_PRAGMA_UNROLL
@@ -230,7 +230,7 @@ struct BlockLoaderT {
   }
 
   /* Load from device memory into threadgroup memory - with bound checking */
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
     src_tile_dim = src_tile_dim - short2(bj, bi);
 
     // Skip loading if thread has no valid reads
@@ -278,7 +278,7 @@ struct BlockLoaderT {
   }
 
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     src += tile_stride;
   }
 };
@@ -362,7 +362,7 @@ struct TransformNone {
 
 template <typename OutT, typename InT>
 struct TransformAdd {
-  TransformAdd(const float, const float) {}
+  TransformAdd(const float, const float) thread {}
 
   static METAL_FUNC OutT apply(InT x) {
     return static_cast<OutT>(x);
@@ -378,14 +378,14 @@ struct TransformAxpby {
   const float alpha;
   const float beta;
 
-  TransformAxpby(const float alpha_, const float beta_)
-      : alpha(alpha_), beta(beta_) {}
+  TransformAxpby(const float alpha_, const float beta_) thread : alpha(alpha_),
+                                                                 beta(beta_) {}
 
   static METAL_FUNC OutT apply(InT x) {
     return static_cast<OutT>(x);
   }
 
-  METAL_FUNC OutT apply(InT x, OutT c) const {
+  METAL_FUNC OutT apply(InT x, OutT c) const thread {
     return static_cast<OutT>(x * alpha + (beta * c));
   }
 };
@@ -493,13 +493,9 @@ struct integral_constant {
   using value_type = T;
   using type = integral_constant;
 
-  METAL_FUNC constexpr operator value_type() const noexcept {
+  METAL_FUNC constexpr operator value_type() const thread noexcept {
     return value;
   }
-
-  // METAL_FUNC constexpr value_type operator()() const noexcept {
-  //   return value;
-  // }
 };
 
 template <bool B>
@@ -529,7 +525,8 @@ using Int = integral_constant<int, val>;
   METAL_FUNC constexpr auto __operator__(                   \
       integral_constant<T, tv>, integral_constant<U, uv>) { \
     constexpr auto res = tv __op__ uv;                      \
-    return integral_constant<decltype(res), res>{};         \
+    using res_t = metal::remove_addrspace_t<decltype(res)>; \
+    return integral_constant<res_t, res>{};                 \
   }
 
 integral_const_binop(+, operator+);
@@ -633,7 +630,7 @@ struct Shape2D {
   RInt r;
   CInt c;
 
-  Shape2D(RInt r_, CInt c_) : r(r_), c(c_) {}
+  Shape2D(RInt r_, CInt c_) thread : r(r_), c(c_) {}
 };
 
 template <typename Shape, typename Layout>
@@ -866,24 +863,25 @@ struct MMATile {
 
   METAL_FUNC MMATile() thread {}
 
-  METAL_FUNC constexpr void clear() {
+  METAL_FUNC constexpr void clear() thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kNumFrags; ++i) {
       val_frags[i] = frag_type(0);
     }
   }
 
-  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) {
+  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j)
+      thread {
     return val_frags[i * kTileCols + j];
   }
 
   METAL_FUNC constexpr const thread frag_type& frag_at(
       const short i,
-      const short j) const {
+      const short j) const thread {
     return val_frags[i * kTileCols + j];
   }
 
-  METAL_FUNC mat_type mat_at(const short i, const short j) {
+  METAL_FUNC mat_type mat_at(const short i, const short j) thread {
     mat_type val_mat;
     STEEL_PRAGMA_UNROLL
     for (short ii = 0; ii < kElemsPerFrag; ++ii) {
@@ -892,16 +890,16 @@ struct MMATile {
     return val_mat;
   }
 
-  METAL_FUNC thread elem_type* elems() {
+  METAL_FUNC thread elem_type* elems() thread {
     return reinterpret_cast<thread elem_type*>(val_frags);
   }
 
-  METAL_FUNC const thread elem_type* elems() const {
+  METAL_FUNC const thread elem_type* elems() const thread {
     return reinterpret_cast<const thread elem_type*>(val_frags);
   }
 
   template <typename Op>
-  METAL_FUNC void row_reduce(thread T vals[kRowsPerThread]) const {
+  METAL_FUNC void row_reduce(thread T vals[kRowsPerThread]) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -913,7 +911,7 @@ struct MMATile {
   }
 
   template <typename Op>
-  METAL_FUNC void row_bin_op(thread T vals[kRowsPerThread]) {
+  METAL_FUNC void row_bin_op(thread T vals[kRowsPerThread]) thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -925,7 +923,7 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y, int str_x, int str_y>
-  METAL_FUNC void load(const threadgroup U* src) {
+  METAL_FUNC void load(const threadgroup U* src) thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -942,7 +940,7 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y, int str_x, int str_y>
-  METAL_FUNC void store(threadgroup U* dst) const {
+  METAL_FUNC void store(threadgroup U* dst) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -959,7 +957,7 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void load(const device U* src, const int ld) {
+  METAL_FUNC void load(const device U* src, const int ld) thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -974,7 +972,7 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void store(device U* dst, const int ld) const {
+  METAL_FUNC void store(device U* dst, const int ld) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -989,8 +987,10 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void
-  load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
+  METAL_FUNC void load_safe(
+      const device U* src,
+      const int ld,
+      const short2 src_tile_dims) thread {
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -1009,8 +1009,10 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void
-  store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
+  METAL_FUNC void store_safe(
+      device U* dst,
+      const int ld,
+      const short2 dst_tile_dims) const thread {
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -1121,7 +1123,7 @@ struct BlockMMA {
   /* Constructor */
   METAL_FUNC BlockMMA(
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]]) {
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread {
     // Determine thread position in simdgroup matrix
     short tm = kFragSize * (simd_group_id / WN);
     short tn = kFragSize * (simd_group_id % WN);
@@ -1139,7 +1141,7 @@ struct BlockMMA {
   }
 
   /* (BM, BK) X (BK, BN) multiply accumulate function */
-  METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) {
+  METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) thread {
     // Adjust for simdgroup and thread location
     As += As_offset;
     Bs += Bs_offset;
@@ -1166,7 +1168,7 @@ struct BlockMMA {
   }
 
   /* Store results from simdgroup_matrix results into device memory */
-  METAL_FUNC void store_result(device U* D, const int ldd) {
+  METAL_FUNC void store_result(device U* D, const int ldd) thread {
     // Apply epilogue
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
@@ -1180,7 +1182,7 @@ struct BlockMMA {
   }
 
   METAL_FUNC void
-  store_result_safe(device U* D, const int ldd, short2 dst_tile_dims) {
+  store_result_safe(device U* D, const int ldd, short2 dst_tile_dims) thread {
     // Apply epilogue
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
@@ -1199,7 +1201,8 @@ struct BlockMMA {
 
   /* Apply epilogue */
   template <typename UnaryEpilogue>
-  METAL_FUNC void apply_epilogue(thread const UnaryEpilogue& epilogue_op) {
+  METAL_FUNC void apply_epilogue(
+      thread const UnaryEpilogue& epilogue_op) thread {
     // Loop over all simdgroup tiles
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
@@ -1213,7 +1216,7 @@ struct BlockMMA {
       const device U* C,
       const int ldc,
       const int fdc,
-      thread const BinaryEpilogue& epilogue_op) {
+      thread const BinaryEpilogue& epilogue_op) thread {
     // Adjust for simdgroup and thread location
     C += (sm)*ldc + (sn)*fdc;
 
@@ -1242,7 +1245,7 @@ struct BlockMMA {
       const int ldc,
       const int fdc,
       short2 dst_tile_dims,
-      thread const BinaryEpilogue& epilogue_op) {
+      thread const BinaryEpilogue& epilogue_op) thread {
     // Adjust for simdgroup and thread location
     C += (sm)*ldc + (sn)*fdc;
     dst_tile_dims -= short2(sn, sm);
@@ -1287,7 +1290,7 @@ struct BlockMMA {
       const device U* C,
       const int ldc,
       const int fdc,
-      thread const Epilogue& epilogue_op) const {
+      thread const Epilogue& epilogue_op) const thread {
     // Adjust for simdgroup and thread location
     C += (sm)*ldc + (sn)*fdc;
     D += (sm)*ldd + sn;
@@ -1320,7 +1323,7 @@ struct BlockMMA {
       const int ldc,
       const int fdc,
       short2 dst_tile_dims,
-      thread const Epilogue& epilogue_op) const {
+      thread const Epilogue& epilogue_op) const thread {
     // Adjust for simdgroup and thread location
     C += (sm)*ldc + (sn)*fdc;
     D += (sm)*ldd + sn;
@@ -1777,7 +1780,7 @@ struct GEMMKernel {
 ///////////////////////////////////////////////////////////////////////////////
 
 #line 1 "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h"
-// Copyright © 2024-25 Apple Inc.
+// Copyright © 2024-26 Apple Inc.
 
 
 using namespace mlx::steel;
@@ -1792,6 +1795,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool save_lse [[function_constant(303)]];
 
 struct MaxOp {
   template <typename T>
@@ -1841,6 +1845,7 @@ template <
     int BQ,
     int BK,
     int BD,
+    int BV,
     int WM,
     int WN,
     typename MaskType = float,
@@ -1854,6 +1859,7 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    device float* lse [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1880,6 +1886,12 @@ template <
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
+  if (save_lse) {
+    lse += tidl.z * params->H * params->qL + // Batch
+        tidl.y * params->qL + // Head
+        tidl.x * BQ; // Sequence
+  }
+
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
         tidl.y * mask_params->M_strides[1]; // Head
@@ -1892,13 +1904,15 @@ template <
 
   constexpr short LDQ_tgp = BD + padQ;
   constexpr short LDK_tgp = BK + padK;
-  constexpr short LDV_tgp = BD + padV;
+  constexpr short LDV_tgp = BV + padV;
 
   constexpr short tgp_mem_0 = (BK + padK) * (BD);
-  constexpr short tgp_mem_1 = BK * (BD + padV);
+  constexpr short tgp_mem_1 = BK * (BV + padV);
   constexpr short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
+  constexpr bool q_in_registers = (WN == 2) && (BK == 32 || sizeof(T) == 4);
+  constexpr short q_tgp_mem_s = q_in_registers ? 1 : BQ * (BD + padQ);
 
-  threadgroup T Q_smem[BQ * (BD + padQ)];
+  threadgroup T Q_smem[q_tgp_mem_s];
   threadgroup T KV_smem[tgp_mem_s];
 
   threadgroup T* Qs = Q_smem;
@@ -1928,7 +1942,7 @@ template <
   using VBlockLoader = BlockLoaderT<
       /* typename T = */ T,
       /* short BROWS = */ BK,
-      /* short BCOLS = */ BD,
+      /* short BCOLS = */ BV,
       /* short kDstStrRow = */ LDV_tgp,
       /* short kDstStrCol = */ 1,
       /* short reduction_dim = */ 0,
@@ -1946,8 +1960,15 @@ template <
   // Prepare MMA tiles
   constexpr short kFragSize = 8; // MMAFrag size
   using MMAFrag_acc_t = BaseMMAFrag<AccumType, kFragSize, kFragSize>;
+  using MMAInType = metal::conditional_t<WN == 2, T, AccumType>;
+  using MMAFrag_in_t = BaseMMAFrag<MMAInType, kFragSize, kFragSize>;
 
-  constexpr int kNWarps = WM * WN;
+  static_assert(WN == 1 || WN == 2, "WN must be 1 or 2");
+  static_assert(
+      BD % WN == 0 && BV % WN == 0,
+      "The head dims must split evenly across WN");
+
+  constexpr int kNWarps = WM;
   static_assert(
       BQ >= (kNWarps * kFragSize) && BQ % (kNWarps * kFragSize) == 0,
       "Each simdgroup must host atleast 1 simdgroup matrix along Q sequence.");
@@ -1958,14 +1979,19 @@ template <
   constexpr int TK = BK / kFragSize;
   // HeadDim frags (all warps load the same frags)
   constexpr int TD = BD / kFragSize;
+  constexpr int TDh = TD / WN;
+  constexpr int BDh = BD / WN;
+  constexpr int TVh = BV / (kFragSize * WN);
+  constexpr int BVh = BV / WN;
 
   static_assert(TQ == 1, "Check TQ");
 
-  MMATile<AccumType, TQ, 1, MMAFrag_acc_t> Qtile;
-  MMATile<AccumType, 1, TK, MMAFrag_acc_t> Ktile;
+  MMATile<MMAInType, TQ, 1, MMAFrag_in_t> Qtile;
+  MMATile<MMAInType, 1, TK, MMAFrag_in_t> Ktile;
   MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Stile;
-  MMATile<AccumType, 1, 1, MMAFrag_acc_t> Vtile;
-  MMATile<AccumType, TQ, TD, MMAFrag_acc_t> Otile;
+  MMATile<MMAInType, 1, 1, MMAFrag_in_t> Vtile;
+  MMATile<AccumType, TQ, TVh, MMAFrag_acc_t> Otile;
+  MMATile<MMAInType, 1, 1, MMAFrag_in_t> Qtiles[q_in_registers ? TDh : 1];
 
   Otile.clear();
 
@@ -1973,22 +1999,45 @@ template <
   const short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
   const short sm = simd_coord.y;
   const short sn = simd_coord.x;
-  const short tm = kFragSize * TQ * simd_group_id;
+  const short row_group = simd_group_id / WN;
+  const short d_half = simd_group_id % WN;
+  const short tm = kFragSize * TQ * row_group;
 
-  const short Qs_offset = (tm + sm) * LDQ_tgp + sn;
-  const short Ks_offset = sm * LDK_tgp + sn;
-  const short Vs_offset = sm * LDV_tgp + sn;
+  const short Qs_offset = (tm + sm) * LDQ_tgp + d_half * BDh + sn;
+  const short Ks_offset = d_half * BDh * LDK_tgp + sm * LDK_tgp + sn;
+  const short Vs_offset = sm * LDV_tgp + d_half * BVh + sn;
 
   constexpr short Qs_tile_stride = kFragSize;
   constexpr short Ks_tile_stride = kFragSize * LDK_tgp;
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Load Q blocks
-  if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-    loader_q.load_safe(short2(BD, params->qL_rem));
+  if constexpr (!q_in_registers) {
+    if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+      loader_q.load_safe(short2(BD, params->qL_rem));
+    } else {
+      loader_q.load_unsafe();
+    }
   } else {
-    loader_q.load_unsafe();
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TDh; dd++) {
+      const device T* q_src = Q + (tm + sm) * params->Q_strides[2] +
+          d_half * BDh + dd * kFragSize + sn;
+      if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+        MMAFrag_in_t::load_safe(
+            Qtiles[dd].frag_at(0, 0),
+            q_src,
+            params->Q_strides[2],
+            Int<1>{},
+            params->qL_rem - (tm + sm),
+            BDh - (dd * kFragSize + sn),
+            Int<0>{},
+            Int<0>{});
+      } else {
+        MMAFrag_in_t::load(
+            Qtiles[dd].frag_at(0, 0), q_src, params->Q_strides[2], Int<1>{});
+      }
+    }
   }
 
   // Init row reduction variables
@@ -2012,11 +2061,16 @@ template <
   }
 
   int kb_lim = params->NK;
+  int kb_min_causal = params->NK;
 
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
     kb_lim = (q_max + BK - 1) / BK;
     kb_lim = min(params->NK, kb_lim);
+
+    int q_min = tid.x * BQ + params->qL_off;
+    q_min = max(0, q_min);
+    kb_min_causal = (q_min / BK);
   }
 
   // Loop over KV seq length
@@ -2035,17 +2089,51 @@ template <
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     STEEL_PRAGMA_UNROLL
-    for (short dd = 0; dd < TD; dd++) {
+    for (short dd = 0; dd < TDh; dd++) {
       simdgroup_barrier(mem_flags::mem_none);
 
-      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
-          &Qs[Qs_offset + dd * Qs_tile_stride]);
+      if constexpr (!q_in_registers) {
+        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
+            &Qs[Qs_offset + dd * Qs_tile_stride]);
+      }
       Ktile.template load<T, 1, 1, LDK_tgp, 1>(
           &Ks[Ks_offset + dd * Ks_tile_stride]);
 
       simdgroup_barrier(mem_flags::mem_none);
 
-      tile_matmad(Stile, Qtile, Ktile, Stile);
+      if constexpr (!q_in_registers) {
+        tile_matmad(Stile, Qtile, Ktile, Stile);
+      } else {
+        tile_matmad(Stile, Qtiles[dd], Ktile, Stile);
+      }
+    }
+
+    if constexpr (WN == 2) {
+      constexpr int s_xchg_stride = decltype(Stile)::kElemsPerTile * 32;
+      constexpr int s_xchg_size = WM * WN * s_xchg_stride;
+      static_assert(
+          s_xchg_size * sizeof(AccumType) <= tgp_mem_s * sizeof(T),
+          "The score exchange must fit in KV_smem");
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup AccumType* s_xchg =
+          reinterpret_cast<threadgroup AccumType*>(KV_smem);
+      threadgroup AccumType* slot =
+          s_xchg + (row_group * WN + d_half) * s_xchg_stride;
+      const short base = short(simd_lane_id) * decltype(Stile)::kElemsPerTile;
+
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        slot[base + ii] = Stile.elems()[ii];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const threadgroup AccumType* peer =
+          s_xchg + (row_group * WN + 1 - d_half) * s_xchg_stride;
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] += peer[base + ii];
+      }
     }
 
     // Apply scale in float32
@@ -2076,7 +2164,7 @@ template <
     }
 
     // Mask out if causal
-    if (do_causal && kb >= (kb_lim - ((BQ + BK - 1) / BK) - int(!align_K))) {
+    if (do_causal && kb >= kb_min_causal) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = Limits<selem_t>::finite_min;
@@ -2146,7 +2234,7 @@ template <
 
     // Load V blocks
     if (!align_K && kb == (params->NK_aligned)) {
-      loader_v.load_safe(short2(BD, params->kL_rem));
+      loader_v.load_safe(short2(BV, params->kL_rem));
     } else {
       loader_v.load_unsafe();
     }
@@ -2198,10 +2286,10 @@ template <
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id++) {
+      for (short id = 0; id < TVh; id++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -2211,7 +2299,7 @@ template <
           Vtile.template load<T, 1, 1, LDV_tgp, 1>(
               &Vs[Vs_offset + kk * LDV_tgp + dd]);
 
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -2233,11 +2321,25 @@ template <
   Otile.template row_bin_op<DivOp>(sum_score);
   threadgroup_barrier(mem_flags::mem_none);
 
+  // Store the logsumexp for the backward pass
+  if (save_lse && sn == 0) {
+    using stile_t = decltype(Stile);
+    const bool is_last_q = int(tid.x) == (params->NQ_aligned);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const short r = tm + sm + i * stile_t::kFragRows;
+      if (align_Q || !is_last_q || r < params->qL_rem) {
+        lse[r] = M_LN2_F * (max_score[i] + metal::log2(sum_score[i]));
+      }
+    }
+  }
+
   // Store results
-  O += (tm + sm) * params->O_strides[2] + sn;
+  O += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
 
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-    auto dst_tile_dims = short2(BD - sn, params->qL_rem - (tm + sm));
+    auto dst_tile_dims = short2(BVh - sn, params->qL_rem - (tm + sm));
 
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;

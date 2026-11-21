@@ -154,10 +154,10 @@ enum ContinuationScorer {
         var totals = [Double](repeating: 0, count: biases.count)
         guard !continuation.isEmpty else { return totals }
         let model = context.model
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         var remaining: [Int] = []
-        switch try model.prepare(input, cache: cache, windowSize: 512) {
+        switch try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters(stepSize: 512, chunking: .remainder)) {
         case .tokens(let text):
             remaining = text.tokens.reshaped([-1]).asType(.int32).asArray(Int32.self).map(Int.init)
         case .logits(let output):

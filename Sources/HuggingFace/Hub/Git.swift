@@ -16,6 +16,26 @@ public enum Git {
         /// The size of the entry in bytes, if available.
         public let size: Int?
 
+        /// The Git LFS metadata, if available.
+        public let lfs: LFSInfo?
+
+        /// The LFS file size in bytes, or the entry size when LFS metadata is absent.
+        public var effectiveSize: Int? {
+            lfs?.size ?? size
+        }
+
+        /// Metadata for a file stored with Git Large File Storage.
+        public struct LFSInfo: Hashable, Codable, Sendable {
+            /// The SHA-256 object ID, if available.
+            public let oid: String?
+
+            /// The file size in bytes.
+            public let size: Int
+
+            /// The size of the Git LFS pointer in bytes, if available.
+            public let pointerSize: Int?
+        }
+
         /// The last commit information for this entry, if available.
         public let lastCommit: LastCommitInfo?
 
@@ -53,13 +73,37 @@ public enum Git {
         /// The full reference path (e.g., "refs/heads/main").
         public let ref: String
 
-        /// The target object ID (SHA).
-        public let targetOid: String?
+        /// The SHA of the commit that the reference points to.
+        public let targetCommit: String?
+
+        /// The SHA of the commit that the reference points to.
+        @available(*, deprecated, renamed: "targetCommit")
+        public var targetOid: String? {
+            targetCommit
+        }
 
         private enum CodingKeys: String, CodingKey {
             case name
             case ref
-            case targetOid = "targetOid"
+            case targetCommit
+            // Earlier versions encoded the commit with this key.
+            case legacyTargetOid = "targetOid"
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.name = try container.decode(String.self, forKey: .name)
+            self.ref = try container.decode(String.self, forKey: .ref)
+            self.targetCommit =
+                try container.decodeIfPresent(String.self, forKey: .targetCommit)
+                ?? container.decodeIfPresent(String.self, forKey: .legacyTargetOid)
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(name, forKey: .name)
+            try container.encode(ref, forKey: .ref)
+            try container.encodeIfPresent(targetCommit, forKey: .targetCommit)
         }
     }
 
@@ -81,24 +125,77 @@ public enum Git {
         public let authors: [Author]
 
         /// The parent commit IDs.
+        ///
+        /// The Hub doesn't send this value.
         public let parents: [String]?
     }
 
     /// Represents a commit author.
     public struct Author: Hashable, Codable, Sendable {
         /// The author's name.
+        ///
+        /// The Hub identifies commit authors by username,
+        /// so for commits from the Hub this is the same as ``user``.
         public let name: String
 
         /// The author's email address.
+        ///
+        /// The Hub doesn't send this value.
         public let email: String?
 
         /// The timestamp of the commit.
+        ///
+        /// The Hub doesn't send this value.
+        /// Use ``Commit/date`` instead.
         public let time: Date?
 
-        /// The Hugging Face user information, if the author has an account.
+        /// The author's Hugging Face username.
         public let user: String?
 
         /// The avatar URL of the author, if available.
         public let avatarURL: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case email
+            case time
+            case user
+            case avatarURL = "avatar"
+            // Earlier versions encoded the avatar URL with this key.
+            case legacyAvatarURL = "avatarURL"
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let user = try container.decodeIfPresent(String.self, forKey: .user)
+            // The Hub sends only the username.
+            // Earlier versions of this package encoded a name.
+            if let name = try container.decodeIfPresent(String.self, forKey: .name) ?? user {
+                self.name = name
+            } else {
+                throw DecodingError.keyNotFound(
+                    CodingKeys.user,
+                    DecodingError.Context(
+                        codingPath: container.codingPath,
+                        debugDescription: "An author needs a user or a name."
+                    )
+                )
+            }
+            self.user = user
+            self.email = try container.decodeIfPresent(String.self, forKey: .email)
+            self.time = try container.decodeIfPresent(Date.self, forKey: .time)
+            self.avatarURL =
+                try container.decodeIfPresent(String.self, forKey: .avatarURL)
+                ?? container.decodeIfPresent(String.self, forKey: .legacyAvatarURL)
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(name, forKey: .name)
+            try container.encodeIfPresent(email, forKey: .email)
+            try container.encodeIfPresent(time, forKey: .time)
+            try container.encodeIfPresent(user, forKey: .user)
+            try container.encodeIfPresent(avatarURL, forKey: .avatarURL)
+        }
     }
 }

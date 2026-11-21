@@ -1,19 +1,30 @@
 // Copyright © 2026 Apple Inc.
 
-// Audio decoding is AVFoundation-only. On Linux `UserInput.Audio` still exists
-// (it is just a URL or an MLXArray); it simply has no decoding helper there.
-#if canImport(AVFoundation)
-
-@preconcurrency import AVFoundation
 import Foundation
 import MLX
+
+#if canImport(AVFoundation)
+@preconcurrency import AVFoundation
+#endif
+
+#if canImport(AVFoundation)
+extension UserInput.AudioFormat {
+    public var asAudioFormatID: AudioFormatID {
+        switch self {
+        case .linearPCM:
+            return kAudioFormatLinearPCM
+        }
+    }
+}
+#endif
 
 extension UserInput.Audio {
 
     public func asMLXArray(processing: UserInput.AudioProcessing = .init()) async throws -> MLXArray
     {
-        switch self {
+        switch source {
         case .url(let url):
+            #if canImport(AVFoundation)
             let asset = AVURLAsset(url: url)
 
             guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
@@ -21,7 +32,7 @@ extension UserInput.Audio {
             }
 
             let settings: [String: Any] = [
-                AVFormatIDKey: processing.audioFormat,
+                AVFormatIDKey: processing.audioFormat.asAudioFormatID,
                 AVSampleRateKey: processing.sampleRate,
                 AVNumberOfChannelsKey: processing.channels,
                 AVLinearPCMBitDepthKey: 32,
@@ -51,11 +62,11 @@ extension UserInput.Audio {
             }
 
             return MLXArray(samples)
-
+            #else
+            fatalError("Audio processing is not supported on this platform.")
+            #endif
         case .array(let array):
             return array
         }
     }
 }
-
-#endif

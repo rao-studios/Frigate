@@ -1,4 +1,4 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2026 Apple Inc.
 
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/unary.h"
@@ -351,6 +351,10 @@ void _qmm_dispatch_typed(
     int bits,
     bool transposed_w) {
   switch (bits) {
+    case 1:
+      _qmm_dispatch_group<T, 1>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
     case 2:
       _qmm_dispatch_group<T, 2>(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
@@ -376,7 +380,8 @@ void _qmm_dispatch_typed(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
       break;
     default:
-      throw std::invalid_argument("Quantization bits must be 2, 3, 4, 6 or 8.");
+      throw std::invalid_argument(
+          "Quantization bits must be 1, 2, 3, 4, 5, 6 or 8.");
   }
 }
 
@@ -1061,6 +1066,15 @@ uint8_t to_fp8_e8m0(float x) {
   return static_cast<uint8_t>(n + 127);
 }
 
+// Smallest E8M0 >= x, so a block's largest elements do not saturate.
+uint8_t to_fp8_e8m0_round_up(float x) {
+  uint8_t bits = to_fp8_e8m0(x);
+  if (bits < 0xFE && dequantize_scale<float, 32>(bits) < x) {
+    bits += 1;
+  }
+  return bits;
+}
+
 uint8_t to_fp4_e2m1(float x) {
   if (std::isnan(x)) {
     return 0x7;
@@ -1112,7 +1126,7 @@ void fp_quantize_dequantize(
     if (group_size == 16) {
       scale = dequantize_scale<float, 16>(detail::ToFP8()(scale));
     } else {
-      scale = dequantize_scale<float, 32>(to_fp8_e8m0(scale));
+      scale = dequantize_scale<float, 32>(to_fp8_e8m0_round_up(scale));
     }
 
     for (int j = 0; j < group_size; ++j) {
@@ -1172,15 +1186,24 @@ void quantize(
       w_min = std::min(w_min, (float)w[w_idx + j]);
     }
     bool mask = std::abs(w_min) > std::abs(w_max);
-    float scale = std::max((w_max - w_min) / n_bins, eps);
-    scale = mask ? scale : -scale;
+    float scale;
+    float bias;
 
-    float edge = mask ? w_min : w_max;
-    float q0 = std::rint(edge / scale);
-    float bias = 0;
-    if (q0 != 0) {
-      scale = edge / q0;
-      bias = edge;
+    if (bits == 1) {
+      // Affine 1-bit: bit 0 -> w_min, bit 1 -> w_max
+      scale = std::max(w_max - w_min, eps);
+      bias = w_min;
+    } else {
+      scale = std::max((w_max - w_min) / n_bins, eps);
+      scale = mask ? scale : -scale;
+
+      float edge = mask ? w_min : w_max;
+      float q0 = std::rint(edge / scale);
+      bias = 0;
+      if (q0 != 0) {
+        scale = edge / q0;
+        bias = edge;
+      }
     }
     size_t out_idx = i * int_per_group;
     for (int j = 0; j < int_per_group / bytes_per_pack; ++j) {
@@ -1357,6 +1380,10 @@ void QQMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   } else {
     throw std::runtime_error("[QQMatmul] NYI for the general case");
   }
+}
+
+void GatherQQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
+  throw std::runtime_error("[GatherQQMM] NYI");
 }
 
 } // namespace mlx::core

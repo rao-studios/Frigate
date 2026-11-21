@@ -581,7 +581,8 @@ TEST_CASE("test array shared buffer") {
   Shape shape = {2, 2};
   auto n_elem = shape[0] * shape[1];
 
-  allocator::Buffer buf_b = allocator::malloc(n_elem * sizeof(float));
+  allocator::Buffer buf_b =
+      allocator::allocator().malloc(n_elem * sizeof(float));
   void* buf_b_ptr = buf_b.raw_ptr();
   float* float_buf_b = (float*)buf_b_ptr;
 
@@ -594,11 +595,11 @@ TEST_CASE("test array shared buffer") {
   auto deleter = [float_buf_b](allocator::Buffer buf) {
     CHECK_EQ(float_buf_b, (float*)buf.raw_ptr());
     CHECK_EQ(float_buf_b[0], ((float*)buf.raw_ptr())[0]);
-    allocator::free(buf);
+    allocator::allocator().free(buf);
   };
 
   array a = ones(shape, float32);
-  array b = array(buf_b, shape, float32, deleter);
+  array b = array(allocator::Data(buf_b, deleter), shape, float32);
 
   eval(a + b);
 }
@@ -647,6 +648,19 @@ TEST_CASE("test make array from user buffer") {
   CHECK_EQ(count, 1);
 }
 
+TEST_CASE("test user buffer is not donated") {
+  int size = 4096;
+  std::vector<float> buffer(size, 1.0f);
+  auto out = exp(array(buffer.data(), Shape{size}, float32, [](void*) {}));
+  eval(out);
+  CHECK_EQ(buffer[0], 1.0f);
+}
+
+TEST_CASE("test null deleter is not owned") {
+  allocator::Data data(allocator::Buffer(nullptr), nullptr);
+  CHECK_FALSE(data.is_owned());
+}
+
 TEST_CASE("test negative indexing for shape/strides") {
   // 2D array: shape = {2, 3}
   std::vector<float> data(6, 1.0f);
@@ -670,4 +684,80 @@ TEST_CASE("test negative indexing for shape/strides") {
   // Invalid: too positive
   CHECK_THROWS_AS(a.shape(2), std::out_of_range);
   CHECK_THROWS_AS(a.strides(2), std::out_of_range);
+}
+
+// https://github.com/ml-explore/mlx/pull/1590
+TEST_CASE("test siblings circular references without eval") {
+  std::weak_ptr<array::Data> tracker;
+  auto fun = [&]() {
+    array key({1, 2});
+    auto splits = split(key, 2);
+    {
+      // Set fake data as a tracker for ArrayDesc's lifetime.
+      splits[0].set_data(allocator::malloc(0));
+      tracker = splits[0].data_shared_ptr();
+    }
+    auto a = reshape(splits[0], {});
+    auto b = reshape(splits[1], {});
+    return b;
+  };
+  fun();
+  CHECK(tracker.expired());
+}
+
+// https://github.com/ml-explore/mlx/pull/4453
+TEST_CASE("test siblings circular references released by assignment") {
+  std::weak_ptr<array::Data> tracker;
+  auto fun = [&]() {
+    array sink({3, 4});
+    array key({1, 2});
+    auto splits = split(key, 2);
+    {
+      // Set fake data as a tracker for ArrayDesc's lifetime.
+      splits[0].set_data(allocator::malloc(0));
+      tracker = splits[0].data_shared_ptr();
+    }
+    // Drop both outputs by assigning over them rather than destroying
+    // them. The siblings hold each other, so unless assignment runs the
+    // same check the destructor does, nothing ever releases them.
+    splits[0] = sink; // copy assignment
+    splits[1] = array({5, 6}); // move assignment
+  };
+  fun();
+  CHECK(tracker.expired());
+}
+
+TEST_CASE("test siblings circular references released by overwrite") {
+  std::weak_ptr<array::Data> tracker;
+  auto fun = [&]() {
+    array key({1, 2});
+    auto splits = split(key, 2);
+    {
+      // Set fake data as a tracker for ArrayDesc's lifetime.
+      splits[0].set_data(allocator::malloc(0));
+      tracker = splits[0].data_shared_ptr();
+    }
+    // Leave one output as the last reference, then replace it in place.
+    // This is the path __setitem__ takes, with no compile involved.
+    array last = splits[0];
+    splits.clear();
+    last.overwrite_descriptor(array({7, 8}));
+  };
+  fun();
+  CHECK(tracker.expired());
+}
+
+TEST_CASE("test assigning a sibling over the last reference keeps the cycle") {
+  array key({1, 2});
+  auto splits = split(key, 2);
+  // Leave one output as the last outside reference to the pair, then assign
+  // its sibling over it. The sibling is reachable only through the array
+  // being replaced, so it has to be held before the old descriptor is
+  // checked: checked first, the pair looks unreferenced, its cycle is broken
+  // and the sibling list the new value lives in is freed before it is read.
+  array last = splits[0];
+  splits.clear();
+  last = last.siblings()[0];
+  REQUIRE_EQ(last.siblings().size(), 1);
+  CHECK(array_equal(last, array({2})).item<bool>());
 }

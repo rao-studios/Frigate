@@ -71,6 +71,8 @@ public enum Tests {
     }
 
     /// Tests if the input is a number.
+    ///
+    /// Booleans are numbers, as they are in Python.
     @Sendable public static func number(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -83,7 +85,7 @@ public enum Tests {
         )
 
         guard let input = arguments["value"] else { return false }
-        return input.isInt || input.isDouble
+        return input.isInt || input.isDouble || input.isBoolean
     }
 
     /// Tests if the input is a Boolean.
@@ -184,7 +186,8 @@ public enum Tests {
         }
         switch (value, divisor) {
         case let (.int(a), .int(b)):
-            return b != 0 && a % b == 0
+            // `Int.min % -1` overflows in Swift; the remainder is 0.
+            return b != 0 && a.remainderReportingOverflow(dividingBy: b).partialValue == 0
         case let (.double(a), .double(b)):
             return b != 0.0 && a.truncatingRemainder(dividingBy: b) == 0
         case let (.int(a), .double(b)):
@@ -323,10 +326,12 @@ public enum Tests {
         )
 
         guard let input = arguments["value"] else { return false }
-        return input.isObject
+        return input.isObject && input.namespace == nil
     }
 
-    /// Tests if the input is callable (function or macro).
+    /// Tests if the input is callable (function, macro, or undefined).
+    ///
+    /// Jinja2's `Undefined` defines `__call__`, so an undefined value is callable.
     @Sendable public static func callable(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -339,7 +344,7 @@ public enum Tests {
         )
 
         guard let input = arguments["value"] else { return false }
-        return input.isFunction || input.isMacro
+        return input.isFunction || input.isMacro || input.isUndefined
     }
 
     /// Tests if the input is an integer.
@@ -444,7 +449,7 @@ public enum Tests {
         return input.isDouble
     }
 
-    /// Tests if the input is a sequence (array or string).
+    /// Tests if the input supports length and indexed access.
     @Sendable public static func sequence(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -457,8 +462,9 @@ public enum Tests {
         )
 
         guard let input = arguments["value"] else { return false }
+        guard input.namespace == nil else { return false }
         switch input {
-        case .array(_), .string(_):
+        case .array(_), .string(_), .object(_), .undefined:
             return true
         default:
             return false
@@ -530,7 +536,14 @@ public enum Tests {
         )
 
         guard let a = arguments["a"], let b = arguments["b"] else { return false }
-        return try a.compare(to: b) == 0
+        switch (a, b) {
+        case (.boolean, _), (_, .boolean), (.null, _), (_, .null):
+            // Python's `True`, `False`, and `None` are singletons,
+            // so `1 is sameas true` is false although `1 == true`.
+            return a == b
+        default:
+            return try a.compare(to: b) == 0
+        }
     }
 
     /// Tests if the input is in a sequence.
@@ -558,6 +571,7 @@ public enum Tests {
             }
             return false
         case let .object(dict):
+            try Namespace.requireMapping(dict)
             if let key = ObjectKey(input) {
                 return dict[key] != nil
             }

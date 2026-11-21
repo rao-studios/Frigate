@@ -4,6 +4,10 @@
 /// and generate dynamic content. They're useful for creating template components
 /// and reducing code duplication.
 public struct Macro: Hashable, Sendable {
+    // Only an internal object marker carries namespace metadata.
+    // Decoding an ordinary macro never creates this payload.
+    var namespace: Namespace? = nil
+
     /// The name of the macro.
     public let name: String
 
@@ -11,10 +15,10 @@ public struct Macro: Hashable, Sendable {
     public let parameters: [String]
 
     /// The default values for optional parameters.
-    public let defaults: OrderedDictionary<String, Expression>
+    let defaults: OrderedDictionary<String, Expression>
 
     /// The template nodes that make up the macro's body.
-    public let body: [Node]
+    let body: [Node]
 
     /// Creates a new macro definition.
     ///
@@ -23,7 +27,7 @@ public struct Macro: Hashable, Sendable {
     ///   - parameters: The parameter names the macro accepts
     ///   - defaults: Default values for optional parameters
     ///   - body: The template nodes that form the macro body
-    public init(
+    init(
         name: String,
         parameters: [String],
         defaults: OrderedDictionary<String, Expression>,
