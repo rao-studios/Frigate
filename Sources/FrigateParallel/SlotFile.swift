@@ -40,23 +40,37 @@ public struct SlotFile: Sendable, Equatable {
 /// and `ring` (the snapshots' token counts), and the caller's own keys as `meta.<key>`.
 enum SlotFileCodec {
     static func write(_ cache: CheckpointedCache, tokens: [Int], layout: CacheLayout, metadata: [String: String],
-                      to url: URL) throws -> SlotFile {
-        var arrays: [String: MLXArray] = ["tokens": MLXArray(tokens.map(Int32.init))]
-        for (index, layer) in cache.layers.enumerated() {
-            for (n, array) in layer.state.enumerated() { arrays["layers.\(index).\(n)"] = array }
-        }
-        func put(_ snapshot: CheckpointedCache.Snapshot, under prefix: String) {
+                      upTo extent: SlotExtent = .whole, to url: URL) throws -> SlotFile {
+        func put(_ snapshot: CheckpointedCache.Snapshot, under prefix: String, into arrays: inout [String: MLXArray]) {
             for (index, state) in snapshot.recurrent {
                 for (n, array) in state.enumerated() { arrays["\(prefix).\(index).\(n)"] = array }
             }
         }
-        if let pinned = cache.pinned { put(pinned, under: "pinned") }
-        if let anchor = cache.anchor { put(anchor, under: "anchor") }
-        for (k, snapshot) in cache.snapshots.enumerated() { put(snapshot, under: "ring.\(k)") }
-        var header = ["format": SlotFile.format, "layout": layout.signature, "tokens": String(tokens.count)]
-        header["pinned"] = cache.pinned.map { String($0.tokenCount) }
-        header["anchor"] = cache.anchor.map { String($0.tokenCount) }
-        if !cache.snapshots.isEmpty { header["ring"] = cache.snapshots.map { String($0.tokenCount) }.joined(separator: ",") }
+        var arrays: [String: MLXArray] = [:]
+        var tokens = tokens
+        var header = ["format": SlotFile.format, "layout": layout.signature]
+        switch extent {
+        case .whole:
+            for (index, layer) in cache.layers.enumerated() {
+                for (n, array) in layer.state.enumerated() { arrays["layers.\(index).\(n)"] = array }
+            }
+            if let pinned = cache.pinned { put(pinned, under: "pinned", into: &arrays) }
+            if let anchor = cache.anchor { put(anchor, under: "anchor", into: &arrays) }
+            for (k, snapshot) in cache.snapshots.enumerated() { put(snapshot, under: "ring.\(k)", into: &arrays) }
+            header["pinned"] = cache.pinned.map { String($0.tokenCount) }
+            header["anchor"] = cache.anchor.map { String($0.tokenCount) }
+            if !cache.snapshots.isEmpty { header["ring"] = cache.snapshots.map { String($0.tokenCount) }.joined(separator: ",") }
+        case .anchor:
+            guard let cut = cache.trimmedToAnchor(), cut.anchor.tokenCount <= tokens.count else { throw ParallelError.noAnchor }
+            tokens = Array(tokens.prefix(cut.anchor.tokenCount))
+            for (index, state) in cut.layers.enumerated() {
+                for (n, array) in state.enumerated() { arrays["layers.\(index).\(n)"] = array }
+            }
+            put(cut.anchor, under: "anchor", into: &arrays)
+            header["anchor"] = String(cut.anchor.tokenCount)
+        }
+        arrays["tokens"] = MLXArray(tokens.map(Int32.init))
+        header["tokens"] = String(tokens.count)
         for (key, value) in metadata { header["meta." + key] = value }
 
         let fm = FileManager.default

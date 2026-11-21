@@ -122,7 +122,13 @@ public final class CheckpointedCache {
     /// where a turn's ask ends, kept outside the ring until the next pin replaces it — or, `anchored`, where the stable
     /// prefix ends, kept until the next anchor replaces it.
     public func snapshot(at tokenCount: Int, pinned pin: Bool = false, anchored: Bool = false) {
-        guard !recurrent.isEmpty, canRewind else { return }
+        guard canRewind else { return }
+        // A cache that trims by position rewinds exactly without snapshots; its anchor holds only where the stable
+        // prefix ends, for a keep up to it (`SlotExtent.anchor`).
+        if recurrent.isEmpty {
+            if anchored { anchor = Snapshot(tokenCount: tokenCount, recurrent: [:]) }
+            return
+        }
         var state: [Int: [MLXArray]] = [:]
         for (index, layer) in recurrent {
             let arrays = layer.state
@@ -148,16 +154,23 @@ public final class CheckpointedCache {
     /// snapshot at or before `target`. Returns the token count the cache now holds, or nil when
     /// nothing fits — the caller then starts a fresh cache.
     @discardableResult
-    public func rewind(toAtMost target: Int) -> Int? {
+    public func rewind(toAtMost target: Int) -> Int? { rewindPoint(toAtMost: target)?.position }
+
+    /// `rewind(toAtMost:)`, saying which point it went back to: the anchor, the pin or the ring when they stand at the
+    /// same count, in that order, or a trim.
+    public func rewindPoint(toAtMost target: Int) -> (position: Int, point: RewindPoint)? {
         guard canRewind else { return nil }
         let current = position
         if isFullyTrimmable {
             let count = max(0, min(target, current))
             trim(by: current - count)
-            return count
+            if let kept = anchor, kept.tokenCount > count { anchor = nil }
+            return (count, .trim)
         }
         guard let snapshot = held.filter({ $0.tokenCount <= target }).max(by: { $0.tokenCount < $1.tokenCount }),
               snapshot.tokenCount <= current else { return nil }
+        let point: RewindPoint = anchor?.tokenCount == snapshot.tokenCount ? .anchor
+            : pinned?.tokenCount == snapshot.tokenCount ? .pin : .ring
         for (index, arrays) in snapshot.recurrent {
             recurrent[index]?.state = arrays
         }
@@ -165,24 +178,41 @@ public final class CheckpointedCache {
         snapshots.removeAll { $0.tokenCount > snapshot.tokenCount }
         if let kept = pinned, kept.tokenCount > snapshot.tokenCount { pinned = nil }
         if let kept = anchor, kept.tokenCount > snapshot.tokenCount { anchor = nil }
-        return snapshot.tokenCount
+        return (snapshot.tokenCount, point)
     }
 
-    /// Drops the oldest snapshot, the pinned one included, the anchor only when nothing else is left: a rewind can then
-    /// reach only the newer ones. False when none is kept.
+    /// Drops one snapshot: the ring's oldest while the ring holds any, then the pin, the anchor last. False when none is
+    /// kept.
+    ///
+    /// PIN: THE RING GOES FIRST (2026-11-20). The pin is where the next turn parts from this one and the anchor where a
+    /// rewritten history does; the ring's are this turn's rounds, the newest of which the next round needs and the
+    /// oldest of which nothing does. Dropped by age instead, the pin went before the ring's newer snapshots, and the
+    /// next turn read this one again from the anchor.
     @discardableResult
     public func dropOldestSnapshot() -> Bool {
-        if let kept = pinned, snapshots.first.map({ kept.tokenCount <= $0.tokenCount }) ?? true {
+        if !snapshots.isEmpty {
+            snapshots.removeFirst()
+            return true
+        }
+        if pinned != nil {
             pinned = nil
             return true
         }
-        guard !snapshots.isEmpty else {
-            guard anchor != nil else { return false }
-            anchor = nil
-            return true
-        }
-        snapshots.removeFirst()
+        guard anchor != nil else { return false }
+        anchor = nil
         return true
+    }
+
+    /// The cache as it stood at the anchor, for a keep up to it: its layers cut to the anchor's count (the recurrent ones
+    /// the anchor's own state) and the anchor as its only snapshot. Nil without an anchor.
+    func trimmedToAnchor() -> (layers: [[MLXArray]], anchor: Snapshot)? {
+        guard let anchor, anchor.tokenCount <= position else { return nil }
+        let count = anchor.tokenCount
+        let cut = layers.enumerated().map { index, layer -> [MLXArray] in
+            if let held = anchor.recurrent[index] { return held }
+            return layer.state.map { $0[.ellipsis, ..<count, 0...] }
+        }
+        return (cut, anchor)
     }
 
     /// Hands the layers to whoever decodes on them next and keeps only the snapshots.

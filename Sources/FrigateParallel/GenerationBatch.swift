@@ -139,6 +139,9 @@ final class Row {
     var admittedAt: Date?
     var prefillSeconds: TimeInterval = 0
     var reused = 0
+    /// How it found its slot's cache, once admitted; and whether that cache came from a file.
+    var admission: CacheAdmission?
+    var fromFile = false
     /// Prompt tokens read into the cache so far: what a stream removed mid-read reports it got through.
     var prefilled = 0
     var batchSteps = 0

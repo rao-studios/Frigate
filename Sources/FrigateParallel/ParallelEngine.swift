@@ -57,7 +57,8 @@ public final class ParallelEngine: @unchecked Sendable {
         case hold
         case resume(ceiling: Int?)
         case shutdown
-        case keep(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
+        case keep(SlotID, URL, SlotExtent, [String: String], (Result<SlotFile, Error>) -> Void)
+        case holdSlot(SlotID, Bool)
         case take(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
     }
 
@@ -69,6 +70,10 @@ public final class ParallelEngine: @unchecked Sendable {
         var forgotten = false
         /// When a stream last began or ended on it: what an eviction reads, oldest first.
         var lastUsed = Date()
+        /// Held by its session between two of a turn's requests (`hold(slot:)`): idle, never evicted.
+        var held = false
+        /// Its cache came from a file (`take`) since its last request.
+        var taken = false
     }
 
     /// A prompt being prefilled, one chunk at a time, on single-sequence layers.
@@ -212,9 +217,19 @@ public final class ParallelEngine: @unchecked Sendable {
     /// Writes a session's cache to `url` (`SlotFile`, `frigate-slot/1`): its layers, the tokens they hold and the
     /// snapshots it can rewind to, with `metadata` beside them. The slot keeps its cache. Throws when the slot holds
     /// nothing, a stream is using it, or the file cannot be written.
-    public func keep(slot: SlotID, to url: URL, metadata: [String: String] = [:]) async throws -> SlotFile {
-        try await answered { .keep(slot, url, metadata, $0) }
+    public func keep(slot: SlotID, to url: URL, upTo extent: SlotExtent = .whole, metadata: [String: String] = [:]) async throws -> SlotFile {
+        try await answered { .keep(slot, url, extent, metadata, $0) }
     }
+
+    /// Holds a session's cache against eviction while its turn runs tools and agents between two requests: the next
+    /// round finds it where the last one left it. `unhold(slot:)` at the turn's end lets the policy have it again.
+    ///
+    /// PIN: A TURN'S SLOT IS NOT IDLE BETWEEN ITS ROUNDS (2026-11-20). An agent the turn called could evict the turn's
+    /// own cache as least recently used, and the round after the agent read the whole conversation again.
+    public func hold(slot: SlotID) { post(.holdSlot(slot, true)) }
+
+    /// Lets a held session's cache be evicted again (`hold(slot:)`).
+    public func unhold(slot: SlotID) { post(.holdSlot(slot, false)) }
 
     /// Reads a session's cache from `url` into `slot`, replacing what the slot held: the next request on the slot
     /// continues it by their common prefix. Throws, leaving the slot as it was, when a stream is using the slot or the
@@ -363,19 +378,22 @@ public final class ParallelEngine: @unchecked Sendable {
             held = nil
         case .shutdown:
             running = false
-        case .keep(let id, let url, let metadata, let answer):
-            answer(Result { try withError { try keepSlot(id, to: url, metadata: metadata) } })
+        case .keep(let id, let url, let extent, let metadata, let answer):
+            answer(Result { try withError { try keepSlot(id, to: url, upTo: extent, metadata: metadata) } })
+        case .holdSlot(let id, let held):
+            if let slot = slots[id] { slot.held = held } else if held { let slot = Slot(); slot.held = true; slots[id] = slot }
+            if !held { enforceSlotBudget() }
         case .take(let id, let url, let expecting, let answer):
             answer(Result { try withError { try takeSlot(id, from: url, expecting: expecting) } })
         }
     }
 
     /// Writes an idle slot's cache, leaving it in place (`keep(slot:to:metadata:)`).
-    private func keepSlot(_ id: SlotID, to url: URL, metadata: [String: String]) throws -> SlotFile {
+    private func keepSlot(_ id: SlotID, to url: URL, upTo extent: SlotExtent, metadata: [String: String]) throws -> SlotFile {
         guard let slot = slots[id] else { throw ParallelError.slotEmpty }
         if let busy = slot.inFlight { throw ParallelError.slotBusy("\(busy)") }
         guard let cache = slot.cache, !cache.layers.isEmpty, !slot.tokens.isEmpty else { throw ParallelError.slotEmpty }
-        return try SlotFileCodec.write(cache, tokens: slot.tokens, layout: layout, metadata: metadata, to: url)
+        return try SlotFileCodec.write(cache, tokens: slot.tokens, layout: layout, metadata: metadata, upTo: extent, to: url)
     }
 
     /// Reads a kept cache into a slot that no stream is using (`take(slot:from:expecting:)`), then holds every slot to
@@ -387,6 +405,7 @@ public final class ParallelEngine: @unchecked Sendable {
         slot.cache = read.cache
         slot.tokens = read.tokens
         slot.forgotten = false
+        slot.taken = true
         slot.lastUsed = Date()
         slots[id] = slot
         learnCosts(from: read.cache)
@@ -513,6 +532,9 @@ public final class ParallelEngine: @unchecked Sendable {
                 return
             }
             slot.lastUsed = Date()
+            row.fromFile = slot.taken
+            slot.taken = false
+            row.admission = .fresh
             if let cache = slot.cache, !slot.tokens.isEmpty, !cache.layers.isEmpty {
                 let common = Self.commonPrefix(slot.tokens, row.request.tokens)
                 // PIN: a prompt read only to be kept that the slot already holds, whole, reads nothing and leaves the
@@ -520,6 +542,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 // token for token), and rewinding to the prompt's end would throw that away to read it again.
                 if row.request.prefillOnly, common == row.request.tokens.count {
                     row.reused = common
+                    row.admission = .append
                     row.continuation.yield(.admitted(prefixReused: common, prefilled: 0,
                                                      queueWait: Date().timeIntervalSince(row.queuedAt), prefillSeconds: 0))
                     end(row, reason: .prefilled, layers: nil)
@@ -529,8 +552,10 @@ public final class ParallelEngine: @unchecked Sendable {
                 let wanted = common == row.request.tokens.count ? max(0, common - 1) : common
                 if wanted == slot.tokens.count, cache.position == wanted {
                     prefix = wanted
-                } else if let position = cache.rewind(toAtMost: wanted) {
-                    prefix = position
+                    row.admission = .append
+                } else if let rewound = cache.rewindPoint(toAtMost: wanted) {
+                    prefix = rewound.position
+                    row.admission = .rewind(rewound.point)
                 } else {
                     slot.cache = CheckpointedCache(layers: freshLayers(), ring: configuration.checkpointRing)
                 }
@@ -542,6 +567,7 @@ public final class ParallelEngine: @unchecked Sendable {
             layers = slot.cache!.layers
         } else {
             layers = freshLayers()
+            row.admission = .fresh
         }
         row.reused = prefix
         if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }
@@ -738,7 +764,7 @@ public final class ParallelEngine: @unchecked Sendable {
                               prefillSeconds: row.prefillSeconds,
                               decodeSeconds: row.admittedAt.map { max(0, Date().timeIntervalSince($0) - row.prefillSeconds) } ?? 0,
                               meanBatchSize: row.batchSteps > 0 ? Double(row.batchRowsSeen) / Double(row.batchSteps) : 0,
-                              message: message, prefilled: row.prefilled)
+                              message: message, prefilled: row.prefilled, admission: row.admission, fromFile: row.fromFile)
         row.continuation.yield(.finished(info))
         row.continuation.finish()
     }
@@ -826,7 +852,7 @@ public final class ParallelEngine: @unchecked Sendable {
     /// Drops the least recently used idle session's cache. False when every session is in use.
     @discardableResult
     private func evictLeastRecentlyUsed(except keep: SlotID? = nil) -> Bool {
-        let idle = slots.filter { $0.value.inFlight == nil && $0.value.cache != nil && $0.key != keep }
+        let idle = slots.filter { $0.value.inFlight == nil && !$0.value.held && $0.value.cache != nil && $0.key != keep }
         guard let victim = idle.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key else { return false }
         slots[victim] = nil
         evictions += 1

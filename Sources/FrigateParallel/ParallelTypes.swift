@@ -63,6 +63,40 @@ public enum FinishReason: String, Sendable {
     case prefilled
 }
 
+/// Which snapshot a rewind went back to (`CheckpointedCache.rewindPoint`): the end of the stable prefix, the last turn
+/// boundary, one of the ring, or an exact trim on a cache with no recurrent layers.
+public enum RewindPoint: String, Sendable, Equatable {
+    case anchor, pin, ring, trim
+}
+
+/// How a request found its slot's cache (`FinishInfo.admission`): continued where the cache stood, taken back to a
+/// point before where the prompt parts from it, or read from the start.
+public enum CacheAdmission: Sendable, Equatable, CustomStringConvertible {
+    /// The slot held the prompt's start as it stood: only the new tokens were read.
+    case append
+    /// The prompt parts from what the slot held: the cache went back to this point, and read from there.
+    case rewind(RewindPoint)
+    /// Nothing kept fit: no slot, an empty one, or no point to go back to.
+    case fresh
+
+    /// `append`, `rewind:anchor`, `fresh`: what a turn record writes.
+    public var description: String {
+        switch self {
+        case .append: return "append"
+        case .rewind(let point): return "rewind:\(point.rawValue)"
+        case .fresh: return "fresh"
+        }
+    }
+}
+
+/// How much of a session's cache `keep(slot:to:upTo:metadata:)` writes.
+public enum SlotExtent: Sendable, Equatable {
+    /// All of it, with every snapshot.
+    case whole
+    /// Up to the anchor, the end of the stable prefix: what any session of the same system prompt and tools begins with.
+    case anchor
+}
+
 public struct FinishInfo: Sendable {
     public var reason: FinishReason
     public var promptTokens: Int
@@ -76,6 +110,10 @@ public struct FinishInfo: Sendable {
     /// Prompt tokens this stream read into its cache: the part its slot did not hold, or as far as it got when it was
     /// removed before the end.
     public var prefilled = 0
+    /// How it found its slot's cache; nil when it was never admitted.
+    public var admission: CacheAdmission?
+    /// Its slot's cache came from a file (`take`) since the slot's last request.
+    public var fromFile = false
 }
 
 public enum StreamEvent: Sendable {
@@ -98,6 +136,8 @@ public enum ParallelError: Error, CustomStringConvertible {
     case slotEmpty
     /// `take` refused a file, and why: not a slot file, cut short, or written by another model or cache layout.
     case slotFileRefused(String)
+    /// `keep(…, upTo: .anchor)` found no anchor: the session's prompts never named one, or a rewind went before it.
+    case noAnchor
 
     public var description: String {
         switch self {
@@ -106,6 +146,7 @@ public enum ParallelError: Error, CustomStringConvertible {
         case .shutDown: return "the parallel engine is shut down"
         case .slotEmpty: return "the session holds no cache to keep"
         case .slotFileRefused(let why): return "the kept cache was not taken: \(why)"
+        case .noAnchor: return "the session's cache holds no anchor to keep up to"
         }
     }
 }
