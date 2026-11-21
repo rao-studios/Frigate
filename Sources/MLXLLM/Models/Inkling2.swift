@@ -206,8 +206,7 @@ final class Inkling2DecoderLayer: Module {
             states = (qInputNorm!(qkv.0).asType(dtype), kInputNorm!(qkv.1).asType(dtype), vInputNorm!(qkv.2).asType(dtype))
         }
         var x = selfAttention(states.0, states.1, states.2, cache: attentionCache, conv: &conv, positions: positions)
-        let attentionWindow: MLXArray
-        (x, attentionWindow) = postAttentionConv(x, state: conv[2])
+        (x, conv[2]) = postAttentionConv(x, state: conv[2])
 
         var y = x.asType(.float32)
         let residual: MLXArray
@@ -222,16 +221,13 @@ final class Inkling2DecoderLayer: Module {
         y = mlpInput(blocks!, Inkling2Ops.rms(y))[.ellipsis, 0, 0...]
         if let messages { y = mlpMessageGate!(y, messages[.ellipsis, 3, 0...]) }
         let mlpOut = mlp(postAttentionNorm(y).asType(dtype))
-        let (z, mlpWindow) = postMlpConv(mlpOut, state: conv[3])
+        let z: MLXArray
+        (z, conv[3]) = postMlpConv(mlpOut, state: conv[3])
 
         if let convCache {
-            let n = kernel - 1
-            convCache[0] = Inkling2Ops.keep(conv[0]!, n)
-            convCache[1] = Inkling2Ops.keep(conv[1]!, n)
-            convCache[2] = Inkling2Ops.keep(attentionWindow, n)
-            convCache[3] = Inkling2Ops.keep(mlpWindow, n)
+            for i in 0 ..< 4 { convCache[i] = conv[i]! }
         }
-        return ((residual + z.asType(.float32)).asType(dtype), blocks)
+        return (Inkling2Fused.residual([residual, z])[0], blocks)
     }
 }
 

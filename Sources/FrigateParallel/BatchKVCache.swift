@@ -85,8 +85,9 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             return .causal
         }
         let total = cursor + n
-        let columns = MLXArray(Int32(0) ..< Int32(total))[.newAxis, 0...]            // [1, L]
-        let queries = MLXArray(Int32(cursor) ..< Int32(total))[0..., .newAxis]       // [n, 1]
+        // `arange` is a device op; a Swift range is copied element by element on the host, every step.
+        let columns = MLXArray.arange(total, dtype: .int32)[.newAxis, 0...]          // [1, L]
+        let queries = MLXArray.arange(cursor, total, dtype: .int32)[0..., .newAxis]  // [n, 1]
         var causal = columns .<= queries                                             // [n, L]
         if let windowSize {
             causal = causal & (columns .> (queries - MLXArray(Int32(windowSize))))

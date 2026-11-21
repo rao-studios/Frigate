@@ -21,7 +21,24 @@ import MLXNN
 enum Inkling2Ops {
     /// RMS norm without a weight, in the input's dtype (float32 everywhere the model calls it).
     static func rms(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: MLXArray.ones([x.dim(-1)], dtype: x.dtype), eps: eps)
+        MLXFast.rmsNorm(x, weight: ones(x.dim(-1), x.dtype), eps: eps)
+    }
+
+    private struct OnesKey: Hashable { let width: Int; let dtype: DType }
+    private static let onesLock = NSLock()
+    nonisolated(unsafe) private static var onesMade: [OnesKey: MLXArray] = [:]
+
+    /// `rms`'s weight, made once per width from host memory. `MLXArray.ones` is a `Full` primitive: a dispatch on every
+    /// call, 339 of them in a decoded token (2026-11-21).
+    static func ones(_ width: Int, _ dtype: DType) -> MLXArray {
+        onesLock.lock()
+        defer { onesLock.unlock() }
+        let key = OnesKey(width: width, dtype: dtype)
+        if let made = onesMade[key] { return made }
+        let host = MLXArray([Float](repeating: 1, count: width))
+        let made = dtype == .float32 ? host : host.asType(dtype)
+        onesMade[key] = made
+        return made
     }
 
     /// `x` in a buffer of its own (an element-wise op writes a fresh one).
@@ -29,18 +46,14 @@ enum Inkling2Ops {
 
     /// Scales the last axis to an L2 norm of at most `threshold`, after an optional per-head scale.
     static func l2Clip(_ x: MLXArray, scale: MLXArray?, threshold: Float) -> MLXArray {
-        var states = x.asType(.float32)
-        if let scale { states = states * scale }
-        let norm = sqrt((states * states).sum(axis: -1, keepDims: true))
-        return (states * minimum(threshold / (norm + 1e-6), 1.0)).asType(x.dtype)
+        let limit = MLXArray(threshold)
+        if let scale { return Inkling2Fused.scaledL2Clip([x, scale, limit])[0] }
+        return Inkling2Fused.l2Clip([x, limit])[0]
     }
 
     /// The SwiGLU of capped gate and up; the sigmoid is of the uncapped gate.
     static func softcappedSwiGLU(_ gate: MLXArray, _ up: MLXArray, gateCap: Float, upCap: Float) -> MLXArray {
-        let g = gate.asType(.float32), u = up.asType(.float32)
-        let gc = tanh(g / gateCap) * gateCap
-        let uc = tanh(u / upCap) * upCap
-        return (gc * sigmoid(g) * uc).asType(gate.dtype)
+        Inkling2Fused.softcappedSwiGLU([gate, up, MLXArray(gateCap), MLXArray(upCap)])[0]
     }
 
     /// Attention of learned queries over the depth sources of each token: `blocks` [K,B,L,D] and `partial` [B,L,D],
@@ -111,15 +124,18 @@ final class Inkling2ShortConvolution: Module {
         _conv.wrappedValue = Inkling2ConvWeight(channels: channels, kernel: kernel)
     }
 
-    /// Returns the output, in `x`'s dtype, and the window it read (for the state).
+    /// Returns the output, in `x`'s dtype, and the state it leaves (the window's last K−1 rows, float32).
     func callAsFunction(_ x: MLXArray, state: MLXArray?) -> (MLXArray, MLXArray) {
+        if x.dim(1) == 1, let state, Inkling2Kernels.available, Inkling2Kernels.fusedConvolution {
+            return Inkling2Kernels.shortConvolution(x, state: state, weight: conv.weight, kernel: kernel)
+        }
         let residual = x.asType(.float32)
         let window = Inkling2Ops.window(x, state: state, kernel: kernel)
         let w = conv.weight
         // As the reference: the convolution runs in the weight's dtype.
         let out = conv1d(window.asType(w.dtype), w, groups: x.dim(-1))
         let y = (out.asType(.float32) + residual) / sqrt(Float(kernel + 1))
-        return (y.asType(x.dtype), window)
+        return (y.asType(x.dtype), Inkling2Ops.keep(window, kernel - 1))
     }
 }
 
@@ -138,9 +154,14 @@ final class Inkling2DynamicConvolution: Module {
         _weightProj.wrappedValue = Linear(inputDimensions, heads * kernel, bias: false)
     }
 
+    /// Returns the output, in `x`'s dtype, and the state it leaves (the window's last K−1 rows, float32).
     func callAsFunction(_ x: MLXArray, dynamicInput: MLXArray, state: MLXArray?) -> (MLXArray, MLXArray) {
         let (b, l, c) = (x.dim(0), x.dim(1), x.dim(2))
         let k = kernel, h = heads
+        if l == 1, let state, Inkling2Kernels.available, Inkling2Kernels.fusedConvolution {
+            return Inkling2Kernels.dynamicConvolution(
+                x, state: state, fixed: staticWeight, dynamic: weightProj(dynamicInput), heads: h, kernel: k)
+        }
         let dynamic = weightProj(dynamicInput).asType(.float32).reshaped(b, l, h, 1, k)
         let statics = staticWeight.asType(.float32).T.reshaped(h, c / h, k)
         let weights = statics + dynamic                                                   // [B,L,H,C/H,K]
@@ -150,7 +171,7 @@ final class Inkling2DynamicConvolution: Module {
             .reshaped(b, l, h, c / h, k)
         let out = (windows * weights).sum(axis: -1).reshaped(b, l, c)
         let y = (out + x.asType(.float32)) / sqrt(Float(2 * k + 1))
-        return (y.asType(x.dtype), window)
+        return (y.asType(x.dtype), Inkling2Ops.keep(window, k - 1))
     }
 }
 
@@ -288,8 +309,7 @@ final class Inkling2SparseMoe: Module {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x)
         let states = experts(x, indices)
-        let out = (states.asType(.float32) * weights.expandedDimensions(axis: -1)).sum(axis: -2)
-        return out.asType(x.dtype)
+        return Inkling2Fused.combine([states, weights.expandedDimensions(axis: -1)])[0]
     }
 }
 
@@ -324,9 +344,7 @@ final class Inkling2MessageGate: Module {
     func callAsFunction(_ x: MLXArray, _ message: MLXArray) -> MLXArray {
         let states = concatenated([Inkling2Ops.rms(x), Inkling2Ops.rms(message)], axis: -1)
         let down = downProj(states.asType(downProj.weight.dtype)).asType(.float32)
-        let forget = tanh(forgetProj(down))
-        let gain = tanh(gainProj(down))
-        return (1 - forget) * x + gain * message
+        return Inkling2Fused.messageGate([forgetProj(down), gainProj(down), x, message])[0]
     }
 }
 

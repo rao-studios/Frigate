@@ -46,7 +46,7 @@ enum Inkling2Positions {
 
     /// The positions of `length` tokens from here, float32: [1,L] or [B,L].
     func span(_ length: Int) -> MLXArray {
-        let steps = MLXArray(Int32(0) ..< Int32(length))
+        let steps = MLXArray.arange(length, dtype: .int32)
         switch self {
         case .host(let o): return (steps + Int32(o)).asType(.float32).expandedDimensions(axis: 0)
         case .device(let rows): return (rows.expandedDimensions(axis: 1) + steps).asType(.float32)
@@ -135,24 +135,41 @@ class Inkling2Attention: Module {
         let v = Inkling2Ops.rms(v0.asType(.float32), eps: eps).asType(v0.dtype)
         var r = relClip(relative.reshaped(b, l, heads, -1))
         if let tau {
-            q = (q.asType(.float32) * tau).asType(q.dtype)
-            r = (r.asType(.float32) * tau).asType(r.dtype)
+            q = Inkling2Fused.scaled([q, tau])[0]
+            r = Inkling2Fused.scaled([r, tau])[0]
         }
         let bias = relLogits(r)                                                           // [B,L,Hq,R]
         let out = attend(q.transposed(0, 2, 1, 3), k.transposed(0, 2, 1, 3), v.transposed(0, 2, 1, 3), bias, sinks)
-        let gated = out.reshaped(b, l, -1).asType(.float32) * sigmoid(gate.asType(.float32))
-        return oProj(gated.asType(gate.dtype))
+        return oProj(Inkling2Fused.outputGate([out.reshaped(b, l, -1), gate])[0])
     }
 
-    /// One token's attention over `keys` [B,Hkv,S,D]: `distance` [B,S] or [S] from the query to each key, `visible` the
-    /// same shape. q [B,Hq,1,D], bias [B,1,Hq,R], sinks [B,1,Hq]. Returns [B,1,Hq,D].
+    /// One token's attention over `keys` [B,Hkv,S,D] laid out as `layout` says. q [B,Hq,1,D], bias [B,1,Hq,R], sinks
+    /// [B,1,Hq]. Returns [B,1,Hq,D]. On the GPU the fused decode kernel (Inkling2DecodeAttention); elsewhere the plain
+    /// ops, with each key's distance and visibility spelled out from the layout.
+    ///
+    /// PIN: NO ARRAY THE SIZE OF THE KEYS IS BUILT ON THE HOST. `MLXArray(Int32(0) ..< Int32(s))` copies the range element
+    /// by element through an unspecialized generic: 32,768 columns in each of 8 global visits made a 32k token's graph
+    /// take 27 ms to build where a 1k token's took 9 (the engine's decode step timed, 2026-11-21), and decode is CPU-bound —
+    /// the GPU waited 0.02 ms a step. Columns come from `MLXArray.arange`, a device op, and only on the plain path.
     func decode(
-        _ q: MLXArray, _ keys: MLXArray, _ values: MLXArray, bias: MLXArray, sinks: MLXArray, distance: MLXArray,
-        visible: MLXArray
+        _ q: MLXArray, _ keys: MLXArray, _ values: MLXArray, bias: MLXArray, sinks: MLXArray,
+        layout: Inkling2Kernels.DecodeLayout
     ) -> MLXArray {
+        if Inkling2Kernels.available, Inkling2Kernels.fusedDecode {
+            return Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: scale, layout: layout)
+        }
         let b = q.dim(0), s = keys.dim(2), r = bias.dim(-1)
-        let distance = distance.ndim == 1 ? distance.expandedDimensions(axis: 0) : distance          // [B?,S]
-        let visible = visible.ndim == 1 ? visible.expandedDimensions(axis: 0) : visible
+        let columns = MLXArray.arange(s, dtype: .int32).expandedDimensions(axis: 0)               // [1,S]
+        let distance: MLXArray, visible: MLXArray                                                 // [B?,S]
+        switch layout {
+        case .newestLast(let keyStart):
+            distance = MLXArray(Int32(s - 1)) - columns
+            visible = columns .>= keyStart.expandedDimensions(axis: 1)
+        case .ring(let positions):
+            let p = positions.expandedDimensions(axis: 1)                                         // [B,1]
+            distance = remainder(remainder(p - columns, Int32(s)) + Int32(s), Int32(s))           // 0 ..< W
+            visible = (p - distance) .>= 0
+        }
         if b == 1 {
             // The fused attention takes one row's sinks.
             let d = distance[0], seen = visible[0]
@@ -218,8 +235,7 @@ final class Inkling2SlidingAttention: Inkling2Attention {
                 return Inkling2Kernels.relativeAttention(
                     q, k, v, rel: bias, sinks: sinks, scale: scale, window: w, keyStart: keyStart)
             }
-            return decode(q, k, v, bias: bias, sinks: sinks, distance: MLXArray([Int32(0)]),
-                          visible: MLXArray([true]))
+            return decode(q, k, v, bias: bias, sinks: sinks, layout: .newestLast(keyStart: keyStart))
         }
         let shape = [b, k.dim(1), w, k.dim(3)]
         var ringK = ring[0] ?? MLXArray.zeros(shape, dtype: k.dtype)
@@ -266,10 +282,7 @@ final class Inkling2SlidingAttention: Inkling2Attention {
         ringV = putAlong(ringV, index, values: v, axis: 2)
         ring[0] = ringK
         ring[1] = ringV
-        let slots = MLXArray(Int32(0) ..< Int32(w)).expandedDimensions(axis: 0)                // [1,W]
-        let p = pos.expandedDimensions(axis: 1)                                             // [B,1]
-        let back = remainder(remainder(p - slots, Int32(w)) + Int32(w), Int32(w))           // [B,W], 0 ..< W
-        return decode(q, ringK, ringV, bias: bias, sinks: sinks, distance: back, visible: (p - back) .>= 0)
+        return decode(q, ringK, ringV, bias: bias, sinks: sinks, layout: .ring(positions: pos))
     }
 }
 
@@ -322,9 +335,6 @@ final class Inkling2FullAttention: Inkling2Attention {
             return Inkling2Kernels.relativeAttention(
                 q, keys, values, rel: bias, sinks: sinks, scale: scale, window: 0, keyStart: MLXArray(Int32(s)) - ends)
         }
-        let columns = MLXArray(Int32(0) ..< Int32(s))
-        let distance = MLXArray(Int32(s - 1)) - columns                                                // [S], the same for every row
-        let visible = columns.expandedDimensions(axis: 0) .>= (MLXArray(Int32(s)) - ends).expandedDimensions(axis: 1)
-        return decode(q, keys, values, bias: bias, sinks: sinks, distance: distance, visible: visible)
+        return decode(q, keys, values, bias: bias, sinks: sinks, layout: .newestLast(keyStart: MLXArray(Int32(s)) - ends))
     }
 }
