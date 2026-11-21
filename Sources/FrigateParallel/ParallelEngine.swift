@@ -100,6 +100,8 @@ public final class ParallelEngine: @unchecked Sendable {
 
     public let configuration: Configuration
     private let model: any LanguageModel
+    /// The GPU scheduling a decode step runs under, when the model gives one (`DecodeSchedulingModel`).
+    private let decodeScheduling: GPU.Scheduling?
     private let layout: CacheLayout
     private let condition = NSCondition()
     private var commands: [Command] = []
@@ -147,6 +149,7 @@ public final class ParallelEngine: @unchecked Sendable {
     /// Takes the model: from here on, only this engine evaluates it.
     public init(model: any LanguageModel, configuration: Configuration = Configuration()) throws {
         self.model = model
+        decodeScheduling = (model as? any DecodeSchedulingModel)?.decodeScheduling
         self.configuration = configuration
         maxRows = max(1, configuration.maxRows)
         prefillChunkSize = max(1, configuration.prefillChunk)
@@ -694,7 +697,11 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.processor = processor
             }
         }
-        asyncEval(sampled)
+        if let decodeScheduling {
+            GPU.withScheduling(decodeScheduling) { asyncEval(sampled) }
+        } else {
+            asyncEval(sampled)
+        }
         // The tokens just fed were sampled last step: read them now, while this step runs.
         let values = fed.asArray(Int32.self)
         var finished: Set<Int> = []

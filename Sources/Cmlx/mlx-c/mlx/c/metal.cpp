@@ -53,3 +53,35 @@ extern "C" int mlx_metal_stop_capture(void) {
   }
   return 0;
 }
+
+// FRIGATE: the scheduling an engine sets around a decode step. Not generated.
+namespace mlx::core {
+void set_max_active_tasks(int tasks);
+int max_active_tasks_override_value();
+#if defined(__APPLE__)
+namespace metal {
+void set_command_buffer_limits(int ops, int megabytes);
+std::pair<int, int> command_buffer_limits();
+} // namespace metal
+#endif
+} // namespace mlx::core
+
+extern "C" int mlx_set_gpu_scheduling(int ops, int megabytes, int in_flight) {
+#if defined(__APPLE__)
+  mlx::core::metal::set_command_buffer_limits(ops, megabytes);
+#endif
+  mlx::core::set_max_active_tasks(in_flight);
+  return 0;
+}
+extern "C" int mlx_gpu_scheduling(int* ops, int* megabytes, int* in_flight) {
+#if defined(__APPLE__)
+  auto [o, m] = mlx::core::metal::command_buffer_limits();
+  *ops = o;
+  *megabytes = m;
+#else
+  *ops = 0;
+  *megabytes = 0;
+#endif
+  *in_flight = mlx::core::max_active_tasks_override_value();
+  return 0;
+}

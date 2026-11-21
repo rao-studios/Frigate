@@ -304,7 +304,7 @@ public final class Inkling2Inner: Module {
     }
 }
 
-public final class Inkling2Model: Module, LLMModel {
+public final class Inkling2Model: Module, LLMModel, DecodeSchedulingModel {
     public let modelType: String
     let configuration: Inkling2TextConfiguration
     @ModuleInfo(key: "model") var model: Inkling2Inner
@@ -318,6 +318,12 @@ public final class Inkling2Model: Module, LLMModel {
     }
 
     public var vocabularySize: Int { configuration.unpaddedVocabularySize }
+
+    /// A decoded token is ~8,000 small dispatches over 6.7 GB of weights: with MLX's 10 buffers in flight the encoder
+    /// waits on the GPU for ~40% of its encoding, and the 50 MB limit commits a buffer every few projections. 64 in flight
+    /// and no MB limit: 1k 42.1 → 48.6 tok/s, 32k 38.0 → 42.7 (release, M4 Max, 2026-11-21). More ops a buffer
+    /// (100, 200) lost at 32k, so the ops limit stays the device's own.
+    public var decodeScheduling: GPU.Scheduling { GPU.Scheduling(megabytes: 100_000, inFlight: 64) }
 
     /// The vision tower is not loaded (this is the text model).
     public var excludedCheckpointNamespaces: [String] { ["model.visual"] }

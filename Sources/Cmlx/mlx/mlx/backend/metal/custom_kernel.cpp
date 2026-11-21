@@ -48,7 +48,10 @@ void CustomKernel::eval_gpu(
   auto& d = metal::device(s.device);
 
   std::string lib_name = fmt::format(
-      "{}_{:x}_{}", name_, std::hash<std::string>{}(source_), compile_options_);
+      "{}_{:x}_{}",
+      name_,
+      source_hash_ ? source_hash_ : std::hash<std::string>{}(source_),
+      compile_options_);
   auto lib = d.get_library(
       lib_name, compile_options_, [this] { return metal::utils() + source_; });
   auto kernel = d.get_kernel(name_, lib);

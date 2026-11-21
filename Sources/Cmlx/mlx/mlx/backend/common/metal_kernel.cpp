@@ -1,7 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/metal.h"
@@ -270,6 +272,17 @@ CustomKernelFunction metal_kernel(
     }
   }
 
+  // FRIGATE: the generated source and its hash, once per kernel name. The name
+  // carries the template, the dtypes and how each input is passed, and this
+  // function's own source, header and names are fixed, so a name always maps to
+  // the same source. Writing it out on every call cost a decoded token
+  // milliseconds (Inkling-2 makes 456 calls a token, 2026-11-21).
+  struct Generated {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::pair<std::string, size_t>> sources;
+  };
+  auto generated = std::make_shared<Generated>();
+
   return [=,
           shape_infos = std::move(shape_infos),
           attributes = std::move(attributes)](
@@ -324,28 +337,42 @@ CustomKernelFunction metal_kernel(
       kernel_name += get_type_string(dtype);
     }
 
-    std::string kernel_source = write_signature(
-        kernel_name,
-        header,
-        source,
-        input_names,
-        inputs,
-        output_names,
-        output_dtypes,
-        template_args,
-        attributes,
-        shape_infos,
-        atomic_outputs);
+    std::string kernel_source;
+    size_t source_hash;
+    {
+      std::lock_guard<std::mutex> lock(generated->mutex);
+      auto known = generated->sources.find(kernel_name);
+      if (known != generated->sources.end()) {
+        kernel_source = known->second.first;
+        source_hash = known->second.second;
+      } else {
+        kernel_source = write_signature(
+            kernel_name,
+            header,
+            source,
+            input_names,
+            inputs,
+            output_names,
+            output_dtypes,
+            template_args,
+            attributes,
+            shape_infos,
+            atomic_outputs);
 
-    if (!template_args.empty()) {
-      template_def = kernel_name + template_def;
-      kernel_source += "\ntemplate [[host_name(\"";
-      kernel_source += kernel_name;
-      kernel_source += "\")]] [[kernel]] decltype(";
-      kernel_source += template_def;
-      kernel_source += ") ";
-      kernel_source += template_def;
-      kernel_source += ";\n";
+        if (!template_args.empty()) {
+          template_def = kernel_name + template_def;
+          kernel_source += "\ntemplate [[host_name(\"";
+          kernel_source += kernel_name;
+          kernel_source += "\")]] [[kernel]] decltype(";
+          kernel_source += template_def;
+          kernel_source += ") ";
+          kernel_source += template_def;
+          kernel_source += ";\n";
+        }
+        source_hash = std::hash<std::string>{}(kernel_source);
+        generated->sources.emplace(
+            kernel_name, std::make_pair(kernel_source, source_hash));
+      }
     }
 
     if (verbose) {
@@ -370,7 +397,8 @@ CustomKernelFunction metal_kernel(
             std::vector<ScalarArg>{},
             false,
             0,
-            compile_options.serialize()),
+            compile_options.serialize(),
+            source_hash),
         std::move(inputs));
   };
 }

@@ -41,6 +41,25 @@ enum Inkling2Ops {
         return made
     }
 
+    private static let rowsLock = NSLock()
+    nonisolated(unsafe) private static var rowsMade: [[Int]: MLXArray] = [:]
+
+    /// Each row's own index, shaped as `shape`: the left indices of a gathered matmul whose rows are not gathered.
+    /// Made from host memory once per shape; left out, `gather_qmm` builds the same with an `arange` on every call
+    /// (96 a decoded token, 2026-11-21). Nil past 256 rows, where MLX's own is as cheap.
+    /// PIN: NEVER WITH SORTED INDICES. MLX takes its sorted-experts kernel only when no left indices are given
+    /// (`right_sorted = sorted_indices && !lhs_indices_`); passing them halved prefill (718 → 299 tok/s at 1k).
+    static func rows(_ shape: [Int]) -> MLXArray? {
+        let count = shape.reduce(1, *)
+        guard count <= 256 else { return nil }
+        rowsLock.lock()
+        defer { rowsLock.unlock() }
+        if let made = rowsMade[shape] { return made }
+        let made = MLXArray((0 ..< UInt32(count)).map { $0 }, shape)
+        rowsMade[shape] = made
+        return made
+    }
+
     /// `x` in a buffer of its own (an element-wise op writes a fresh one).
     static func owned(_ x: MLXArray) -> MLXArray { x * 1 }
 
@@ -206,7 +225,8 @@ final class Inkling2SwitchLinear: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray {
         if let format, let scales {
             return gatherQuantizedMM(
-                x, weight, scales: scales, rhsIndices: indices, transpose: true,
+                x, weight, scales: scales, lhsIndices: sorted ? nil : Inkling2Ops.rows(Array(x.shape.dropLast(2))),
+                rhsIndices: indices, transpose: true,
                 groupSize: format.groupSize, bits: format.bits, mode: format.mode,
                 globalScale: globalScale, sortedIndices: sorted)
         }

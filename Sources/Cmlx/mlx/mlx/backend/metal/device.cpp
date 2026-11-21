@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -534,8 +535,28 @@ void CommandEncoder::wait_event(Event event, uint64_t value) {
   wait_events_.push_back(std::move(event));
 }
 
+// FRIGATE: the commit limits an engine sets for a while (0 = the device's own,
+// from its architecture or MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER).
+static std::atomic<int> max_ops_override{0};
+static std::atomic<int> max_mb_override{0};
+
+void set_command_buffer_limits(int ops, int megabytes) {
+  max_ops_override = ops;
+  max_mb_override = megabytes;
+}
+
+std::pair<int, int> command_buffer_limits() {
+  return {max_ops_override.load(), max_mb_override.load()};
+}
+
 bool CommandEncoder::needs_commit() const {
   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
+  if (int ops = max_ops_override; ops > 0) {
+    max_ops = ops;
+  }
+  if (int mb = max_mb_override; mb > 0) {
+    max_mb = mb;
+  }
   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 

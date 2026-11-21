@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -22,7 +23,24 @@
 
 namespace mlx::core {
 
+// FRIGATE: how many committed command buffers may be in flight before an
+// evaluation waits for one (MLX's own: 10). A runtime value, so an engine can
+// let a decode step's small buffers run deeper than a prefill's large ones.
 static constexpr int MAX_ACTIVE_TASKS = 10;
+static std::atomic<int> max_active_tasks_override{0};
+
+void set_max_active_tasks(int tasks) {
+  max_active_tasks_override = tasks;
+}
+
+int max_active_tasks_override_value() {
+  return max_active_tasks_override;
+}
+
+static int max_active_tasks() {
+  int tasks = max_active_tasks_override;
+  return tasks > 0 ? tasks : MAX_ACTIVE_TASKS;
+}
 
 namespace {
 
@@ -275,7 +293,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         cpu::eval(arr);
       }
 
-      if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+      if (scheduler::n_active_tasks() > max_active_tasks() ||
           (get_active_memory() > get_memory_limit() &&
            scheduler::n_active_tasks() > 0)) {
         // Commit any open streams
