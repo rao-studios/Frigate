@@ -7,10 +7,10 @@
 //        Each runs the same operations in the same order and dtypes as the plain code it replaced, so outputs are the
 //        same bit for bit (as MuseGlimmer.swift's compiled norms; Inkling2FusedDecodeLiveTests holds it on the
 //        checkpoint: 32 decoded tokens, logit diff 0).
-//  WHY:  Decode is CPU-bound. A token was 14,564 primitives (a DOT of one decode step's graph), encoded at ~1.7 µs each
-//        while the GPU waited 0.02 ms a step (the engine's decode step timed, 2026-11-21); 2,695 were casts and 1,986
-//        broadcasts of scalars, most of them inside these chains. With the decode convolutions: 7,966 primitives, 1k
-//        decode 34.4 → 41.9 tok/s, 32k 30.9 → 37.3 (`craft bench context`, release).
+//  WHY:  A token was 14,564 primitives (a DOT of one decode step's graph, 2026-11-21); 2,695 were casts and 1,986
+//        broadcasts of scalars, most of them inside these chains, and each one the GPU ran was a dispatch waiting on
+//        the one before. With the decode convolutions: 7,966 primitives, 1k decode 34.4 → 41.9 tok/s, 32k 30.9 → 37.3
+//        (`craft bench context`, release). A decoded token is bound by the GPU (`Inkling2Model.decodeScheduling`).
 //  PIN:  NO SHAPES INSIDE. Every function is compiled shapeless, so a reshape, slice or expand stays outside it, done
 //        by the caller; constants that differ between callers (the clip thresholds, the caps) arrive as scalar arrays.
 //

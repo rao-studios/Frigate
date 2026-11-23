@@ -8,9 +8,9 @@
 //        position order with the newest last and each row's first key, and a sliding visit's ring, slot s holding the
 //        newest position ≡ s (mod W).
 //  WHY:  The masked SDPA built a mask per visit — distances, visibility, the bias gathered by distance, −∞ for the
-//        hidden keys: ten primitives and a [Hq,S] array before the attention reads a key. Decode is CPU-bound, so the
-//        gain is small for now: 32k decode 36.6 / 36.7 tok/s against 35.8 / 34.4 by the SDPA, 1k level (release,
-//        2026-11-21). It grows once the GPU is the limit: a 32k global visit read once at memory speed is 0.3 ms.
+//        hidden keys: ten primitives and a [Hq,S] array before the attention reads a key. 32k decode 36.6 / 36.7
+//        tok/s against 35.8 / 34.4 by the SDPA, 1k level (release, 2026-11-21). A decoded token is bound by the GPU
+//        (`Inkling2Model.decodeScheduling`): the kernel and the ring's two writes are 2.4 ms of a 1k token's 21.
 //  PIN:  THE KEYS ARE READ WHERE THEY ARE. A global visit's keys are a slice of the cache's buffer, its heads a capacity
 //        apart; the kernel reads them by their strides (`ensureRowContiguous: false`), never through a copy.
 //
@@ -28,11 +28,6 @@ extension Inkling2Kernels {
         /// position has reached is hidden.
         case ring(positions: MLXArray)
     }
-
-    /// Whether a decoded token's attention, and its convolutions (Inkling2DecodeConvolution), run fused. Only a test
-    /// turns them off, to read the plain ops beside them.
-    nonisolated(unsafe) static var fusedDecode = true
-    nonisolated(unsafe) static var fusedConvolution = true
 
     /// Simdgroups a threadgroup, keys a block (measured 2026-11-21: 4 × 256 was best at both a 1,024 ring and 32k).
     static let decodeSimdgroups = 4
@@ -155,11 +150,18 @@ extension Inkling2Kernels {
         outputNames: ["out"],
         source: decodeFoldSource)
 
+    /// What the kernels read of a ring of `keys` slots: their count, and the blocks they are read in. For a count that
+    /// never changes; a global visit's grows with the prompt, and `decodeAttention` makes its own.
+    static func decodeSizes(keys: Int) -> Inkling2Constant {
+        Inkling2Constant([Int32(keys), Int32((keys + decodeChunk - 1) / decodeChunk)])
+    }
+
     /// q [B,Hq,1,D], keys and values [B,Hkv,S,D] (any strides, the last dimension contiguous); rel [B,1,Hq,R]; sinks
-    /// [B,1,Hq]. Returns [B,1,Hq,D].
+    /// [B,1,Hq]; `scale` the attention's, as a list of one; `sizes` is `decodeSizes(keys: S)` where S never changes,
+    /// made here otherwise. Returns [B,1,Hq,D].
     static func decodeAttention(
-        _ q: MLXArray, _ keys: MLXArray, _ values: MLXArray, rel: MLXArray, sinks: MLXArray, scale: Float,
-        layout: DecodeLayout
+        _ q: MLXArray, _ keys: MLXArray, _ values: MLXArray, rel: MLXArray, sinks: MLXArray, scale: Inkling2Constant,
+        sizes: Inkling2Constant? = nil, layout: DecodeLayout
     ) -> MLXArray {
         let (b, hq, d) = (q.dim(0), q.dim(1), q.dim(3))
         let (hkv, s) = (keys.dim(1), keys.dim(2))
@@ -169,13 +171,13 @@ extension Inkling2Kernels {
         case .newestLast(let keyStart): (rows, ring) = (keyStart, false)
         case .ring(let positions): (rows, ring) = (positions, true)
         }
-        let sizes = MLXArray([Int32(s), Int32(blocks)])
+        let sizes = sizes?.array ?? MLXArray([Int32(s), Int32(blocks)])
         let template: [(String, any KernelTemplateArg)] = [
             ("T", q.dtype), ("D", d), ("HQ", hq), ("HKV", hkv), ("R", rel.dim(-1)), ("RING", ring),
             ("NS", decodeSimdgroups), ("CHUNK", decodeChunk),
         ]
         let parts = decodeBlocksKernel(
-            [q, keys, values, contiguous(rel), contiguous(rows.asType(.int32)), sizes, MLXArray([scale])],
+            [q, keys, values, contiguous(rel), contiguous(rows.asType(.int32)), sizes, scale.array],
             template: template,
             grid: (32 * decodeSimdgroups, hkv, b * blocks),
             threadGroup: (32 * decodeSimdgroups, 1, 1),

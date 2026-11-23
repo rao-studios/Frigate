@@ -64,7 +64,7 @@ struct Inkling2DecodeAttentionTests {
         let want = reference(q, keys, values, bias: bias, sinks: sinks,
                              distance: broadcast(MLXArray(Int32(s - 1)) - columns, to: [b, s]),
                              visible: columns.expandedDimensions(axis: 0) .>= keyStart.expandedDimensions(axis: 1))
-        let got = Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: scale,
+        let got = Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: Inkling2Constant([scale]),
                                                   layout: .newestLast(keyStart: keyStart))
         #expect(got.shape == [b, 1, hq, d])
         #expect(close(got, want) < 0.02, "bf16 output, float32 reference")
@@ -79,7 +79,7 @@ struct Inkling2DecodeAttentionTests {
         let p = pos.expandedDimensions(axis: 1)
         let back = remainder(remainder(p - slots, Int32(w)) + Int32(w), Int32(w))
         let want = reference(q, keys, values, bias: bias, sinks: sinks, distance: back, visible: (p - back) .>= 0)
-        let got = Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: scale,
+        let got = Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: Inkling2Constant([scale]),
                                                   layout: .ring(positions: pos))
         #expect(close(got, want) < 0.02, "bf16 output, float32 reference")
     }

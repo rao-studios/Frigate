@@ -69,8 +69,12 @@ class Inkling2Attention: Module {
     let headDim: Int
     let window: Int
     let scale: Float
-    let qkClip: Float
+    /// `scale` as the decode kernel reads it, and the keys' clip threshold.
+    let decodeScale: Inkling2Constant
+    let qkClip: Inkling2Constant
     let eps: Float
+    /// Whether a decoded token's attention runs as the fused kernel (`Inkling2Model.fuseDecode`).
+    var fusesDecode = true
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -97,7 +101,8 @@ class Inkling2Attention: Module {
         }
         let extent = sliding ? config.slidingWindow : config.relExtent
         scale = pow(Float(headDim), -0.5)
-        qkClip = config.qkL2ClipThreshold
+        decodeScale = Inkling2Constant([scale])
+        qkClip = Inkling2Constant(config.qkL2ClipThreshold)
         eps = config.rmsNormEps
         let d = config.hiddenSize
         let qDim = heads * headDim, kvDim = kvHeads * headDim
@@ -145,18 +150,20 @@ class Inkling2Attention: Module {
 
     /// One token's attention over `keys` [B,Hkv,S,D] laid out as `layout` says. q [B,Hq,1,D], bias [B,1,Hq,R], sinks
     /// [B,1,Hq]. Returns [B,1,Hq,D]. On the GPU the fused decode kernel (Inkling2DecodeAttention); elsewhere the plain
-    /// ops, with each key's distance and visibility spelled out from the layout.
+    /// ops, with each key's distance and visibility spelled out from the layout. `sizes` is the kernel's, when the
+    /// keys' length never changes (a ring's).
     ///
     /// PIN: NO ARRAY THE SIZE OF THE KEYS IS BUILT ON THE HOST. `MLXArray(Int32(0) ..< Int32(s))` copies the range element
     /// by element through an unspecialized generic: 32,768 columns in each of 8 global visits made a 32k token's graph
-    /// take 27 ms to build where a 1k token's took 9 (the engine's decode step timed, 2026-11-21), and decode is CPU-bound —
-    /// the GPU waited 0.02 ms a step. Columns come from `MLXArray.arange`, a device op, and only on the plain path.
+    /// take 27 ms to build where a 1k token's took 9 (the engine's decode step timed, 2026-11-21). Columns come from
+    /// `MLXArray.arange`, a device op, and only on the plain path.
     func decode(
         _ q: MLXArray, _ keys: MLXArray, _ values: MLXArray, bias: MLXArray, sinks: MLXArray,
-        layout: Inkling2Kernels.DecodeLayout
+        layout: Inkling2Kernels.DecodeLayout, sizes: Inkling2Constant? = nil
     ) -> MLXArray {
-        if Inkling2Kernels.available, Inkling2Kernels.fusedDecode {
-            return Inkling2Kernels.decodeAttention(q, keys, values, rel: bias, sinks: sinks, scale: scale, layout: layout)
+        if Inkling2Kernels.available, fusesDecode {
+            return Inkling2Kernels.decodeAttention(
+                q, keys, values, rel: bias, sinks: sinks, scale: decodeScale, sizes: sizes, layout: layout)
         }
         let b = q.dim(0), s = keys.dim(2), r = bias.dim(-1)
         let columns = MLXArray.arange(s, dtype: .int32).expandedDimensions(axis: 0)               // [1,S]
@@ -198,11 +205,14 @@ class Inkling2Attention: Module {
 }
 
 final class Inkling2SlidingAttention: Inkling2Attention {
+    /// The decode kernel's sizes over the ring: W keys, in their blocks.
+    let ringSizes: Inkling2Constant
     @ModuleInfo(key: "k_sconv") var kConv: Inkling2ShortConvolution
     @ModuleInfo(key: "v_sconv") var vConv: Inkling2ShortConvolution
 
     init(_ config: Inkling2TextConfiguration) {
         let dims = config.swaKeyValueHeads * config.swaHeadDim
+        ringSizes = Inkling2Kernels.decodeSizes(keys: config.slidingWindow)
         _kConv.wrappedValue = Inkling2ShortConvolution(channels: dims, kernel: config.sconvKernelSize)
         _vConv.wrappedValue = Inkling2ShortConvolution(channels: dims, kernel: config.sconvKernelSize)
         super.init(config, sliding: true)
@@ -215,7 +225,7 @@ final class Inkling2SlidingAttention: Inkling2Attention {
         let key: MLXArray, value: MLXArray
         (key, conv[0]) = kConv(kProj(hk), state: conv[0])
         (value, conv[1]) = vConv(vProj(hv), state: conv[1])
-        let ring = cache as? ArraysCache
+        let ring = cache.map { Inkling2Model.arrays($0, holding: "a sliding visit's window") }
         return attend(hq, query: qProj(hq), key: key, value: value, relative: rProj(hq), tau: nil) {
             q, k, v, bias, sinks in
             self.slide(q, k, v, bias: bias, sinks: sinks, ring: ring, positions: positions)
@@ -282,7 +292,7 @@ final class Inkling2SlidingAttention: Inkling2Attention {
         ringV = putAlong(ringV, index, values: v, axis: 2)
         ring[0] = ringK
         ring[1] = ringV
-        return decode(q, ringK, ringV, bias: bias, sinks: sinks, layout: .ring(positions: pos))
+        return decode(q, ringK, ringV, bias: bias, sinks: sinks, layout: .ring(positions: pos), sizes: ringSizes)
     }
 }
 

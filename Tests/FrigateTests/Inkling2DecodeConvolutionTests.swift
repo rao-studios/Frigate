@@ -40,7 +40,9 @@ struct Inkling2DecodeConvolutionTests {
         let window = concatenated([kept, x.asType(.float32)], axis: 1)
         let out = conv1d(window.asType(weight.dtype), weight, groups: c)
         let want = ((out.asType(.float32) + x.asType(.float32)) / sqrt(Float(k + 1))).asType(x.dtype)
-        let (got, next) = Inkling2Kernels.shortConvolution(x, state: kept, weight: weight, kernel: k)
+        let (got, next) = Inkling2Kernels.shortConvolution(
+            x, state: kept, weight: weight, kernel: k, sizes: Inkling2Constant([Int32(c)]),
+            divisor: Inkling2Constant([sqrt(Float(k + 1))]))
         #expect(got.shape == [b, 1, c] && got.dtype == .bfloat16)
         #expect(largest(got, want) < 0.02)
         #expect(largest(next, window[0..., 1..., 0...]) == 0)
@@ -66,7 +68,8 @@ struct Inkling2DecodeConvolutionTests {
         let out = (windows * weights).sum(axis: -1).reshaped(b, 1, c)
         let want = ((out + x.asType(.float32)) / sqrt(Float(2 * k + 1))).asType(x.dtype)
         let (got, next) = Inkling2Kernels.dynamicConvolution(
-            x, state: kept, fixed: fixed, dynamic: projected, heads: h, kernel: k)
+            x, state: kept, fixed: fixed, dynamic: projected, kernel: k, sizes: Inkling2Constant([Int32(c), Int32(h)]),
+            divisor: Inkling2Constant([sqrt(Float(2 * k + 1))]))
         #expect(got.shape == [b, 1, c] && got.dtype == .bfloat16)
         #expect(largest(got, want) < 0.02)
         #expect(largest(next, window[0..., 1..., 0...]) == 0)

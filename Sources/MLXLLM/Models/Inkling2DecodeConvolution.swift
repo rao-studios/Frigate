@@ -5,9 +5,9 @@
 //  WHAT: A decoded token's convolutions for Inkling-2, one dispatch each: the short convolution (four a visit) and the
 //        global layers' dynamic key and value convolution. Each reads the kept state and the token and writes both the
 //        output and the next state (the state's last K−2 rows, then the token in float32).
-//  WHY:  Decode is CPU-bound: the GPU waited 0.02 ms a step while encoding took 24 ms (the engine's decode step timed,
-//        2026-11-21). The plain ops spend ~13 primitives a short convolution and ~25 a dynamic one, the copy that keeps
-//        the state included: ~2,700 of a token's 14,564.
+//  WHY:  The plain ops spend ~13 primitives a short convolution and ~25 a dynamic one, the copy that keeps the state
+//        included: ~2,700 of a token's 14,564 (2026-11-21), most of them dispatches the GPU ran one after another
+//        (a decoded token is bound by the GPU: `Inkling2Model.decodeScheduling`).
 //  PIN:  THE SAME ROUNDINGS AS THE PLAIN OPS. The short convolution rounds the window to the weight's dtype and the sum
 //        to it again, as `conv1d` in the weight's dtype does; the dynamic one stays in float32 throughout, as its ops do.
 //
@@ -41,11 +41,14 @@ extension Inkling2Kernels {
         outputNames: ["out", "next"],
         source: shortConvolutionSource)
 
-    /// x [B,1,C], state [B,K−1,C] float32, weight [C,K,1]. Returns the output [B,1,C] in x's dtype and the next state.
-    static func shortConvolution(_ x: MLXArray, state: MLXArray, weight: MLXArray, kernel: Int) -> (MLXArray, MLXArray) {
+    /// x [B,1,C], state [B,K−1,C] float32, weight [C,K,1]; `sizes` is [C] and `divisor` [√(K+1)], the convolution's
+    /// own. Returns the output [B,1,C] in x's dtype and the next state.
+    static func shortConvolution(
+        _ x: MLXArray, state: MLXArray, weight: MLXArray, kernel: Int, sizes: Inkling2Constant, divisor: Inkling2Constant
+    ) -> (MLXArray, MLXArray) {
         let (b, c) = (x.dim(0), x.dim(2))
         let parts = shortConvolutionKernel(
-            [x, state, weight, MLXArray([Int32(c)]), MLXArray([sqrt(Float(kernel + 1))])],
+            [x, state, weight, sizes.array, divisor.array],
             template: [("T", x.dtype), ("W", weight.dtype), ("K", kernel)],
             grid: (c, b, 1),
             threadGroup: (min(256, c), 1, 1),
@@ -80,14 +83,15 @@ extension Inkling2Kernels {
         outputNames: ["out", "next"],
         source: dynamicConvolutionSource)
 
-    /// x [B,1,C], state [B,K−1,C] float32, the static weight [K,C], the dynamic projection [B,1,H·K]. Returns the output
-    /// [B,1,C] in x's dtype and the next state.
+    /// x [B,1,C], state [B,K−1,C] float32, the static weight [K,C], the dynamic projection [B,1,H·K]; `sizes` is
+    /// [C, H] and `divisor` [√(2K+1)], the convolution's own. Returns the output [B,1,C] in x's dtype and the next state.
     static func dynamicConvolution(
-        _ x: MLXArray, state: MLXArray, fixed: MLXArray, dynamic: MLXArray, heads: Int, kernel: Int
+        _ x: MLXArray, state: MLXArray, fixed: MLXArray, dynamic: MLXArray, kernel: Int, sizes: Inkling2Constant,
+        divisor: Inkling2Constant
     ) -> (MLXArray, MLXArray) {
         let (b, c) = (x.dim(0), x.dim(2))
         let parts = dynamicConvolutionKernel(
-            [x, state, fixed, dynamic, MLXArray([Int32(c), Int32(heads)]), MLXArray([sqrt(Float(2 * kernel + 1))])],
+            [x, state, fixed, dynamic, sizes.array, divisor.array],
             template: [("T", x.dtype), ("K", kernel)],
             grid: (c, b, 1),
             threadGroup: (min(256, c), 1, 1),

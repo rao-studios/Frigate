@@ -281,10 +281,12 @@ enum Inkling2Kernels {
     static func rowThreads(_ dim: Int) -> Int { min(1024, max(32, dim / 8 / 32 * 32)) }
 
     /// blocks [K,…,D] and partial […,D], float32, also the values; queries [Q,D] float32. Returns […,Q,D] float32.
-    static func depthAttention(_ blocks: MLXArray, _ partial: MLXArray, _ queries: MLXArray, scale: Float) -> MLXArray {
+    static func depthAttention(
+        _ blocks: MLXArray, _ partial: MLXArray, _ queries: MLXArray, scale: Inkling2Constant
+    ) -> MLXArray {
         let d = partial.dim(-1), q = queries.dim(0), threads = rowThreads(d)
         return depthAttentionKernel(
-            [blocks, partial, queries, MLXArray(scale)],
+            [blocks, partial, queries, scale.array],
             template: [("K", blocks.dim(0)), ("D", d), ("Q", q), ("TG", threads)],
             grid: (partial.size / d * threads, 1, 1),
             threadGroup: (threads, 1, 1),
@@ -357,12 +359,25 @@ enum Inkling2Kernels {
         outputNames: ["inds", "weights"],
         source: routingSource)
 
+    /// What the routing kernel reads beside the logits and the bias: the sigmoid's multiplier (1), the epsilon under
+    /// the weights' sum, and the scale of the weights.
+    struct Routing: Sendable {
+        let multiplier = Inkling2Constant(Float(1))
+        let eps: Inkling2Constant
+        let routeScale: Inkling2Constant
+
+        init(eps: Float, routeScale: Float) {
+            self.eps = Inkling2Constant(eps)
+            self.routeScale = Inkling2Constant(routeScale)
+        }
+    }
+
     /// The top-k experts (uint32) and their weights from the router's float32 logits […,E].
-    static func routing(_ logits: MLXArray, bias: MLXArray, topK: Int, eps: Float, routeScale: Float) -> (MLXArray, MLXArray) {
+    static func routing(_ logits: MLXArray, bias: MLXArray, topK: Int, constants: Routing) -> (MLXArray, MLXArray) {
         let e = logits.dim(-1)
         let shape = Array(logits.shape.dropLast()) + [topK]
         let out = routingKernel(
-            [logits, bias, MLXArray(Float(1)), MLXArray(eps), MLXArray(routeScale)],
+            [logits, bias, constants.multiplier.array, constants.eps.array, constants.routeScale.array],
             template: [("E", e), ("K", topK)],
             grid: (logits.size / e * 32, 1, 1),
             threadGroup: (256, 1, 1),

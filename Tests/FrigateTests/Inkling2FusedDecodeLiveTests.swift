@@ -30,12 +30,10 @@ struct Inkling2FusedDecodeLiveTests {
     func decode(_ model: Inkling2Model, prompt: [Int], steps: Int, forced: [Int]? = nil, fused: Bool, attention: Bool)
         -> (tokens: [Int], logits: [MLXArray])
     {
-        Inkling2Kernels.fusedDecode = attention
-        Inkling2Kernels.fusedConvolution = fused
+        model.fuseDecode(attention: attention, convolutions: fused)
         compile(enable: fused)
         defer {
-            Inkling2Kernels.fusedDecode = true
-            Inkling2Kernels.fusedConvolution = true
+            model.fuseDecode(attention: true, convolutions: true)
             compile(enable: true)
         }
         let cache = model.newCache(parameters: nil)

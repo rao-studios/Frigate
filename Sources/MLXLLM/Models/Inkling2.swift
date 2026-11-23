@@ -268,7 +268,8 @@ public final class Inkling2TextModel: Module {
             for (i, layer) in range.enumerated() {
                 let messages = bank.map { messageInput!($0, layer: i) }
                 (h, blocks) = layers[layer](
-                    h, blocks: blocks, attentionCache: cache?[2 * visit], convCache: cache?[2 * visit + 1] as? ArraysCache,
+                    h, blocks: blocks, attentionCache: cache?[2 * visit],
+                    convCache: cache.map { Inkling2Model.arrays($0[2 * visit + 1], holding: "a visit's convolution windows") },
                     positions: positions, messages: messages)
                 visit += 1
             }
@@ -319,11 +320,50 @@ public final class Inkling2Model: Module, LLMModel, DecodeSchedulingModel {
 
     public var vocabularySize: Int { configuration.unpaddedVocabularySize }
 
-    /// A decoded token is ~8,000 small dispatches over 6.7 GB of weights: with MLX's 10 buffers in flight the encoder
+    /// A decoded token is ~4,100 dispatches over about 5 GB of weights: with MLX's 10 buffers in flight the encoder
     /// waits on the GPU for ~40% of its encoding, and the 50 MB limit commits a buffer every few projections. 64 in flight
     /// and no MB limit: 1k 42.1 → 48.6 tok/s, 32k 38.0 → 42.7 (release, M4 Max, 2026-11-21). More ops a buffer
     /// (100, 200) lost at 32k, so the ops limit stays the device's own.
+    ///
+    /// PIN: A DECODED TOKEN IS BOUND BY THE GPU, NOT BY THE THREAD THAT ENCODES IT. Of a 21.4 ms step at 1k the GPU is
+    /// busy 21.3 (each command buffer's `GPUEndTime − GPUStartTime`, summed); the engine's thread works 15.3 and waits
+    /// the rest inside `asyncEval`, on the buffers in flight (thread CPU time against the clock, release, 2026-11-23).
+    /// The 0.02 ms once read as the GPU's wait is the read of the token sampled a step earlier. So work taken off the
+    /// thread becomes waiting, and the rate moves only with what the GPU does a token. Each part left out in turn, at
+    /// 1k: the attention less its kernel 7.2 ms (six projections a visit), the experts 5.1, the attention kernel and
+    /// its ring writes 2.4, the unembedding 1.7, and about 5 of norms, casts, routing and depth attention, small
+    /// dispatches each waiting on the one before.
     public var decodeScheduling: GPU.Scheduling { GPU.Scheduling(megabytes: 100_000, inFlight: 64) }
+
+    /// Which of a decoded token's fused paths this model takes: the attention kernel (Inkling2DecodeAttention) and the
+    /// convolution kernels (Inkling2DecodeConvolution). Both from the start; a test turns them off on the model it
+    /// holds, to read the plain ops beside them.
+    ///
+    /// PIN: THE MODEL'S OWN, NEVER THE PROCESS'S. They were two statics, which one model's test turned off for every
+    /// model loaded.
+    func fuseDecode(attention: Bool, convolutions: Bool) {
+        for module in modules() {
+            switch module {
+            case let module as Inkling2Attention: module.fusesDecode = attention
+            case let module as Inkling2ShortConvolution: module.fusesDecode = convolutions
+            case let module as Inkling2DynamicConvolution: module.fusesDecode = convolutions
+            default: break
+            }
+        }
+    }
+
+    /// `layer` as the arrays `newCache` made for it: a sliding visit's window, a visit's convolution windows.
+    ///
+    /// PIN: NEVER `as?`. A visit handed another kind of cache took nil for it and decoded on without a word: zeros for
+    /// its convolution windows, no window at all for its attention. A forward cannot throw, so a cache this model did
+    /// not make stops here, saying what it is.
+    static func arrays(_ layer: KVCache, holding what: StaticString) -> ArraysCache {
+        guard let arrays = layer as? ArraysCache else {
+            preconditionFailure(
+                "Inkling2: \(what) is kept in an ArraysCache, as newCache(parameters:) makes it; this is a \(type(of: layer))")
+        }
+        return arrays
+    }
 
     /// The vision tower is not loaded (this is the text model).
     public var excludedCheckpointNamespaces: [String] { ["model.visual"] }

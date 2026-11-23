@@ -18,6 +18,28 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// A number a kernel or a compiled chain reads, in an array made once, where its owner is built.
+///
+/// WHY: `MLXArray(threshold)` at the call site made about 860 arrays a decoded token, each a buffer from the allocator,
+/// for values fixed since the model was built: the clip thresholds, the caps, the scales, a kernel's sizes and divisor.
+/// Held by their owners, a token's graph is built in 4.5 ms where it took 5.4 (the engine's step timed, release,
+/// 2026-11-23). The rate does not move with it: a decoded token is bound by the GPU (`Inkling2Model.decodeScheduling`).
+/// PIN: NEVER A BARE `MLXArray` PROPERTY. MLXNN reads every `MLXArray` a `Module` stores as a parameter of the
+/// checkpoint; this is a value it passes over.
+/// PIN: THE SHAPE IS THE CALL SITE'S. A kernel is named by how each input arrives (no dimension is passed by value,
+/// under eight elements as a constant), so a scalar stays a scalar and a list a list.
+/// PIN: ONLY WHAT A MODEL IS BUILT WITH. A value that changes with the prompt (a growing key count) is an `MLXArray`
+/// made where it is read.
+struct Inkling2Constant: @unchecked Sendable {
+    let array: MLXArray
+
+    /// No dimension, as `MLXArray(value)`.
+    init(_ value: Float) { array = MLXArray(value) }
+    /// One dimension, as `MLXArray(values)`.
+    init(_ values: [Float]) { array = MLXArray(values) }
+    init(_ values: [Int32]) { array = MLXArray(values) }
+}
+
 enum Inkling2Ops {
     /// RMS norm without a weight, in the input's dtype (float32 everywhere the model calls it).
     static func rms(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
@@ -64,28 +86,35 @@ enum Inkling2Ops {
     static func owned(_ x: MLXArray) -> MLXArray { x * 1 }
 
     /// Scales the last axis to an L2 norm of at most `threshold`, after an optional per-head scale.
-    static func l2Clip(_ x: MLXArray, scale: MLXArray?, threshold: Float) -> MLXArray {
-        let limit = MLXArray(threshold)
-        if let scale { return Inkling2Fused.scaledL2Clip([x, scale, limit])[0] }
-        return Inkling2Fused.l2Clip([x, limit])[0]
+    static func l2Clip(_ x: MLXArray, scale: MLXArray?, threshold: Inkling2Constant) -> MLXArray {
+        if let scale { return Inkling2Fused.scaledL2Clip([x, scale, threshold.array])[0] }
+        return Inkling2Fused.l2Clip([x, threshold.array])[0]
     }
 
     /// The SwiGLU of capped gate and up; the sigmoid is of the uncapped gate.
-    static func softcappedSwiGLU(_ gate: MLXArray, _ up: MLXArray, gateCap: Float, upCap: Float) -> MLXArray {
-        Inkling2Fused.softcappedSwiGLU([gate, up, MLXArray(gateCap), MLXArray(upCap)])[0]
+    static func softcappedSwiGLU(
+        _ gate: MLXArray, _ up: MLXArray, gateCap: Inkling2Constant, upCap: Inkling2Constant
+    ) -> MLXArray {
+        Inkling2Fused.softcappedSwiGLU([gate, up, gateCap.array, upCap.array])[0]
     }
 
     /// Attention of learned queries over the depth sources of each token: `blocks` [K,B,L,D] and `partial` [B,L,D],
-    /// float32, are keys and values both; `queries` [Q,D]. Returns [B,L,Q,D] float32.
-    static func depthAttention(_ blocks: MLXArray, _ partial: MLXArray, _ queries: MLXArray) -> MLXArray {
+    /// float32, are keys and values both; `queries` [Q,D]; `scale` is D to the −½ (`depthScale`). Returns [B,L,Q,D]
+    /// float32.
+    static func depthAttention(
+        _ blocks: MLXArray, _ partial: MLXArray, _ queries: MLXArray, scale: Inkling2Constant
+    ) -> MLXArray {
         let q = queries.asType(.float32)
-        let scale = pow(Float(partial.dim(-1)), -0.5)
         if Inkling2Kernels.available { return Inkling2Kernels.depthAttention(blocks, partial, q, scale: scale) }
+        let scale = pow(Float(partial.dim(-1)), -0.5)
         let stacked = movedAxis(concatenated([blocks, partial.expandedDimensions(axis: 0)], axis: 0),
                                 source: 0, destination: -2)                                     // [B,L,N,D]
         let weights = softmax(matmul(stacked, q.T) * scale, axis: -2, precise: true)            // [B,L,N,Q]
         return matmul(weights.swappedAxes(-1, -2), stacked)
     }
+
+    /// The depth attention's scale over states of `dimensions`.
+    static func depthScale(_ dimensions: Int) -> Inkling2Constant { Inkling2Constant(pow(Float(dimensions), -0.5)) }
 
     /// The window a convolution reads: its kept state (zeros before the first token), then `x` in float32.
     static func window(_ x: MLXArray, state: MLXArray?, kernel: Int) -> MLXArray {
@@ -102,11 +131,11 @@ enum Inkling2Ops {
 
 /// `scale` per head, then the L2 clip.
 final class Inkling2ScaledL2Clip: Module {
-    let threshold: Float
+    let threshold: Inkling2Constant
     @ParameterInfo(key: "scale") var scale: MLXArray
 
     init(heads: Int, dimensions: Int, threshold: Float) {
-        self.threshold = threshold
+        self.threshold = Inkling2Constant(threshold)
         _scale.wrappedValue = MLXArray.ones([heads, dimensions])
     }
 
@@ -136,17 +165,25 @@ final class Inkling2ConvWeight: Module {
 /// A causal depthwise convolution of `kernel` taps added to its input, scaled by 1/√(K+1).
 final class Inkling2ShortConvolution: Module {
     let kernel: Int
+    /// What the decode kernel reads beside the token: its channels, and √(K+1).
+    let sizes: Inkling2Constant
+    let divisor: Inkling2Constant
+    /// Whether a decoded token's convolution runs as the fused kernel (`Inkling2Model.fuseDecode`).
+    var fusesDecode = true
     @ModuleInfo(key: "conv1d") var conv: Inkling2ConvWeight
 
     init(channels: Int, kernel: Int) {
         self.kernel = kernel
+        sizes = Inkling2Constant([Int32(channels)])
+        divisor = Inkling2Constant([sqrt(Float(kernel + 1))])
         _conv.wrappedValue = Inkling2ConvWeight(channels: channels, kernel: kernel)
     }
 
     /// Returns the output, in `x`'s dtype, and the state it leaves (the window's last K−1 rows, float32).
     func callAsFunction(_ x: MLXArray, state: MLXArray?) -> (MLXArray, MLXArray) {
-        if x.dim(1) == 1, let state, Inkling2Kernels.available, Inkling2Kernels.fusedConvolution {
-            return Inkling2Kernels.shortConvolution(x, state: state, weight: conv.weight, kernel: kernel)
+        if x.dim(1) == 1, let state, Inkling2Kernels.available, fusesDecode {
+            return Inkling2Kernels.shortConvolution(
+                x, state: state, weight: conv.weight, kernel: kernel, sizes: sizes, divisor: divisor)
         }
         let residual = x.asType(.float32)
         let window = Inkling2Ops.window(x, state: state, kernel: kernel)
@@ -163,12 +200,19 @@ final class Inkling2ShortConvolution: Module {
 final class Inkling2DynamicConvolution: Module {
     let kernel: Int
     let heads: Int
+    /// What the decode kernel reads beside the token: its channels and heads, and √(2K+1).
+    let sizes: Inkling2Constant
+    let divisor: Inkling2Constant
+    /// Whether a decoded token's convolution runs as the fused kernel (`Inkling2Model.fuseDecode`).
+    var fusesDecode = true
     @ParameterInfo(key: "static_weight") var staticWeight: MLXArray
     @ModuleInfo(key: "weight_proj") var weightProj: Linear
 
     init(channels: Int, inputDimensions: Int, heads: Int, kernel: Int) {
         self.kernel = kernel
         self.heads = heads
+        sizes = Inkling2Constant([Int32(channels), Int32(heads)])
+        divisor = Inkling2Constant([sqrt(Float(2 * kernel + 1))])
         _staticWeight.wrappedValue = MLXArray.zeros([kernel, channels])
         _weightProj.wrappedValue = Linear(inputDimensions, heads * kernel, bias: false)
     }
@@ -177,9 +221,10 @@ final class Inkling2DynamicConvolution: Module {
     func callAsFunction(_ x: MLXArray, dynamicInput: MLXArray, state: MLXArray?) -> (MLXArray, MLXArray) {
         let (b, l, c) = (x.dim(0), x.dim(1), x.dim(2))
         let k = kernel, h = heads
-        if l == 1, let state, Inkling2Kernels.available, Inkling2Kernels.fusedConvolution {
+        if l == 1, let state, Inkling2Kernels.available, fusesDecode {
             return Inkling2Kernels.dynamicConvolution(
-                x, state: state, fixed: staticWeight, dynamic: weightProj(dynamicInput), heads: h, kernel: k)
+                x, state: state, fixed: staticWeight, dynamic: weightProj(dynamicInput), kernel: k, sizes: sizes,
+                divisor: divisor)
         }
         let dynamic = weightProj(dynamicInput).asType(.float32).reshaped(b, l, h, 1, k)
         let statics = staticWeight.asType(.float32).T.reshaped(h, c / h, k)
@@ -240,8 +285,8 @@ final class Inkling2Experts: Module {
     let dimensions: Int
     let hidden: Int
     let experts: Int
-    let gateCap: Float
-    let upCap: Float
+    let gateCap: Inkling2Constant
+    let upCap: Inkling2Constant
     @ModuleInfo(key: "gate_up_proj") var gateUp: Inkling2SwitchLinear
     @ModuleInfo(key: "down_proj") var down: Inkling2SwitchLinear
 
@@ -249,8 +294,8 @@ final class Inkling2Experts: Module {
         dimensions = config.hiddenSize
         hidden = config.intermediateSize
         experts = config.routedExperts
-        gateCap = config.mlpGateSoftcap
-        upCap = config.mlpUpSoftcap
+        gateCap = Inkling2Constant(config.mlpGateSoftcap)
+        upCap = Inkling2Constant(config.mlpUpSoftcap)
         _gateUp.wrappedValue = Inkling2SwitchLinear(
             inputDimensions: dimensions, outputDimensions: 2 * hidden, experts: experts)
         _down.wrappedValue = Inkling2SwitchLinear(inputDimensions: hidden, outputDimensions: dimensions, experts: experts)
@@ -293,12 +338,15 @@ final class Inkling2Experts: Module {
 final class Inkling2Router: Module {
     let topK: Int
     let routeScale: Float
+    /// What the routing kernel reads beside the logits: the sigmoid's multiplier, the sum's epsilon, the scale.
+    let constants: Inkling2Kernels.Routing
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var bias: MLXArray
 
     init(_ config: Inkling2TextConfiguration) {
         topK = config.expertsPerToken
         routeScale = config.routeScale
+        constants = Inkling2Kernels.Routing(eps: 1e-20, routeScale: config.routeScale)
         _weight.wrappedValue = MLXArray.zeros([config.routedExperts, config.hiddenSize], dtype: .float32)
         _bias.wrappedValue = MLXArray.zeros([config.routedExperts], dtype: .float32)
     }
@@ -306,7 +354,7 @@ final class Inkling2Router: Module {
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let logits = matmul(x.asType(.float32), weight.T)
         if Inkling2Kernels.available {
-            return Inkling2Kernels.routing(logits, bias: bias, topK: topK, eps: 1e-20, routeScale: routeScale)
+            return Inkling2Kernels.routing(logits, bias: bias, topK: topK, constants: constants)
         }
         let scores = sigmoid(logits)
         let biased = scores + bias
@@ -335,9 +383,11 @@ final class Inkling2SparseMoe: Module {
 
 /// The learned query (one, or one per q/k/v input) a layer reads the block states with.
 final class Inkling2BlockResidual: Module {
+    let scale: Inkling2Constant
     @ParameterInfo(key: "query") var query: MLXArray
 
     init(dimensions: Int, queries: Int = 1) {
+        scale = Inkling2Ops.depthScale(dimensions)
         _query.wrappedValue = queries == 1
             ? MLXArray.zeros([dimensions], dtype: .float32)
             : MLXArray.zeros([queries, dimensions], dtype: .float32)
@@ -345,7 +395,7 @@ final class Inkling2BlockResidual: Module {
 
     /// [B,L,Q,D] float32.
     func callAsFunction(_ blocks: MLXArray, _ partial: MLXArray) -> MLXArray {
-        Inkling2Ops.depthAttention(blocks, partial, query.reshaped(-1, partial.dim(-1)))
+        Inkling2Ops.depthAttention(blocks, partial, query.reshaped(-1, partial.dim(-1)), scale: scale)
     }
 }
 
@@ -370,14 +420,16 @@ final class Inkling2MessageGate: Module {
 
 /// The looped layers' message queries: query, key, value and mlp, per looped layer.
 final class Inkling2MessageInput: Module {
+    let scale: Inkling2Constant
     @ParameterInfo(key: "query") var query: MLXArray
 
     init(dimensions: Int, loopedLayers: Int) {
+        scale = Inkling2Ops.depthScale(dimensions)
         _query.wrappedValue = MLXArray.zeros([loopedLayers, 4, dimensions], dtype: .float32)
     }
 
     /// The bank is the previous pass's later block states and its normed output. Returns [B,L,4,D].
     func callAsFunction(_ bank: (MLXArray, MLXArray), layer: Int) -> MLXArray {
-        Inkling2Ops.depthAttention(bank.0, bank.1, query[layer])
+        Inkling2Ops.depthAttention(bank.0, bank.1, query[layer], scale: scale)
     }
 }
