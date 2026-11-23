@@ -1,4 +1,6 @@
 // Copyright © 2026 Apple Inc.
+// FRIGATE(cuda-no-cutlass): added. Stands in for fp_quantize.cu and
+// qqmm_utils.cu, left out with their CUTLASS dependency.
 
 #include <optional>
 #include <stdexcept>

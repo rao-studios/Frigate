@@ -535,7 +535,7 @@ void CommandEncoder::wait_event(Event event, uint64_t value) {
   wait_events_.push_back(std::move(event));
 }
 
-// FRIGATE: the commit limits an engine sets for a while (0 = the device's own,
+// FRIGATE(gpu-scheduling): the commit limits an engine sets for a while (0 = the device's own,
 // from its architecture or MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER).
 static std::atomic<int> max_ops_override{0};
 static std::atomic<int> max_mb_override{0};

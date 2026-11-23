@@ -272,7 +272,7 @@ CustomKernelFunction metal_kernel(
     }
   }
 
-  // FRIGATE: the generated source and its hash, once per kernel name. The name
+  // FRIGATE(kernel-source-once): the generated source and its hash, once per kernel name. The name
   // carries the template, the dtypes and how each input is passed, and this
   // function's own source, header and names are fixed, so a name always maps to
   // the same source. Writing it out on every call cost a decoded token

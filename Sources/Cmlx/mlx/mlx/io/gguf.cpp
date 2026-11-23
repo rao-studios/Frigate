@@ -437,7 +437,7 @@ void save_gguf(
     memcpy(val->string, src.c_str(), src.length());
   };
 
-  // Frigate: write the metadata, the tensor infos and the tensor data in key order. The maps
+  // FRIGATE(saved-in-key-order): write the metadata, the tensor infos and the tensor data in key order. The maps
   // iterate in their insertion order, which follows the caller's (Swift seeds its dictionary order
   // per process), so the same contents saved twice gave two different files. As in
   // safetensors.cpp. Not built in Frigate: gguf.cpp is excluded in favour of no_gguf.cpp.

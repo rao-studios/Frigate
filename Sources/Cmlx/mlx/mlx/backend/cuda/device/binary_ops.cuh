@@ -4,6 +4,8 @@
 
 #include <cuda/std/array>
 
+// FRIGATE(cuda-half-math): half and bfloat16 go through float in the ops below
+// (is_half_v, unary_ops.cuh).
 namespace mlx::core::cu {
 
 struct Add {

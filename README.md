@@ -281,6 +281,12 @@ both. Consumers should call it rather than keeping their own copy — `Bonnie`, 
 metallib (a copy made before the build breaks the bundle's signature), builds, installs a fresh
 copy beside every binary and bundle, and runs `swift test --skip-build` with `FRIGATE_MLX_TESTS=1`.
 
+**The parallel engine's tests need no model.** `Tests/FrigateTests/Parallel/` holds `FrigateParallel` (the batched
+engine, its checkpointed cache, slot files and their writer) on a stub model of two tiny layers, so
+`./scripts/test-mlx.sh --filter "ParallelEngineTests|CheckpointedCacheTests|BatchKVCacheTests|SlotFileWriterTests"`
+runs them in seconds on any Mac. They lived in Craft until 2026-11-22, where a change here was caught only when
+Craft's pin moved.
+
 ---
 
 ## API reference
@@ -348,10 +354,10 @@ as theirs, this tree as ours), so every local patch was kept, dropped as adopted
 
 | Directory | From | Version | Local patches |
 |---|---|---|---|
-| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.32.4** | 4 files in `backend/cuda/` + 3 added `no_*_impl.cpp` (CUTLASS-disabled fallbacks, sm_86); the CUDA SDPA graph cache is per thread (`static thread_local`, 2048 entries); the Metal sort's multi-block partitions are offset per row and use 64-bit row offsets, in `kernels/sort.h` and its generated copies `mlx-generated/{metal/sort.h,sort.cpp}` (`SortTests`; still wrong upstream in 0.32.4); `io/safetensors.cpp` lays tensors out in key order, so the same tensors always save to the same bytes (`SafetensorsLayoutTests`; upstream follows the map's insertion order, which Swift seeds per process); `io/gguf.cpp` writes its metadata, tensor infos and tensor data in key order the same way. That file is not built here: `Package.swift` excludes it for `no_gguf.cpp`, gguflib is not vendored, and mlx-c has no GGUF binding. It was checked on 2026-10-19 against gguflib `8fa6eb6`, upstream's pin, in a scratch harness linked to Frigate's Cmlx objects |
-| `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | **v0.8.0** | none |
+| `Sources/Cmlx/mlx/` | `ml-explore/mlx` | **v0.32.4** | eight patches, listed in [`VENDORED-PATCHES.md`](VENDORED-PATCHES.md): `sort-rows`, `saved-in-key-order`, `kernel-source-once`, `gpu-scheduling`, and for CUDA `cuda-no-cutlass`, `cuda-affine-fallback`, `cuda-half-math`, `cuda-sdpa-cache` |
+| `Sources/Cmlx/mlx-c/` | `ml-explore/mlx-c` | **v0.8.0** | `gpu-scheduling`: two functions in `metal.cpp` and `metal.h`, and in the two header copies under `Sources/Cmlx/include*/` |
 | `Sources/Cmlx/{json,fmt,metal-cpp}/` | pinned by mlx-swift | json 3.11.3, fmt 12.1.0 | none — these are mlx's own pins, **not** drift |
-| `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.33.0** | none (the compile lock fix is upstream since 0.32: `evalLock` outermost, `CompiledLockTests`) |
+| `Sources/MLX/` … `Sources/MLXOptimizers/` | `ml-explore/mlx-swift` | **0.33.0** | `GPU+Scheduling.swift` added (`gpu-scheduling`); nothing else (the compile lock fix is upstream since 0.32: `evalLock` outermost, `CompiledLockTests`) |
 | `Sources/Jinja/` | `huggingface/swift-jinja` | **3.2.1** | none |
 | `Sources/Hub/` … `Sources/Models/` | `huggingface/swift-transformers` | **1.4.0** | `LocalizedStringLinuxShim.swift` added; `Hub.swift` finds the fallback tokenizer configs beside the executable or in the app's resources, never through `Bundle.module` (which traps in an app's helper); `HubApi.swift` weighs each file's share of the download bar by its size (BPE `ignore_merges` is upstream now) |
 | `Sources/HuggingFace/` | `huggingface/swift-huggingface` | **1.0.1** | none (Xet trait off) |
@@ -363,6 +369,16 @@ as theirs, this tree as ours), so every local patch was kept, dropped as adopted
 | `Sources/Frigate/` | This package — `FrigateEmbedder`, `FrigateLLM`, `FrigateBoost` |  |  |
 | `Sources/FrigateVisionAX/`, `Sources/CVisionAX/` | This package — the vision runtime (moved in from the VisionAX repository, which keeps `VisionAXCore` and training); see `Sources/FrigateVisionAX/README.md` |  |  |
 | `Sources/SinatraHarness/`, `Sources/sinatra-harness/` | This package — the on-device harness and its CLI (moved in from the SinatraHarness repository, 2026-10); **GPL-3.0-only**, see `Sources/SinatraHarness/LICENSE` and `NOTICE` |  |  |
+
+**One list of the patches to vendored MLX.** Every file this tree changes or adds in `Sources/Cmlx/` and
+`Sources/MLX*/` carries a mark where the change is, `FRIGATE(<patch>)`, and
+[`VENDORED-PATCHES.md`](VENDORED-PATCHES.md) is written from those marks
+(`FRIGATE_WRITE_PATCH_LIST=1 swift test --filter VendoredPatchListTests`); the same test fails when the list
+and the tree disagree. A mark is found, an unmarked change is not: on 2026-11-22 `diff -rq` of the vendored trees
+against the three tags found 23 files changed or added, and each now carries a mark (`CudaBuild.json`, which
+cannot, is named by the mark in `no_qmm_impl.cpp`). After a sync, run that diff again and mark what still differs.
+What holds each patch: `SortTests` (`sort-rows`, still wrong upstream in 0.32.4), `SafetensorsLayoutTests`
+(`saved-in-key-order`), `GPUSchedulingTests` (`gpu-scheduling`). `io/gguf.cpp` writes its metadata, tensor infos and tensor data in key order the same way. That file is not built here: `Package.swift` excludes it for `no_gguf.cpp`, gguflib is not vendored, and mlx-c has no GGUF binding. It was checked on 2026-10-19 against gguflib `8fa6eb6`, upstream's pin, in a scratch harness linked to Frigate's Cmlx objects.
 
 **mlx C++ moves with mlx-swift.** Each mlx-swift release names the mlx C++ tag it binds through
 `MLX_VERSION` (see `Package.swift`) and the mlx-c tag it vendors; mlx-swift 0.33.0 names mlx 0.32.4

@@ -34,7 +34,8 @@ int mlx_metal_set_metallib_path(const char* path);
 int mlx_metal_start_capture(const char* path);
 int mlx_metal_stop_capture(void);
 
-/* FRIGATE: how much work goes in one command buffer before it is committed
+/* FRIGATE(gpu-scheduling): not generated. How much work goes in one command
+ * buffer before it is committed
  * (`ops` kernels or `megabytes` of inputs; 0 = the device's own) and how many
  * committed buffers may be in flight before evaluation waits (0 = MLX's 10). */
 int mlx_set_gpu_scheduling(int ops, int megabytes, int in_flight);

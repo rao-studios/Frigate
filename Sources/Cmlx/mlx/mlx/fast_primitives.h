@@ -573,7 +573,7 @@ class CustomKernel : public Primitive {
   CompileOptions::Data compile_options_;
 
  public:
-  // FRIGATE: std::hash of source_, when the maker knew it (0 = not known): a
+  // FRIGATE(kernel-source-once): std::hash of source_, when the maker knew it (0 = not known): a
   // kernel's source is thousands of characters and was hashed on every call.
   size_t source_hash_;
 };

@@ -39,10 +39,11 @@ public struct StreamRequest: Sendable {
     /// Where the prompt's turn boundary ends (the end of the person's message): prefill stops there once and pins a
     /// snapshot the next turn can rewind to (`CheckpointedCache.snapshot(at:pinned:)`). Nil pins nothing.
     public var pinAt: Int?
-    /// Where the prompt's stable prefix ends (the system prompt and the tools): prefill stops there once and anchors a
-    /// snapshot that later pins never replace (`CheckpointedCache.snapshot(at:anchored:)`), so a history rewritten after
-    /// it rewinds there instead of reading from zero. Nil anchors nothing.
-    public var anchorAt: Int?
+    /// The positions every prompt of the session begins with, ascending (where the tools end, where the system prompt
+    /// does): prefill stops at each once and marks a snapshot that later pins never replace
+    /// (`CheckpointedCache.snapshot(at:mark:)`), so a history rewritten after one rewinds there instead of reading from
+    /// zero, and the cache can be kept as the stretches between them (`SlotStretch`). Empty marks nothing.
+    public var marksAt: [Int]
     /// Read the prompt into the slot and stop: nothing is sampled and no row joins the batch, so the next request on
     /// the slot continues from the prompt's end. What a session reads ahead of a request it knows is coming. It needs a
     /// slot, since nothing else would keep what it read, and it finishes `prefilled`.
@@ -50,9 +51,9 @@ public struct StreamRequest: Sendable {
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
                 priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil,
-                anchorAt: Int? = nil, prefillOnly: Bool = false) {
+                marksAt: [Int] = [], prefillOnly: Bool = false) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
-        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.anchorAt = anchorAt
+        self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.marksAt = marksAt
         self.prefillOnly = prefillOnly
     }
 }
@@ -63,10 +64,10 @@ public enum FinishReason: String, Sendable {
     case prefilled
 }
 
-/// Which snapshot a rewind went back to (`CheckpointedCache.rewindPoint`): the end of the stable prefix, the last turn
-/// boundary, one of the ring, or an exact trim on a cache with no recurrent layers.
+/// Which snapshot a rewind went back to (`CheckpointedCache.rewindPoint`): a mark (a position every prompt of the
+/// session begins with), the last turn boundary, one of the ring, or an exact trim on a cache with no recurrent layers.
 public enum RewindPoint: String, Sendable, Equatable {
-    case anchor, pin, ring, trim
+    case mark, pin, ring, trim
 }
 
 /// How a request found its slot's cache (`FinishInfo.admission`): continued where the cache stood, taken back to a
@@ -79,7 +80,7 @@ public enum CacheAdmission: Sendable, Equatable, CustomStringConvertible {
     /// Nothing kept fit: no slot, an empty one, or no point to go back to.
     case fresh
 
-    /// `append`, `rewind:anchor`, `fresh`: what a turn record writes.
+    /// `append`, `rewind:mark`, `fresh`: what a turn record writes.
     public var description: String {
         switch self {
         case .append: return "append"
@@ -89,12 +90,30 @@ public enum CacheAdmission: Sendable, Equatable, CustomStringConvertible {
     }
 }
 
-/// How much of a session's cache `keep(slot:to:upTo:metadata:)` writes.
-public enum SlotExtent: Sendable, Equatable {
-    /// All of it, with every snapshot.
-    case whole
-    /// Up to the anchor, the end of the stable prefix: what any session of the same system prompt and tools begins with.
-    case anchor
+/// The part of a session's cache one file holds (`keep(slot:to:stretch:metadata:)`): the tokens from `start` up to
+/// `end`, with the state at `end`.
+///
+/// PIN: A STRETCH STANDS ON WHAT COMES BEFORE IT, HOWEVER THAT GOT THERE. Its keys and values were computed over the
+/// tokens before `start`, and its state is the state at `end`; neither says how the cache came to hold those tokens.
+/// So a stretch is taken onto any slot that holds exactly them: read from the files of the stretches before it, or
+/// read from the prompt (`take(slot:from:expecting:)`).
+/// PIN: WHY STRETCHES (2026-11-22). Every kept file held a session's cache from its first token: four projects' prefix
+/// files and each kept or saved session repeated the same tools block, about 1 GB a file, and a session's file carried
+/// every snapshot of its ring. Cut at the marks, what sessions share is written once, and a session writes only what
+/// is its own.
+public struct SlotStretch: Sendable, Equatable {
+    /// The first token the file's layers hold. Zero is the cache's start.
+    public var start: Int
+    /// Where the stretch ends: the cache's end, a mark, or any snapshot the cache holds. Nil is the cache's end. A
+    /// cache with no recurrent layer ends a stretch anywhere.
+    public var end: Int?
+
+    public init(from start: Int = 0, upTo end: Int? = nil) {
+        self.start = start; self.end = end
+    }
+
+    /// All of it.
+    public static let whole = SlotStretch()
 }
 
 public struct FinishInfo: Sendable {
@@ -112,7 +131,8 @@ public struct FinishInfo: Sendable {
     public var prefilled = 0
     /// How it found its slot's cache; nil when it was never admitted.
     public var admission: CacheAdmission?
-    /// Its slot's cache came from a file (`take`) since the slot's last request.
+    /// Its slot's cache came from a file (`take`) since the slot's last request, and the prompt went on from it: false
+    /// when the cache was read from the start all the same.
     public var fromFile = false
 }
 
@@ -134,10 +154,12 @@ public enum ParallelError: Error, CustomStringConvertible {
     case shutDown
     /// `keep` found no cache to write: the session never read a prompt, or its cache was forgotten.
     case slotEmpty
-    /// `take` refused a file, and why: not a slot file, cut short, or written by another model or cache layout.
+    /// `take` refused a file, and why: not a slot file, cut short, written by another model or cache layout, or a
+    /// stretch that does not begin where the slot stands.
     case slotFileRefused(String)
-    /// `keep(…, upTo: .anchor)` found no anchor: the session's prompts never named one, or a rewind went before it.
-    case noAnchor
+    /// `keep` could not cut the stretch it was asked for, and why: it begins past its end, or the cache holds no state
+    /// where it ends (no mark was read there, or a rewind went before it).
+    case stretchRefused(String)
 
     public var description: String {
         switch self {
@@ -146,7 +168,7 @@ public enum ParallelError: Error, CustomStringConvertible {
         case .shutDown: return "the parallel engine is shut down"
         case .slotEmpty: return "the session holds no cache to keep"
         case .slotFileRefused(let why): return "the kept cache was not taken: \(why)"
-        case .noAnchor: return "the session's cache holds no anchor to keep up to"
+        case .stretchRefused(let why): return "the session's cache was not kept: \(why)"
         }
     }
 }
@@ -224,7 +246,10 @@ public struct MemoryPolicy: Sendable {
     public var maxResidentSlots = Int.max
     /// What idle sessions' caches may hold together.
     public var slotBudgetBytes = Int.max
-    /// What recurrent snapshots may hold together; the oldest go first.
+    /// What the recurrent snapshots the sessions share may hold together: every session's ring, and its marks but the
+    /// last. The oldest of the session with the most go first (`CheckpointedCache.dropSharedSnapshot`). Each session
+    /// keeps its pin and its last mark beside them whatever this says, and the bound is never less than one ring of
+    /// the model's own snapshots.
     public var snapshotBudgetBytes = Int.max
     /// Requests that may wait; past it a request ends at once, failed, rather than queue without bound.
     public var maxQueued = Int.max
@@ -288,6 +313,9 @@ public struct MemoryStats: Sendable, Equatable {
     /// Recurrent snapshots the idle and running sessions keep to rewind to. An upper bound: a snapshot
     /// taken at a prompt's end shares its arrays with the live state until the next step replaces them.
     public var snapshotBytes = 0
+    /// What the sessions held between two of a turn's requests keep (`holding(slot:)`), counted in the lines above
+    /// too: not idle, so never trimmed as idle sessions are.
+    public var heldBytes = 0
     /// The batch's own KV buffers, the longest row's token count, and the padding columns the shorter
     /// rows carry so their last tokens line up with it.
     public var batchKVBytes = 0
@@ -312,5 +340,7 @@ public struct SlotStat: Sendable, Equatable {
     public var snapshotBytes: Int
     /// A stream is running on it now: its layers are in the batch, and it cannot be evicted.
     public var inFlight: Bool
+    /// Its session holds it between two of a turn's requests (`holding(slot:)`).
+    public var held = false
     public var lastUsed: Date
 }

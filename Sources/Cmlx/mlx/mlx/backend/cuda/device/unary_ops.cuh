@@ -11,8 +11,9 @@
 
 namespace mlx::core::cu {
 
-// Helper: true for __half and __nv_bfloat16 — cuda::std:: math ops are
-// ambiguous for these types when GCC's cmath overloads are in scope.
+// FRIGATE(cuda-half-math): true for __half and __nv_bfloat16. cuda::std:: math
+// ops are ambiguous for these types when GCC's cmath overloads are in scope, so
+// each op below and in binary_ops.cuh takes them through float.
 template <typename T>
 static constexpr bool is_half_v =
     cuda::std::is_same_v<T, __half> || cuda::std::is_same_v<T, __nv_bfloat16>;

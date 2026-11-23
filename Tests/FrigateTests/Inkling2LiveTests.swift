@@ -162,7 +162,7 @@ struct Inkling2LiveTests {
         defer { engine.shutdown() }
         func request(_ prompt: [Int], slot: SlotID? = nil, anchorAt: Int? = nil) -> StreamRequest {
             StreamRequest(tokens: prompt, sampling: GenerateParameters(temperature: 0), maxTokens: 12, stopTokens: [],
-                          slot: slot, anchorAt: anchorAt)
+                          slot: slot, marksAt: anchorAt.map { [$0] } ?? [])
         }
 
         // Alone, each on a cache of its own.

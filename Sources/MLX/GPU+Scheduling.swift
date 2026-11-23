@@ -6,10 +6,11 @@
 //        buffer before it is committed, and how many committed buffers may run before an evaluation waits for one.
 //  WHY:  MLX reads the first two once, at start (`MLX_MAX_OPS_PER_BUFFER`, `MLX_MAX_MB_PER_BUFFER`), and fixes the third
 //        at 10, so one process can't give a decode step's thousands of small kernels a deeper queue than a prefill's
-//        large ones. FRIGATE: not in upstream mlx-swift; the vendored MLX reads the overrides (device.cpp,
-//        transforms.cpp) and mlx-c's metal.cpp binds them.
+//        large ones.
 //  PIN:  APPLE ONLY. The binding lives in mlx-c's metal.cpp, which Linux builds leave out; there `scheduling` is always
 //        MLX's own and setting it does nothing.
+//  FRIGATE(gpu-scheduling): added, not in upstream mlx-swift. The vendored MLX reads the overrides (device.cpp,
+//        transforms.cpp) and mlx-c's metal.cpp binds them.
 //
 
 import Cmlx

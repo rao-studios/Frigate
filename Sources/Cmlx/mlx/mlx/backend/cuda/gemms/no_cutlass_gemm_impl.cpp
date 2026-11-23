@@ -1,4 +1,6 @@
 // Copyright © 2026 Apple Inc.
+// FRIGATE(cuda-no-cutlass): added. Stands in for grouped_gemm_unaligned.cu,
+// left out with its CUTLASS dependency.
 
 #include <stdexcept>
 #include "mlx/array.h"

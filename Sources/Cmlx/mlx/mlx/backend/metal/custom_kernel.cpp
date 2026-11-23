@@ -47,6 +47,7 @@ void CustomKernel::eval_gpu(
 
   auto& d = metal::device(s.device);
 
+  // FRIGATE(kernel-source-once): the hash its maker took, where it took one.
   std::string lib_name = fmt::format(
       "{}_{:x}_{}",
       name_,

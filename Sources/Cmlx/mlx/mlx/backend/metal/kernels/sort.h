@@ -579,6 +579,10 @@ template <
       BLOCK_THREADS,
       N_PER_THREAD>;
 
+  // FRIGATE(sort-rows): a row's partitions are n_blocks + 1 apart, as the merge
+  // kernel reads them. They were offset by the threadgroup's width,
+  // min(n_blocks + 1, 1024), so past 1,023 blocks the rows of one call
+  // overlapped. A row's offset is 64-bit here and in the kernels beside this one.
   block_partitions += tid.y * (n_blocks + 1);
   dev_vals += int64_t(tid.y) * size_sorted_axis;
   dev_idxs += int64_t(tid.y) * size_sorted_axis;

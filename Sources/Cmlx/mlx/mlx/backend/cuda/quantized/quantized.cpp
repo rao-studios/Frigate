@@ -136,7 +136,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // GPU fallback for affine quantization: dequantize weights then cuBLAS GEMM.
+  // FRIGATE(cuda-affine-fallback): affine quantization on a GPU with no CUTLASS
+  // kernels: dequantize the weights, then cuBLAS GEMM.
   // Used on GPUs without CUTLASS support (e.g. sm_86 / RTX 30xx).
   if (mode_ == QuantizationMode::Affine && biases.has_value() && transpose_) {
     array x_rc = ensure_row_contiguous(x, encoder, s);

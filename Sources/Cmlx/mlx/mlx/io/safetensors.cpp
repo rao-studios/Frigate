@@ -253,7 +253,7 @@ void save_safetensors(
   }
   parent["__metadata__"] = _metadata;
 
-  // Frigate: lay the tensors out in key order. The map iterates in its insertion order, which
+  // FRIGATE(saved-in-key-order): lay the tensors out in key order. The map iterates in its insertion order, which
   // follows the caller's (Swift seeds its dictionary order per process), so the same tensors
   // saved twice gave two different files. In key order a file's bytes depend only on its contents.
   std::vector<std::string> keys;

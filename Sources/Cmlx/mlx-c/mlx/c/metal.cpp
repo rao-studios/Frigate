@@ -54,7 +54,9 @@ extern "C" int mlx_metal_stop_capture(void) {
   return 0;
 }
 
-// FRIGATE: the scheduling an engine sets around a decode step. Not generated.
+// FRIGATE(gpu-scheduling): the scheduling an engine sets around a decode step.
+// Not generated, though the file says it is: the binding sits beside the
+// generated ones so the same header declares it.
 namespace mlx::core {
 void set_max_active_tasks(int tasks);
 int max_active_tasks_override_value();

@@ -57,9 +57,9 @@ public final class ParallelEngine: @unchecked Sendable {
         case hold
         case resume(ceiling: Int?)
         case shutdown
-        case keep(SlotID, URL, SlotExtent, [String: String], (Result<SlotFile, Error>) -> Void)
+        case keep(SlotID, URL, SlotStretch, [String: String], @Sendable (Result<SlotFile, Error>) -> Void)
         case holdSlot(SlotID, Bool)
-        case take(SlotID, URL, [String: String], (Result<SlotFile, Error>) -> Void)
+        case take(SlotID, [URL], [String: String], @Sendable (Result<SlotFile, Error>) -> Void)
     }
 
     private final class Slot {
@@ -70,8 +70,10 @@ public final class ParallelEngine: @unchecked Sendable {
         var forgotten = false
         /// When a stream last began or ended on it: what an eviction reads, oldest first.
         var lastUsed = Date()
-        /// Held by its session between two of a turn's requests (`hold(slot:)`): idle, never evicted.
-        var held = false
+        /// How many of its session's scopes hold it between two of a turn's requests (`holding(slot:)`): not idle, and
+        /// evicted only when a request would otherwise be refused.
+        var holds = 0
+        var isHeld: Bool { holds > 0 }
         /// Its cache came from a file (`take`) since its last request.
         var taken = false
     }
@@ -84,18 +86,18 @@ public final class ParallelEngine: @unchecked Sendable {
         let suffix: [Int]
         /// Where in `suffix` the turn boundary ends, when it is inside it and a slot keeps the cache.
         let pin: Int?
-        /// Where in `suffix` the stable prefix ends, when it is inside it and a slot keeps the cache.
-        let anchor: Int?
+        /// Where in `suffix` the prompt's marks stand, those inside it, when a slot keeps the cache.
+        let marks: [Int]
         var done = 0
         let startedAt = Date()
 
-        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int], pin: Int? = nil, anchor: Int? = nil) {
+        init(row: Row, layers: [KVCache], slotCache: CheckpointedCache?, suffix: [Int], pin: Int? = nil, marks: [Int] = []) {
             self.row = row; self.layers = layers; self.slotCache = slotCache; self.suffix = suffix; self.pin = pin
-            self.anchor = anchor
+            self.marks = marks
         }
         var isDone: Bool { done >= suffix.count }
-        /// The next point past `done` a chunk must end at: the anchor or the pin, whichever comes first.
-        var nextStop: Int? { [anchor, pin].compactMap { $0 }.filter { $0 > done }.min() }
+        /// The next point past `done` a chunk must end at: a mark or the pin, whichever comes first.
+        var nextStop: Int? { (marks + [pin].compactMap { $0 }).filter { $0 > done }.min() }
     }
 
     public let configuration: Configuration
@@ -104,6 +106,8 @@ public final class ParallelEngine: @unchecked Sendable {
     private let decodeScheduling: GPU.Scheduling?
     private let layout: CacheLayout
     private let condition = NSCondition()
+    /// Where kept caches are written, one at a time, off the engine's thread (`SlotFileWriter`).
+    private let files = DispatchQueue(label: "frigate.parallel.files", qos: .utility)
     private var commands: [Command] = []
     private var running = true
     /// `shutdown` was called: a stream inserted after it ends at once rather than wait for a thread that is gone.
@@ -217,29 +221,45 @@ public final class ParallelEngine: @unchecked Sendable {
     /// engine still over it holds again at once.
     public func resume(ceiling: Int? = nil) { post(.resume(ceiling: ceiling)) }
 
-    /// Writes a session's cache to `url` (`SlotFile`, `frigate-slot/1`): its layers, the tokens they hold and the
-    /// snapshots it can rewind to, with `metadata` beside them. The slot keeps its cache. Throws when the slot holds
-    /// nothing, a stream is using it, or the file cannot be written.
-    public func keep(slot: SlotID, to url: URL, upTo extent: SlotExtent = .whole, metadata: [String: String] = [:]) async throws -> SlotFile {
-        try await answered { .keep(slot, url, extent, metadata, $0) }
+    /// Writes a stretch of a session's cache to `url` (`SlotFile`, `frigate-slot/1`): its layers for the stretch's
+    /// tokens, the state at its end and the snapshots inside it, with every token before its end and `metadata` beside
+    /// them. The slot keeps its cache. Throws when the slot holds nothing, a stream is using it, the stretch cannot be
+    /// cut (`ParallelError.stretchRefused`), or the file cannot be written.
+    ///
+    /// PIN: GATHERED ON THE ENGINE'S THREAD, WRITTEN OFF IT (2026-11-22). The engine cuts the stretch between two
+    /// passes, which costs it the time to evaluate a few slices; the bytes go to disk on a queue of their own
+    /// (`SlotFileWriter`), and the engine reads and decodes on meanwhile. The call returns once the file is in place.
+    public func keep(slot: SlotID, to url: URL, stretch: SlotStretch = .whole, metadata: [String: String] = [:]) async throws -> SlotFile {
+        try await answered { .keep(slot, url, stretch, metadata, $0) }
     }
 
-    /// Holds a session's cache against eviction while its turn runs tools and agents between two requests: the next
-    /// round finds it where the last one left it. `unhold(slot:)` at the turn's end lets the policy have it again.
+    /// Runs `body` with a session's cache held against eviction: the tools and agents a turn runs between two of its
+    /// requests find the cache where the last request left it. The hold ends when `body` does, however it ends.
     ///
     /// PIN: A TURN'S SLOT IS NOT IDLE BETWEEN ITS ROUNDS (2026-11-20). An agent the turn called could evict the turn's
     /// own cache as least recently used, and the round after the agent read the whole conversation again.
-    public func hold(slot: SlotID) { post(.holdSlot(slot, true)) }
+    /// PIN: A HOLD IS A SCOPE (2026-11-22). It was two calls, `hold` and `unhold`, that every path out of a turn had to
+    /// pair by hand; a path that missed the second left a slot nothing could ever evict. A scope has one way out.
+    public func holding<T>(slot: SlotID, isolation: isolated (any Actor)? = #isolation,
+                           _ body: () async throws -> T) async rethrows -> T {
+        post(.holdSlot(slot, true))
+        defer { post(.holdSlot(slot, false)) }
+        return try await body()
+    }
 
-    /// Lets a held session's cache be evicted again (`hold(slot:)`).
-    public func unhold(slot: SlotID) { post(.holdSlot(slot, false)) }
+    /// Reads a session's cache from `urls` into `slot`: a chain of stretches, each beginning where the one before it
+    /// ends. A chain that begins at token zero replaces what the slot held; one that begins later is taken onto the
+    /// slot's own cache, which must hold exactly the tokens before it. The next request on the slot continues the
+    /// cache by their common prefix. Throws, leaving the slot as it was, when a stream is using the slot or a file does
+    /// not fit: not a slot file, cut short, another cache layout, a value in `expecting` its metadata does not hold,
+    /// or a stretch that does not begin where the tokens before it end.
+    public func take(slot: SlotID, from urls: [URL], expecting: [String: String] = [:]) async throws -> SlotFile {
+        try await answered { .take(slot, urls, expecting, $0) }
+    }
 
-    /// Reads a session's cache from `url` into `slot`, replacing what the slot held: the next request on the slot
-    /// continues it by their common prefix. Throws, leaving the slot as it was, when a stream is using the slot or the
-    /// file does not fit this engine: not a slot file, cut short, another cache layout, or a value in `expecting` that
-    /// the file's metadata does not hold.
+    /// `take(slot:from:expecting:)` for a file that stands alone.
     public func take(slot: SlotID, from url: URL, expecting: [String: String] = [:]) async throws -> SlotFile {
-        try await answered { .take(slot, url, expecting, $0) }
+        try await take(slot: slot, from: [url], expecting: expecting)
     }
 
     public var stats: ParallelStats { statsLock.withLock { latest } }
@@ -261,7 +281,7 @@ public final class ParallelEngine: @unchecked Sendable {
     /// PIN: checked and posted under one lock. `shutdown` closes the engine under that lock before it posts its own
     /// command, so a command posted while open is ahead of it and answered before the loop ends; one posted after is
     /// answered at once. Posted without the check, it would wait for a thread that is gone.
-    private func answered(_ command: (@escaping (Result<SlotFile, Error>) -> Void) -> Command) async throws -> SlotFile {
+    private func answered(_ command: (@escaping @Sendable (Result<SlotFile, Error>) -> Void) -> Command) async throws -> SlotFile {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SlotFile, Error>) in
             let posted: Bool = condition.withLock {
                 guard !closed else { return false }
@@ -381,29 +401,41 @@ public final class ParallelEngine: @unchecked Sendable {
             held = nil
         case .shutdown:
             running = false
-        case .keep(let id, let url, let extent, let metadata, let answer):
-            answer(Result { try withError { try keepSlot(id, to: url, upTo: extent, metadata: metadata) } })
+        case .keep(let id, let url, let stretch, let metadata, let answer):
+            do {
+                let image = try withError { try gatherSlot(id, stretch: stretch, metadata: metadata) }
+                files.async { answer(Result { try withError { try SlotFileCodec.write(image, to: url) } }) }
+            } catch {
+                answer(.failure(error))
+            }
         case .holdSlot(let id, let held):
-            if let slot = slots[id] { slot.held = held } else if held { let slot = Slot(); slot.held = true; slots[id] = slot }
+            let slot = slots[id] ?? Slot()
+            slot.holds = max(0, slot.holds + (held ? 1 : -1))
+            // A slot made only to be held, and let go before it ever read a prompt, leaves nothing behind.
+            if slot.isHeld || slot.cache != nil || slot.inFlight != nil { slots[id] = slot } else { slots[id] = nil }
             if !held { enforceSlotBudget() }
-        case .take(let id, let url, let expecting, let answer):
-            answer(Result { try withError { try takeSlot(id, from: url, expecting: expecting) } })
+        case .take(let id, let urls, let expecting, let answer):
+            answer(Result { try withError { try takeSlot(id, from: urls, expecting: expecting) } })
         }
     }
 
-    /// Writes an idle slot's cache, leaving it in place (`keep(slot:to:metadata:)`).
-    private func keepSlot(_ id: SlotID, to url: URL, upTo extent: SlotExtent, metadata: [String: String]) throws -> SlotFile {
+    /// Cuts a stretch of an idle slot's cache for writing, leaving the cache in place (`keep(slot:to:stretch:metadata:)`).
+    private func gatherSlot(_ id: SlotID, stretch: SlotStretch, metadata: [String: String]) throws -> SlotFileImage {
         guard let slot = slots[id] else { throw ParallelError.slotEmpty }
         if let busy = slot.inFlight { throw ParallelError.slotBusy("\(busy)") }
         guard let cache = slot.cache, !cache.layers.isEmpty, !slot.tokens.isEmpty else { throw ParallelError.slotEmpty }
-        return try SlotFileCodec.write(cache, tokens: slot.tokens, layout: layout, metadata: metadata, upTo: extent, to: url)
+        return try SlotFileCodec.gather(cache, tokens: slot.tokens, layout: layout, stretch: stretch, metadata: metadata)
     }
 
-    /// Reads a kept cache into a slot that no stream is using (`take(slot:from:expecting:)`), then holds every slot to
-    /// the memory policy again, as a slot that settles is.
-    private func takeSlot(_ id: SlotID, from url: URL, expecting: [String: String]) throws -> SlotFile {
+    /// Reads a chain of kept stretches into a slot that no stream is using (`take(slot:from:expecting:)`), then holds
+    /// every slot to the memory policy again, as a slot that settles is.
+    private func takeSlot(_ id: SlotID, from urls: [URL], expecting: [String: String]) throws -> SlotFile {
         if let busy = slots[id]?.inFlight { throw ParallelError.slotBusy("\(busy)") }
-        let read = try SlotFileCodec.read(from: url, layout: layout, expecting: expecting, ring: configuration.checkpointRing)
+        let standing = slots[id].flatMap { slot in
+            slot.cache.flatMap { $0.layers.isEmpty || slot.tokens.isEmpty ? nil : (cache: $0, tokens: slot.tokens) }
+        }
+        let read = try SlotFileCodec.read(from: urls, onto: standing, layout: layout, expecting: expecting,
+                                          ring: configuration.checkpointRing)
         let slot = slots[id] ?? Slot()
         slot.cache = read.cache
         slot.tokens = read.tokens
@@ -535,7 +567,10 @@ public final class ParallelEngine: @unchecked Sendable {
                 return
             }
             slot.lastUsed = Date()
-            row.fromFile = slot.taken
+            // PIN: FROM A FILE ONLY WHEN THE FILE'S CACHE WAS GONE ON FROM. It was said of any request after a take,
+            // so a prompt that shared nothing with the kept cache, and read from the start, was recorded "fresh from
+            // file".
+            let taken = slot.taken
             slot.taken = false
             row.admission = .fresh
             if let cache = slot.cache, !slot.tokens.isEmpty, !cache.layers.isEmpty {
@@ -546,6 +581,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 if row.request.prefillOnly, common == row.request.tokens.count {
                     row.reused = common
                     row.admission = .append
+                    row.fromFile = taken
                     row.continuation.yield(.admitted(prefixReused: common, prefilled: 0,
                                                      queueWait: Date().timeIntervalSince(row.queuedAt), prefillSeconds: 0))
                     end(row, reason: .prefilled, layers: nil)
@@ -556,9 +592,11 @@ public final class ParallelEngine: @unchecked Sendable {
                 if wanted == slot.tokens.count, cache.position == wanted {
                     prefix = wanted
                     row.admission = .append
+                    row.fromFile = taken
                 } else if let rewound = cache.rewindPoint(toAtMost: wanted) {
                     prefix = rewound.position
                     row.admission = .rewind(rewound.point)
+                    row.fromFile = taken && prefix > 0
                 } else {
                     slot.cache = CheckpointedCache(layers: freshLayers(), ring: configuration.checkpointRing)
                 }
@@ -574,10 +612,15 @@ public final class ParallelEngine: @unchecked Sendable {
         }
         row.reused = prefix
         if !row.request.prefillOnly { row.processor?.prompt(MLXArray(row.request.tokens.map(Int32.init))) }
-        // A boundary the cache already holds, or the prompt's very end, needs no pin of its own.
-        let inside: (Int?) -> Int? = { at in at.flatMap { slotCache != nil && $0 > prefix && $0 < row.request.tokens.count ? $0 - prefix : nil } }
+        // A boundary the cache already holds, or the prompt's very end, needs no pin of its own. A prompt read only to
+        // be kept may end at a mark: nothing is sampled after it, and its end is where a stretch is cut.
+        let count = row.request.tokens.count
+        let inside: (Int?) -> Int? = { at in at.flatMap { slotCache != nil && $0 > prefix && $0 < count ? $0 - prefix : nil } }
+        let marks = row.request.marksAt.compactMap { at in
+            inside(at) ?? (row.request.prefillOnly && slotCache != nil && at == count && at > prefix ? at - prefix : nil)
+        }
         prefill = PrefillJob(row: row, layers: layers, slotCache: slotCache, suffix: Array(row.request.tokens[prefix...]),
-                             pin: inside(row.request.pinAt), anchor: inside(row.request.anchorAt))
+                             pin: inside(row.request.pinAt), marks: marks)
     }
 
     /// A request may start reading now: one that joins the batch needs a row free there; one read only to be kept
@@ -618,7 +661,7 @@ public final class ParallelEngine: @unchecked Sendable {
             return
         }
         var upTo = min(job.done + max(1, tokens), job.suffix.count)
-        // A chunk ends at the anchor and at the turn boundary, so the cache stands exactly there once.
+        // A chunk ends at each mark and at the turn boundary, so the cache stands exactly there once.
         if let stop = job.nextStop, upTo > stop { upTo = stop }
         let piece = Array(job.suffix[job.done ..< upTo])
         let last = upTo == job.suffix.count
@@ -631,7 +674,7 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.pending = sample(logits: logits[0..., -1, 0...], row: row)
             } else {
                 eval(job.layers.flatMap { $0.innerState() })
-                if let anchor = job.anchor, upTo == anchor { job.slotCache?.snapshot(at: row.reused + anchor, anchored: true) }
+                if job.marks.contains(upTo) { job.slotCache?.snapshot(at: row.reused + upTo, mark: true) }
                 if let pin = job.pin, upTo == pin { job.slotCache?.snapshot(at: row.reused + pin, pinned: true) }
             }
         } else if last, !keeps {
@@ -828,7 +871,20 @@ public final class ParallelEngine: @unchecked Sendable {
         }
         // Rows decoding now will finish and give memory back: wait for them.
         if !batch.isEmpty { return .defer }
-        // Nothing running will free anything; what is held is the model and what cannot go.
+        // PIN: A HELD SESSION GIVES WAY BEFORE A REQUEST IS REFUSED (2026-11-22). A turn waiting on its person (a
+        // permission prompt, for as long as they take) holds its cache, and a held cache was never evicted: another
+        // session short of room was refused where, before holds, it had evicted and gone on. The held turn's next round
+        // reads its conversation again, which is what the hold spares it while there is room, and no more than that.
+        var gaveWay = false
+        while memory.active + estimate > policy.budgetBytes, evictLeastRecentlyUsed(except: row.slot, held: true) {
+            gaveWay = true
+            memory = policy.readMemory()
+        }
+        if gaveWay {
+            policy.clearCache()
+            memory = policy.readMemory()
+        }
+        // Nothing running will free anything; what is left is the model and what cannot go.
         if memory.active + estimate > policy.budgetBytes {
             return .reject("the model and what it holds leave \(Self.gb(max(0, policy.budgetBytes - memory.active))) of the "
                            + "\(Self.gb(policy.budgetBytes)) budget, and this prompt needs about \(Self.gb(estimate))")
@@ -851,32 +907,49 @@ public final class ParallelEngine: @unchecked Sendable {
         return bytes
     }
 
-    /// What idle sessions' caches hold together.
+    /// What idle sessions' caches hold together: the sessions no stream is using and no turn holds.
     private var idleSlotBytes: Int {
-        slots.values.filter { $0.inFlight == nil }.compactMap(\.cache).reduce(0) { $0 + $1.kvBytes + $1.recurrentBytes + $1.snapshotBytes }
+        slots.values.filter { $0.inFlight == nil && !$0.isHeld }.compactMap(\.cache).reduce(0) { $0 + Self.bytes($1) }
     }
 
-    /// Drops the least recently used idle session's cache. False when every session is in use.
+    private static func bytes(_ cache: CheckpointedCache) -> Int { cache.kvBytes + cache.recurrentBytes + cache.snapshotBytes }
+
+    /// Drops the least recently used idle session's cache. False when every session is in use or held. With `held`,
+    /// the sessions a turn holds are taken too, after every other: a held slot stays, emptied, so its turn still holds
+    /// what it reads next.
     @discardableResult
-    private func evictLeastRecentlyUsed(except keep: SlotID? = nil) -> Bool {
-        let idle = slots.filter { $0.value.inFlight == nil && !$0.value.held && $0.value.cache != nil && $0.key != keep }
-        guard let victim = idle.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key else { return false }
-        slots[victim] = nil
+    private func evictLeastRecentlyUsed(except keep: SlotID? = nil, held: Bool = false) -> Bool {
+        let idle = slots.filter { $0.value.inFlight == nil && (held || !$0.value.isHeld) && $0.value.cache != nil && $0.key != keep }
+        guard let victim = idle.min(by: { a, b in (a.value.isHeld ? 1 : 0, a.value.lastUsed) < (b.value.isHeld ? 1 : 0, b.value.lastUsed) }) else {
+            return false
+        }
+        if victim.value.isHeld {
+            victim.value.cache = nil
+            victim.value.tokens = []
+        } else {
+            slots[victim.key] = nil
+        }
         evictions += 1
         return true
     }
 
-    /// Holds sessions to the policy: how many keep a cache, what the idle ones hold, what the snapshots hold.
+    /// Holds sessions to the policy: how many keep a cache, what the idle ones hold, what the snapshots they share hold.
+    ///
+    /// PIN: THE SNAPSHOT BOUND IS OVER WHAT THE SESSIONS SHARE, AND NEVER UNDER ONE RING (2026-11-22). Each session
+    /// keeps its pin and its last mark outside it (`CheckpointedCache.dropSharedSnapshot`), and the bound is at least
+    /// one ring of the model's own snapshots, whatever the policy's megabytes say: a number chosen for a model whose
+    /// snapshot was a few megabytes left a model whose snapshot is 164 MiB room for six among every session.
     private func enforceSlotBudget() {
         var freed = false
         while slots.values.filter({ $0.cache != nil }).count > policy.maxResidentSlots, evictLeastRecentlyUsed() { freed = true }
         while idleSlotBytes > policy.slotBudgetBytes, evictLeastRecentlyUsed() { freed = true }
-        while slots.values.compactMap(\.cache).reduce(0, { $0 + $1.snapshotBytes }) > policy.snapshotBudgetBytes {
-            // The oldest snapshot of the session with the most, then of the least recently used.
-            let holders = slots.values.filter { ($0.cache?.snapshotCount ?? 0) > 0 }
+        let bound = max(policy.snapshotBudgetBytes, configuration.checkpointRing * recurrentBytesPerRow)
+        while slots.values.compactMap(\.cache).reduce(0, { $0 + $1.sharedSnapshotBytes }) > bound {
+            // The oldest shared snapshot of the session with the most, then of the least recently used.
+            let holders = slots.values.filter { ($0.cache?.sharedSnapshotCount ?? 0) > 0 }
             guard let holder = holders.max(by: { a, b in
-                (a.cache?.snapshotCount ?? 0, b.lastUsed) < (b.cache?.snapshotCount ?? 0, a.lastUsed)
-            }), holder.cache?.dropOldestSnapshot() == true else { break }
+                (a.cache?.sharedSnapshotCount ?? 0, b.lastUsed) < (b.cache?.sharedSnapshotCount ?? 0, a.lastUsed)
+            }), holder.cache?.dropSharedSnapshot() == true else { break }
             freed = true
         }
         if freed { policy.clearCache() }
@@ -990,7 +1063,8 @@ public final class ParallelEngine: @unchecked Sendable {
             guard let cache = slot.cache else { continue }
             let stat = SlotStat(slot: id, tokens: slot.tokens.count, kvBytes: cache.kvBytes, recurrentBytes: cache.recurrentBytes,
                                 snapshots: cache.snapshotCount, snapshotBytes: cache.snapshotBytes,
-                                inFlight: slot.inFlight != nil, lastUsed: slot.lastUsed)
+                                inFlight: slot.inFlight != nil, held: slot.isHeld, lastUsed: slot.lastUsed)
+            if slot.isHeld { memory.heldBytes += Self.bytes(cache) }
             memory.kvBytes += stat.kvBytes
             memory.recurrentBytes += stat.recurrentBytes
             memory.snapshotBytes += stat.snapshotBytes

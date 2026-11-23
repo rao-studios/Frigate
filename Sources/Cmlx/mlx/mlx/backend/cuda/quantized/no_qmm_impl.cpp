@@ -1,5 +1,7 @@
 // Copyright © 2026 Apple Inc.
-// Stubs for qmm/ CUDA kernels excluded due to missing CUTLASS dependency.
+// FRIGATE(cuda-no-cutlass): added. Stubs for the qmm/ kernels, left out with
+// their CUTLASS dependency: Sources/Cmlx/CudaBuild.json excludes them and the
+// two sources beside them (a JSON file carries no mark of its own).
 
 #include <optional>
 #include <stdexcept>

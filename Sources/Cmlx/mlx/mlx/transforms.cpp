@@ -23,7 +23,7 @@
 
 namespace mlx::core {
 
-// FRIGATE: how many committed command buffers may be in flight before an
+// FRIGATE(gpu-scheduling): how many committed command buffers may be in flight before an
 // evaluation waits for one (MLX's own: 10). A runtime value, so an engine can
 // let a decode step's small buffers run deeper than a prefill's large ones.
 static constexpr int MAX_ACTIVE_TASKS = 10;

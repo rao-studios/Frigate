@@ -175,6 +175,9 @@ inline BytesKey<SDPACacheKey> build_sdpa_cache_key(
   return cache_key;
 }
 
+// FRIGATE(cuda-sdpa-cache): 2048 graphs by default, where upstream keeps 256:
+// sub-batches of varying sequence length missed 512 times and ended in a fatal
+// error.
 auto& sdpa_cache() {
   static thread_local LRUBytesKeyCache<SDPACacheKey, DnnGraph> cache(
       "MLX_CUDA_SDPA_CACHE_SIZE", /* default_capacity */ 2048);
