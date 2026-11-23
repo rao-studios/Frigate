@@ -166,6 +166,11 @@ public struct StreamStat: Sendable {
     public var promptTokens: Int
     public var generated: Int
     public var tokensPerSecond: Double
+    /// How the stream found its slot's cache, from the moment it was admitted: the same value its `FinishInfo` ends
+    /// with, so whoever watches a prompt being read can say why that much is read while it is. Nil while it is queued.
+    public var admission: CacheAdmission?
+    /// Its slot's cache came from a file (`FinishInfo.fromFile`).
+    public var fromFile = false
 }
 
 public struct ParallelStats: Sendable {

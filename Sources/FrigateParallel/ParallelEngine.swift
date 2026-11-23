@@ -952,7 +952,8 @@ public final class ParallelEngine: @unchecked Sendable {
                 row.rateMark = (row.emitted, now)
             }
             return StreamStat(id: row.id, label: row.request.label, phase: phase, promptTokens: row.promptCount,
-                              generated: row.emitted, tokensPerSecond: row.tokensPerSecond)
+                              generated: row.emitted, tokensPerSecond: row.tokensPerSecond,
+                              admission: row.admission, fromFile: row.fromFile)
         }
         stats.streams = batch.rows.map { stat($0, phase: .decode) }
         if let job = prefill { stats.streams.append(stat(job.row, phase: .prefill(done: job.done, total: job.suffix.count))) }
