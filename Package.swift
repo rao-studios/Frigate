@@ -807,7 +807,7 @@ let package = Package(
         // ── Tests ─────────────────────────────────────────────────────────────
         .testTarget(
             name: "FrigateTests",
-            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLX", "MLXLMCommon", "FrigateBridge", "FrigateParallel", "Hub", "mlx_embeddings"]
+            dependencies: ["Frigate", "MLXAccelerate", "MLXLLM", "MLXVLM", "MLX", "MLXLMCommon", "FrigateBridge", "FrigateParallel", "Hub", "mlx_embeddings"]
                 + visionTestDependencies,
             // Read from the source tree by path (Mamba3Tests), never bundled: a resource bundle inside the signed
             // .xctest would break the seal the metallib install re-signs.

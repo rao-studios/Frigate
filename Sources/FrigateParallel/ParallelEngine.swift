@@ -60,6 +60,7 @@ public final class ParallelEngine: @unchecked Sendable {
         case keep(SlotID, URL, SlotStretch, [String: String], @Sendable (Result<SlotFile, Error>) -> Void)
         case holdSlot(SlotID, Bool)
         case take(SlotID, [URL], [String: String], @Sendable (Result<SlotFile, Error>) -> Void)
+        case exclusive(@Sendable () -> Void)
     }
 
     private final class Slot {
@@ -262,6 +263,21 @@ public final class ParallelEngine: @unchecked Sendable {
         try await take(slot: slot, from: [url], expecting: expecting)
     }
 
+    /// Runs `body` on the engine's thread between two passes, nothing else running: a forward of the engine's model
+    /// that is not a stream of it (a picture read by the model's own tower, `OwnVision`) never runs beside a step.
+    /// The rows decoding wait while it runs.
+    public func exclusive<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            let posted: Bool = condition.withLock {
+                guard !closed else { return false }
+                commands.append(.exclusive { continuation.resume(with: Result { try body() }) })
+                condition.signal()
+                return true
+            }
+            if !posted { continuation.resume(throwing: ParallelError.shutDown) }
+        }
+    }
+
     public var stats: ParallelStats { statsLock.withLock { latest } }
 
     public func shutdown() {
@@ -416,6 +432,8 @@ public final class ParallelEngine: @unchecked Sendable {
             if !held { enforceSlotBudget() }
         case .take(let id, let urls, let expecting, let answer):
             answer(Result { try withError { try takeSlot(id, from: urls, expecting: expecting) } })
+        case .exclusive(let body):
+            body()
         }
     }
 

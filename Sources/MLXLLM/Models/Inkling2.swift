@@ -257,8 +257,17 @@ public final class Inkling2TextModel: Module {
     /// The first global visit, whose cache says where the forward's tokens sit.
     var positionVisit: Int? { visits.firstIndex { !config.localLayerIds.contains($0) } }
 
+    /// The first hidden state of `inputs`: the token embedding, normalized. A picture's features stand in for its
+    /// body's tokens after this norm, with no norm of their own (NeMo's multimodal.py).
+    func embed(_ inputs: MLXArray) -> MLXArray { embedNorm(embedTokens(inputs)) }
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var h = embedNorm(embedTokens(inputs))
+        callAsFunction(embeddings: embed(inputs), cache: cache)
+    }
+
+    /// The forward from its first hidden state, as `embed` writes it.
+    func callAsFunction(embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var h = embeddings
         let dtype = h.dtype
         let positions = Inkling2Positions(positionVisit.flatMap { cache?[2 * $0].ropeOffset })
         var visit = 0
@@ -369,7 +378,15 @@ public final class Inkling2Model: Module, LLMModel, DecodeSchedulingModel {
     public var excludedCheckpointNamespaces: [String] { ["model.visual"] }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let hidden = model.languageModel(inputs, cache: cache)
+        logits(model.languageModel(inputs, cache: cache))
+    }
+
+    /// The logits of a forward whose first hidden state is `embeddings` [1, L, hidden] (`Inkling2OwnVision`).
+    func callAsFunction(embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
+        logits(model.languageModel(embeddings: embeddings, cache: cache))
+    }
+
+    private func logits(_ hidden: MLXArray) -> MLXArray {
         let cap = configuration.finalLogitSoftcapping
         let logits = tanh(lmHead(hidden).asType(.float32) / cap) * cap
         return logits[.ellipsis, ..<configuration.unpaddedVocabularySize]

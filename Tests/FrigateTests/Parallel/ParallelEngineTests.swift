@@ -1017,4 +1017,47 @@ final class ParallelEngineTests: EngineTestCase, @unchecked Sendable {
         engine.remove(row.id)
         try await finish(row)
     }
+
+    /// A forward that is not a stream (a picture read by the model's own tower) runs on the engine's thread between two
+    /// passes: no row decodes while it runs, what it returns or throws comes back, and the rows go on after it.
+    func testAnExclusiveBodyRunsWithNoStepBesideIt() async throws {
+        let engine = try ParallelEngine(model: StubLanguageModel())
+        defer { engine.shutdown() }
+        let row = engine.insert(request(slot: SlotID(), maxTokens: 100_000))
+        let counted = Counter()
+        let consumer = Task {
+            for try await event in row.events { if case .token = event { counted.add() } }
+        }
+        while counted.value < 3 { try await Task.sleep(nanoseconds: 1_000_000) }
+
+        let (before, after) = try await engine.exclusive { () -> (Int, Int) in
+            let before = counted.value
+            Thread.sleep(forTimeInterval: 0.2)
+            return (before, counted.value)
+        }
+        XCTAssertEqual(before, after, "no token while the body ran")
+        let resumed = counted.value
+        while counted.value <= resumed + 2 { try await Task.sleep(nanoseconds: 1_000_000) }
+
+        struct Refused: Error {}
+        do {
+            _ = try await engine.exclusive { () -> Int in throw Refused() }
+            XCTFail("the body's error comes back")
+        } catch is Refused {}
+
+        engine.remove(row.id)
+        _ = try await consumer.value
+        engine.shutdown()
+        do {
+            _ = try await engine.exclusive { 1 }
+            XCTFail("a shut-down engine runs nothing")
+        } catch ParallelError.shutDown {}
+    }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func add() { lock.withLock { count += 1 } }
 }
