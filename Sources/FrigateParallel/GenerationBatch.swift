@@ -155,7 +155,7 @@ final class Row {
         self.request = request
         self.continuation = continuation
         self.sampler = request.sampling.sampler()
-        self.processor = request.sampling.processor()
+        self.processor = request.components.logitProcessor(parameters: request.sampling)
         let s = request.sampling
         samplingKey = "\(s.temperature)/\(s.topP)/\(s.topK)/\(s.minP)/\(s.seed.map(String.init) ?? "-")"
         queuedAt = Date()

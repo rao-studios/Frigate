@@ -147,6 +147,60 @@ final class ParallelEngineTests: EngineTestCase, @unchecked Sendable {
         return try ParallelEngine(model: StubLanguageModel(), configuration: configuration)
     }
 
+    /// PIN: A REMOVED STREAM HEARS ITS LAST TOKEN. A stream removed while it decodes hears every token its slot keeps, so
+    /// a request that goes on from it (a thought closed and fed on, in Craft) reads only what is new. Its last token was
+    /// fed and kept but never heard, and a cache with a recurrent layer went back to its last snapshot to read the whole
+    /// reply again: 16,388 tokens in 31.7 s after a thought that filled its room.
+    func testARemovedStreamHearsEveryTokenItsSlotKeeps() async throws {
+        let engine = try ParallelEngine(model: StubLanguageModel())
+        defer { engine.shutdown() }
+        let slot = SlotID()
+        let handle = engine.insert(request(slot: slot, tokens: 20, maxTokens: 100_000))
+        var ids: [Int] = []
+        var finished: FinishInfo?
+        for try await event in handle.events {
+            switch event {
+            case .token(let id):
+                ids.append(id)
+                if ids.count == 5 { engine.remove(handle.id) }
+            case .finished(let info): finished = info
+            case .admitted: break
+            }
+        }
+        XCTAssertEqual(finished?.reason, .removed)
+        let kept = await stats(engine) { $0.memory.slots.first?.inFlight == false }
+        XCTAssertEqual(kept.memory.slots.first?.tokens, 20 + ids.count, "the slot keeps the prompt and every token heard")
+        let next = try await hear(engine.insert(StreamRequest(tokens: Array(1 ... 20) + ids + [3], sampling: GenerateParameters(temperature: 0),
+                                                              maxTokens: 1, stopTokens: [], slot: slot)))
+        XCTAssertEqual(next.admitted?.reused, 20 + ids.count, "it goes on from where the stream stood")
+        XCTAssertEqual(next.admitted?.prefilled, 1, "and reads only what is new")
+    }
+
+    /// A request's components shape its sampling as a `TokenIterator`'s do: their processor sees the row's logits after
+    /// the penalties, here keeping the stub's one token from the first sample and no other.
+    func testARequestsComponentsShapeItsSampling() async throws {
+        let engine = try ParallelEngine(model: StubLanguageModel())
+        defer { engine.shutdown() }
+        let barred = GenerationComponents().appendingLogitProcessor { FirstBarred(token: StubLanguageModel.token) }
+        let heard = try await hear(engine.insert(StreamRequest(tokens: Array(1 ... 20), sampling: GenerateParameters(temperature: 0),
+                                                               maxTokens: 3, stopTokens: [], components: barred)))
+        XCTAssertEqual(heard.ids.count, 3)
+        XCTAssertNotEqual(heard.ids.first, StubLanguageModel.token, "the first sample is kept from it")
+        XCTAssertEqual(Array(heard.ids.dropFirst()), [StubLanguageModel.token, StubLanguageModel.token], "the rest are the model's")
+    }
+
+    /// Keeps one token from the first sample.
+    private struct FirstBarred: LogitProcessor {
+        let token: Int
+        var sampled = false
+        mutating func prompt(_ prompt: MLXArray) {}
+        func process(logits: MLXArray) -> MLXArray {
+            guard !sampled, let barred = SuppressTokensProcessor(tokenIds: [token]) else { return logits }
+            return barred.process(logits: logits)
+        }
+        mutating func didSample(token: MLXArray) { sampled = true }
+    }
+
     /// PIN: a prompt read ahead is kept in its slot and nothing else: no token is sampled, no row joins the batch, and the
     /// request that follows reads only what comes after it. Read again, it reads nothing.
     func testAPromptReadAheadIsKeptInItsSlotAndTheNextRequestContinuesIt() async throws {

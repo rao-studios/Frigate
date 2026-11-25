@@ -48,13 +48,17 @@ public struct StreamRequest: Sendable {
     /// the slot continues from the prompt's end. What a session reads ahead of a request it knows is coming. It needs a
     /// slot, since nothing else would keep what it read, and it finishes `prefilled`.
     public var prefillOnly: Bool
+    /// What shapes the sampling beyond its values: a custom ``LogitProcessor``, run after the sampling's own penalties
+    /// (``GenerationComponents/logitProcessor(parameters:)``), as a `TokenIterator` takes one. Empty runs the penalties
+    /// alone.
+    public var components: GenerationComponents
 
     public init(tokens: [Int], sampling: GenerateParameters, maxTokens: Int, stopTokens: Set<Int>,
                 priority: StreamPriority = .interactive, label: String = "", slot: SlotID? = nil, pinAt: Int? = nil,
-                marksAt: [Int] = [], prefillOnly: Bool = false) {
+                marksAt: [Int] = [], prefillOnly: Bool = false, components: GenerationComponents = .init()) {
         self.tokens = tokens; self.sampling = sampling; self.maxTokens = maxTokens; self.stopTokens = stopTokens
         self.priority = priority; self.label = label; self.slot = slot; self.pinAt = pinAt; self.marksAt = marksAt
-        self.prefillOnly = prefillOnly
+        self.prefillOnly = prefillOnly; self.components = components
     }
 }
 

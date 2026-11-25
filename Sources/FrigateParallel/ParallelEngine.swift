@@ -772,6 +772,12 @@ public final class ParallelEngine: @unchecked Sendable {
             row.batchSteps += 1
             row.batchRowsSeen += count
             if row.removed {
+                // PIN: A REMOVED STREAM HEARS ITS LAST TOKEN. It was fed this step, so its slot keeps it; unheard, the
+                // request that continued the slot (a thought closed and fed on, Craft 2026-11-25) parted from the
+                // cache one token short, and a cache with recurrent layers went back to its last snapshot to read the
+                // whole generation again: 16,388 tokens in 31.7 s after a thought that filled its room.
+                row.emitted += 1
+                row.continuation.yield(.token(token))
                 row.finish = .removed
                 finished.insert(b)
                 continue
