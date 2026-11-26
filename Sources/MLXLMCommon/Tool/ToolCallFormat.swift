@@ -141,6 +141,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<|channel|>commentary to=functions.get_weather<|message|>{"location": "Tokyo"}<|call|>`
     case gptOSS = "gpt_oss"
 
+    /// Inkling-2's reply frames: reasoning, answer and call frames opened by the model
+    /// itself, a call's payload in the hosted Thinking Machines shape (`args`).
+    /// Example: `<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"location":"Tokyo"}}<|end_message|>`
+    case inkling
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -180,6 +185,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return Llama3ToolCallParser()
         case .gptOSS:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .inkling:
+            return InklingToolCallParser()
         }
     }
 
@@ -233,6 +240,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
                 toolCallPolicy: toolCallPolicy)
 
+        case .inkling:
+            return InklingStreamAdapter(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
+
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .miniCPM5, .mistral, .llama3:
             return nil
@@ -257,7 +269,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .miniCPM5, .mistral,
-            .llama3:
+            .llama3, .inkling:
             return []
         }
     }
@@ -278,7 +290,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 }
             }
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .miniCPM5, .mistral, .llama3:
+            .miniCPM5, .mistral, .llama3, .inkling:
             0
         }
     }

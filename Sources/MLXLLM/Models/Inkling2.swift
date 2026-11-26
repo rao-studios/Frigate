@@ -315,6 +315,9 @@ public final class Inkling2Inner: Module {
 }
 
 public final class Inkling2Model: Module, LLMModel, DecodeSchedulingModel {
+    /// Replies arrive as frames (reasoning, answer, call), decoded by `InklingStreamAdapter`.
+    public var toolCallFormat: ToolCallFormat? { .inkling }
+
     public let modelType: String
     let configuration: Inkling2TextConfiguration
     @ModuleInfo(key: "model") var model: Inkling2Inner

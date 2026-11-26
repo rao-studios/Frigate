@@ -74,6 +74,7 @@ extension ToolCallFormat {
         case "kimi_k2": self = .kimiK2
         case "mistral": self = .mistral
         case "json_tools", "json": self = .json
+        case "inkling": self = .inkling
         default: return nil
         }
     }
@@ -120,7 +121,7 @@ extension ToolCallFormat {
         switch self {
         case .qwen35:
             return templateFormat == .xmlFunction || templateFormat == .json
-        case .gptOSS, .atem:
+        case .gptOSS, .atem, .inkling:
             // These select complete token-stream protocols, not interchangeable
             // payload parsers. Incidental textual markers must not reroute them.
             return true
