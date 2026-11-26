@@ -18,6 +18,7 @@
 //        to any generation waiting for the gate.
 //
 
+import CoreGraphics
 import Foundation
 import FrigateBridge
 import MLX
@@ -37,8 +38,15 @@ public actor Harness {
     private var session: SinatraSession?
     private var tokenizer: (any SinatraTokenizing)?
     private var encoder: LanguageModelContextEncoder?
+    /// Whether the resident checkpoint carries a vision tower of its own (Inkling-2's), and the
+    /// reader over it, built on the first picture and dropped with the model.
+    private var carriesOwnVision = false
+    private var ownVision: (any OwnVision)?
     public private(set) var state: HarnessLoadState = .cold
     public private(set) var modelKey: String?
+    /// The resident checkpoint's `config.json` `model_type` (`inkling2_loop`, `mistral`, …):
+    /// what a host reads to know which template arguments the model takes.
+    public private(set) var residentModelType: String?
     private var loading: (id: String, task: Task<Void, Error>)?
 
     private var busy = false
@@ -93,6 +101,9 @@ public actor Harness {
             session = nil
             tokenizer = nil
             encoder = nil
+            ownVision = nil
+            carriesOwnVision = false
+            residentModelType = nil
             self.modelKey = nil
             release()
         }
@@ -140,7 +151,30 @@ public actor Harness {
         self.tokenizer = tokenizer
         self.encoder = encoder
         self.modelKey = modelKey
+        carriesOwnVision = Self.carriesOwnVision(loaded)
+        ownVision = nil
+        residentModelType = Self.modelType(loaded)
         state = .ready(modelKey)
+    }
+
+    static func modelType(_ context: ModelContext) -> String? {
+        guard let directory = try? context.configuration.modelDirectory,
+            let data = try? Data(contentsOf: directory.appending(component: "config.json")),
+            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return config["model_type"] as? String
+    }
+
+    /// An Inkling-2 whose checkpoint has a `vision_config` and `model.visual.` tensors: the tower
+    /// Frigate leaves out at load, read on the first picture.
+    static func carriesOwnVision(_ context: ModelContext) -> Bool {
+        guard context.model is Inkling2Model else { return false }
+        guard let directory = try? context.configuration.modelDirectory,
+            let data = try? Data(contentsOf: directory.appending(component: "config.json")),
+            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            config["vision_config"] != nil
+        else { return false }
+        return !((try? OwnVisionCheckpoint.files(in: directory, prefix: "model.visual.")) ?? []).isEmpty
     }
 
     private func noteProgress(_ fraction: Double) {
@@ -154,12 +188,40 @@ public actor Harness {
         session = nil
         tokenizer = nil
         encoder = nil
+        ownVision = nil
+        carriesOwnVision = false
+        residentModelType = nil
         modelKey = nil
         state = .cold
         release()
     }
 
     public var isLoaded: Bool { context != nil }
+
+    // MARK: - Pictures
+
+    /// Whether the resident model reads pictures with its own tower.
+    public var hasOwnVision: Bool { context != nil && carriesOwnVision }
+
+    /// A picture read by the resident model's own tower, at most `maxTokens` tokens, greedy; nil
+    /// when the resident model carries none (the host then reads it with a vision model of its
+    /// own). Runs under the gate, between generations: the tower and the answer run the loaded
+    /// model, whose weights are shared, never copied.
+    public func look(image: CGImage, question: String, maxTokens: Int) async throws -> String? {
+        guard hasOwnVision else { return nil }
+        waiting.increment()
+        await acquire()
+        waiting.decrement()
+        defer { release() }
+        guard let context, carriesOwnVision else { return nil }
+        if ownVision == nil {
+            ownVision = try Inkling2OwnVision.over(
+                context.model, tokenizer: context.tokenizer, directory: try context.configuration.modelDirectory)
+        }
+        guard let ownVision else { return nil }
+        let read = try await ownVision.reader(image: image, question: question, maxTokens: maxTokens)
+        return try read()
+    }
     public var vocabularySize: Int? { encoder?.vocabularySize }
     public var tokenizerAdapter: (any SinatraTokenizing)? { tokenizer }
 
