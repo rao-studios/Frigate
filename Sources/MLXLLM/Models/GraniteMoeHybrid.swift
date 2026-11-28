@@ -629,8 +629,12 @@ public struct GraniteMoeHybridConfiguration: Codable, Sendable {
     var tieWordEmbeddings: Bool
     private let _timeStepLimit: [Float]?
 
-    var timeStepMinimum: Float { _timeStepLimit?.first ?? 0.001 }
-    var timeStepMaximum: Float { _timeStepLimit?.last ?? 100.0 }
+    /// The Mamba time step's clamp. Unset, it is transformers' (0, +inf), the range Granite 4.0 was trained under; its
+    /// configs leave it out. mlx-lm's (0.001, 100) raised every smaller step to 0.001, so a long-memory head took in each
+    /// token many times over: H-Micro read 1k tokens well, 2k worse and 4k as "1.1.1.1" (2026-11-28, against
+    /// transformers on the same bf16 weights).
+    var timeStepMinimum: Float { _timeStepLimit?.first ?? 0.0 }
+    var timeStepMaximum: Float { _timeStepLimit?.last ?? .infinity }
 
     var useMoE: Bool { (numLocalExperts ?? 0) > 0 }
 
